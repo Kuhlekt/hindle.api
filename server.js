@@ -1,3 +1,4 @@
+const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -8,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 // ─────────────────────────────────────────────
 // HEALTH
@@ -23,13 +24,128 @@ app.get("/api/health", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// AI CHAT  — routes messages through Claude
+// POST /api/chat
+// Body: { tenantId, system, messages: [{role, content}] }
+// ─────────────────────────────────────────────
+app.post("/api/chat", async (req, res) => {
+  const { system, messages, tenantId } = req.body;
+
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: "messages array required" });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not set on server" });
+  }
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 600,
+        system: system || "You are a helpful support assistant. Answer concisely and helpfully.",
+        messages: messages.map((m) => ({
+          role: m.role === "visitor" || m.role === "user" ? "user" : "assistant",
+          content: m.content || m.text || "",
+        })),
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      return res.status(502).json({ error: "Anthropic API error", detail: err });
+    }
+
+    const data = await response.json();
+    const reply = data.content?.[0]?.text || "";
+
+    // Optionally log the message to the DB if a conversationId is supplied
+    if (req.body.conversationId) {
+      try {
+        await sql`
+          INSERT INTO messages (conversation_id, type, sender, content)
+          VALUES (${req.body.conversationId}, 'bot', 'AI', ${reply})
+        `;
+        await sql`
+          UPDATE conversations SET updated_at = NOW()
+          WHERE id = ${req.body.conversationId}
+        `;
+      } catch (_) {}
+    }
+
+    res.json({ reply });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// TENANT CONFIG  — stores chatbot config so widget.js can fetch it
+// POST /api/tenant-config        { tenantId, ...config }
+// GET  /api/tenant-config/:id
+// ─────────────────────────────────────────────
+
+// In-memory store (persists for the life of the Railway instance).
+// Replace with a DB table if you want permanent storage across restarts.
+const tenantConfigs = {};
+
+app.post("/api/tenant-config", (req, res) => {
+  const { tenantId, ...config } = req.body;
+  if (!tenantId) return res.status(400).json({ error: "tenantId required" });
+  tenantConfigs[tenantId] = { ...tenantConfigs[tenantId], ...config, updatedAt: new Date().toISOString() };
+  res.json({ ok: true, tenantId });
+});
+
+app.get("/api/tenant-config/:tenantId", (req, res) => {
+  const cfg = tenantConfigs[req.params.tenantId];
+  if (!cfg) return res.status(404).json({ error: "No config found for this tenant" });
+  res.json(cfg);
+});
+
+// ─────────────────────────────────────────────
+// FETCH URL  — server-side fetch for KB URL import (avoids CORS)
+// POST /api/fetch-url   { url }
+// ─────────────────────────────────────────────
+app.post("/api/fetch-url", async (req, res) => {
+  const { url } = req.body;
+  if (!url || (!url.startsWith("http://") && !url.startsWith("https://"))) {
+    return res.status(400).json({ error: "Valid URL required" });
+  }
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": "HindleBot/1.0 (KB Importer)" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return res.status(502).json({ error: `Remote returned ${r.status}` });
+    const html = await r.text();
+    // Strip HTML tags to extract readable text
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, 20000);
+    res.json({ text, url });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 // ORGANISATIONS (TENANTS)
 // ─────────────────────────────────────────────
 app.get("/api/tenants", async (req, res) => {
   try {
-    const rows = await sql`
-      SELECT * FROM organisations ORDER BY created_at DESC
-    `;
+    const rows = await sql`SELECT * FROM organisations ORDER BY created_at DESC`;
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -38,9 +154,7 @@ app.get("/api/tenants", async (req, res) => {
 
 app.get("/api/tenants/:id", async (req, res) => {
   try {
-    const rows = await sql`
-      SELECT * FROM organisations WHERE id = ${req.params.id}
-    `;
+    const rows = await sql`SELECT * FROM organisations WHERE id = ${req.params.id}`;
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
@@ -170,24 +284,21 @@ app.get("/api/conversations", async (req, res) => {
     let rows;
     if (org_id && status) {
       rows = await sql`
-        SELECT c.*, a.name as agent_name
-        FROM conversations c
+        SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
         WHERE c.org_id = ${org_id} AND c.status = ${status}
         ORDER BY c.updated_at DESC
       `;
     } else if (org_id) {
       rows = await sql`
-        SELECT c.*, a.name as agent_name
-        FROM conversations c
+        SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
         WHERE c.org_id = ${org_id}
         ORDER BY c.updated_at DESC
       `;
     } else {
       rows = await sql`
-        SELECT c.*, a.name as agent_name
-        FROM conversations c
+        SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
         ORDER BY c.updated_at DESC
       `;
@@ -201,8 +312,7 @@ app.get("/api/conversations", async (req, res) => {
 app.get("/api/conversations/:id", async (req, res) => {
   try {
     const rows = await sql`
-      SELECT c.*, a.name as agent_name
-      FROM conversations c
+      SELECT c.*, a.name as agent_name FROM conversations c
       LEFT JOIN agents a ON c.assigned_agent_id = a.id
       WHERE c.id = ${req.params.id}
     `;
@@ -232,9 +342,9 @@ app.patch("/api/conversations/:id", async (req, res) => {
   try {
     const rows = await sql`
       UPDATE conversations SET
-        status             = COALESCE(${status},             status),
-        assigned_agent_id  = COALESCE(${assigned_agent_id},  assigned_agent_id),
-        updated_at         = NOW()
+        status            = COALESCE(${status},            status),
+        assigned_agent_id = COALESCE(${assigned_agent_id}, assigned_agent_id),
+        updated_at        = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
     `;
@@ -279,11 +389,7 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
       VALUES (${req.params.id}, ${type}, ${sender}, ${content})
       RETURNING *
     `;
-    // Update conversation updated_at
-    await sql`
-      UPDATE conversations SET updated_at = NOW()
-      WHERE id = ${req.params.id}
-    `;
+    await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${req.params.id}`;
     res.status(201).json(rows[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -323,9 +429,7 @@ app.patch("/api/alert-log/:id", async (req, res) => {
   const { status } = req.body;
   try {
     const rows = await sql`
-      UPDATE alert_log SET status = ${status}
-      WHERE id = ${req.params.id}
-      RETURNING *
+      UPDATE alert_log SET status = ${status} WHERE id = ${req.params.id} RETURNING *
     `;
     res.json(rows[0]);
   } catch (e) {
