@@ -94,6 +94,11 @@ app.post("/api/tenant-config", async (req, res) => {
       ON CONFLICT (tenant_id) DO UPDATE
         SET config = ${payload}::jsonb, updated_at = NOW()
     `;
+    // Auto-register tenant_id on organisations so handoff can find the org
+    const orgName = config.widget_name || (config.brand && config.brand.name) || null;
+    if (orgName) {
+      try { await sql`UPDATE organisations SET tenant_id = ${tenantId} WHERE name = ${orgName} AND (tenant_id IS NULL OR tenant_id = ${tenantId})`; } catch (_) {}
+    }
     res.json({ ok: true, tenantId, storage: "db" });
   } catch (e) {
     tenantConfigsMemory[tenantId] = { ...tenantConfigsMemory[tenantId], ...config, updatedAt: new Date().toISOString() };
