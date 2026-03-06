@@ -278,6 +278,36 @@ app.delete("/api/tenants/:id", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// AUTH — server-side password verification
+// POST /api/auth { email, password }
+// Returns { ok, role, name, id, mustChangePassword }
+// ─────────────────────────────────────────────
+app.post("/api/auth", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    const rows = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "no_account" });
+    const agent = rows[0];
+    if (agent.active === false) return res.status(403).json({ error: "disabled" });
+    if (!agent.password_hash) return res.status(401).json({ error: "no_password" });
+    if (agent.password_hash !== password) return res.status(401).json({ error: "wrong_password" });
+    res.json({ ok: true, id: agent.id, name: agent.name, email: agent.email, role: agent.role || "agent", mustChangePassword: agent.must_change_password || false });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/auth/set-password — update password after forced change
+app.post("/api/auth/set-password", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    const rows = await sql`UPDATE agents SET password_hash=${password}, must_change_password=false WHERE LOWER(email)=LOWER(${email}) RETURNING id, name, email, role`;
+    if (!rows.length) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true, ...rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
 // AGENTS
 // ─────────────────────────────────────────────
 app.get("/api/agents", async (req, res) => {
@@ -287,15 +317,30 @@ app.get("/api/agents", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post("/api/agents", async (req, res) => {
-  const { org_id, name, email, mobile, role = "agent" } = req.body;
+  const { org_id, name, email, mobile, role = "agent", password, mustChangePassword } = req.body;
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
-  try { res.status(201).json((await sql`INSERT INTO agents (org_id, name, email, mobile, role) VALUES (${org_id},${name},${email},${mobile},${role}) RETURNING *`)[0]); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    const pw = password || null;
+    const mcp = mustChangePassword !== false;
+    const rows = await sql`INSERT INTO agents (org_id, name, email, mobile, role, password_hash, must_change_password) VALUES (${org_id},${name},${email},${mobile},${role},${pw},${mcp}) ON CONFLICT (email) DO UPDATE SET name=EXCLUDED.name, mobile=COALESCE(EXCLUDED.mobile,agents.mobile), role=EXCLUDED.role, password_hash=COALESCE(EXCLUDED.password_hash,agents.password_hash), must_change_password=EXCLUDED.must_change_password RETURNING *`;
+    res.status(201).json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.patch("/api/agents/:id", async (req, res) => {
-  const { name, email, mobile, role, status, sms_alerts } = req.body;
+  const { name, email, mobile, role, status, sms_alerts, password, mustChangePassword, active } = req.body;
   try {
-    const rows = await sql`UPDATE agents SET name=COALESCE(${name},name), email=COALESCE(${email},email), mobile=COALESCE(${mobile},mobile), role=COALESCE(${role},role), status=COALESCE(${status},status), sms_alerts=COALESCE(${sms_alerts},sms_alerts) WHERE id=${req.params.id} RETURNING *`;
+    const rows = await sql`
+      UPDATE agents SET
+        name=COALESCE(${name??null},name),
+        email=COALESCE(${email??null},email),
+        mobile=COALESCE(${mobile??null},mobile),
+        role=COALESCE(${role??null},role),
+        status=COALESCE(${status??null},status),
+        sms_alerts=COALESCE(${sms_alerts??null},sms_alerts),
+        password_hash=COALESCE(${password??null},password_hash),
+        must_change_password=COALESCE(${mustChangePassword??null},must_change_password),
+        active=COALESCE(${active??null},active)
+      WHERE id=${req.params.id} RETURNING *`;
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
