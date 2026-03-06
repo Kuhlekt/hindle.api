@@ -27,7 +27,6 @@ app.get("/api/health", async (req, res) => {
 
 // ─────────────────────────────────────────────
 // AI CHAT
-// POST /api/chat  { tenantId, system, messages }
 // ─────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
   const { system, messages, tenantId, conversationId } = req.body;
@@ -35,17 +34,12 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: "messages array required" });
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey)
-    return res.status(500).json({ error: "ANTHROPIC_API_KEY not set on server" });
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set on server" });
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 600,
@@ -79,9 +73,7 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// TENANT CONFIG — DB persisted
-// POST /api/tenant-config  { tenantId, ...config }
-// GET  /api/tenant-config/:tenantId
+// TENANT CONFIG
 // ─────────────────────────────────────────────
 app.post("/api/tenant-config", async (req, res) => {
   const { tenantId, ...config } = req.body;
@@ -94,15 +86,19 @@ app.post("/api/tenant-config", async (req, res) => {
       ON CONFLICT (tenant_id) DO UPDATE
         SET config = ${payload}::jsonb, updated_at = NOW()
     `;
-    // Auto-register tenant_id on organisations so handoff can find the org
+    // Also register tenant_id on the matching organisation by widget name
     const orgName = config.widget_name || (config.brand && config.brand.name) || null;
     if (orgName) {
       try { await sql`UPDATE organisations SET tenant_id = ${tenantId} WHERE name = ${orgName} AND (tenant_id IS NULL OR tenant_id = ${tenantId})`; } catch (_) {}
     }
+    // Cache in memory too
+    tenantConfigsMemory[tenantId] = { ...config, updatedAt: new Date().toISOString() };
     res.json({ ok: true, tenantId, storage: "db" });
   } catch (e) {
+    // DB failed — fall back to memory
     tenantConfigsMemory[tenantId] = { ...tenantConfigsMemory[tenantId], ...config, updatedAt: new Date().toISOString() };
-    res.json({ ok: true, tenantId, storage: "memory" });
+    console.error("tenant-config DB error:", e.message);
+    res.json({ ok: true, tenantId, storage: "memory", warning: e.message });
   }
 });
 
@@ -118,23 +114,17 @@ app.get("/api/tenant-config/:tenantId", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// HANDOFF — widget "Speak to a Human"
-// POST /api/handoff
-// Creates conversation + messages in DB
-// Sends SMS via ClickSend if configured
+// HANDOFF
 // ─────────────────────────────────────────────
 app.post("/api/handoff", async (req, res) => {
   const { tenantId, sessionId, conversationId: existingConvId, visitorEmail, visitorName, page, url, history } = req.body;
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
 
-  // Load tenant config for ClickSend creds + agents
-  let tenantConfig = {};
+  let tenantConfig = tenantConfigsMemory[tenantId] || {};
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId}`;
     if (rows.length) tenantConfig = rows[0].config;
-  } catch (e) {
-    tenantConfig = tenantConfigsMemory[tenantId] || {};
-  }
+  } catch (e) {}
 
   const cs = tenantConfig.clicksend || {};
   const agents = tenantConfig.agents || [];
@@ -143,24 +133,20 @@ app.post("/api/handoff", async (req, res) => {
   const visitorLabel = visitorName || visitorEmail || "Website Visitor";
   const magicUrl = (url || page || "/") + (url && url.includes("?") ? "&" : "?") + "token=" + token;
 
-  // ── Create or update conversation record so dashboard shows it ──
   let conversationId = existingConvId || null;
   try {
     const orgRows = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
     const orgId = orgRows.length ? orgRows[0].id : null;
 
     if (conversationId) {
-      // Conversation already created by widget — update status to handoff
       await sql`UPDATE conversations SET status='handoff', visitor_name=${visitorLabel}, visitor_email=${visitorEmail || null}, updated_at=NOW() WHERE id=${conversationId}`;
     } else {
-      // No existing conversation — create one
       const convRows = await sql`
         INSERT INTO conversations (org_id, visitor_name, visitor_email, page, status)
         VALUES (${orgId}, ${visitorLabel}, ${visitorEmail || null}, ${page || "/"}, 'handoff')
         RETURNING id
       `;
       conversationId = convRows[0].id;
-      // Save chat history
       if (history && history.length) {
         for (const msg of history.slice(-20)) {
           const mtype = msg.role === "assistant" ? "bot" : "visitor";
@@ -169,27 +155,16 @@ app.post("/api/handoff", async (req, res) => {
         }
       }
     }
-
-    // Add system handoff message
     await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${conversationId}, 'system', 'System', ${"Visitor requested a human agent"})`;
-
   } catch (e) {
-    console.warn("Could not update conversation record:", e.message);
+    console.warn("Handoff conversation error:", e.message);
   }
 
-  // ── Log to alert_log ──
   try {
-    await sql`
-      INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token)
-      VALUES (${tenantId}, ${conversationId || null}, ${"Widget Handoff"}, ${"—"}, ${visitorLabel}, ${page || "/"}, ${token})
-    `;
+    await sql`INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token) VALUES (${tenantId}, ${conversationId || null}, ${"Widget Handoff"}, ${"—"}, ${visitorLabel}, ${page || "/"}, ${token})`;
   } catch (e) {}
 
-  // ── Send SMS via ClickSend ──
-  let smsSent = false;
-  let smsError = null;
-  let smsTargets = 0;
-
+  let smsSent = false, smsError = null, smsTargets = 0;
   if (cs.configured && cs.username && cs.apiKey) {
     const targets = agents.filter((a) => a.mobile && a.smsAlerts !== false && a.active !== false);
     smsTargets = targets.length;
@@ -199,40 +174,22 @@ app.post("/api/handoff", async (req, res) => {
         const smsBody = "[" + smsSender + "] " + visitorLabel + " on " + (page || "/") + " wants to chat. Join: " + magicUrl;
         const messages = targets.map((a) => ({ source: "sdk", to: a.mobile, from: smsSender, body: smsBody, schedule: 0 }));
         const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: auth },
-          body: JSON.stringify({ messages }),
-          signal: AbortSignal.timeout(8000),
+          method: "POST", headers: { "Content-Type": "application/json", Authorization: auth },
+          body: JSON.stringify({ messages }), signal: AbortSignal.timeout(8000),
         });
         const d = await r.json();
         smsSent = d?.data?.messages?.every((m) => m.status === "SUCCESS");
         if (!smsSent) smsError = d?.data?.messages?.[0]?.status || "Send failed";
-        try {
-          await sql`UPDATE alert_log SET status = ${smsSent ? "sent" : "failed"} WHERE token = ${token}`;
-        } catch (_) {}
-      } catch (e) {
-        smsError = e.message;
-      }
-    } else {
-      smsError = "No agents with mobile + SMS alerts enabled";
-    }
-  } else {
-    smsError = "ClickSend not configured";
-  }
+        try { await sql`UPDATE alert_log SET status = ${smsSent ? "sent" : "failed"} WHERE token = ${token}`; } catch (_) {}
+      } catch (e) { smsError = e.message; }
+    } else { smsError = "No agents with mobile + SMS alerts enabled"; }
+  } else { smsError = "ClickSend not configured"; }
 
-  res.json({
-    ok: true,
-    smsSent,
-    smsTargets,
-    smsError,
-    token,
-    conversationId,
-    message: smsSent ? "SMS sent to " + smsTargets + " agent(s)" : "Handoff logged — " + (smsError || "SMS not configured"),
-  });
+  res.json({ ok: true, smsSent, smsTargets, smsError, token, conversationId, message: smsSent ? "SMS sent to " + smsTargets + " agent(s)" : "Handoff logged — " + (smsError || "SMS not configured") });
 });
 
 // ─────────────────────────────────────────────
-// FETCH URL — KB import proxy
+// FETCH URL (KB proxy)
 // ─────────────────────────────────────────────
 app.post("/api/fetch-url", async (req, res) => {
   const { url } = req.body;
@@ -244,9 +201,7 @@ app.post("/api/fetch-url", async (req, res) => {
     const html = await r.text();
     const text = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().substring(0, 20000);
     res.json({ text, url });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─────────────────────────────────────────────
@@ -283,9 +238,7 @@ app.delete("/api/tenants/:id", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// AUTH — server-side password verification
-// POST /api/auth { email, password }
-// Returns { ok, role, name, id, mustChangePassword }
+// AUTH
 // ─────────────────────────────────────────────
 app.post("/api/auth", async (req, res) => {
   const { email, password } = req.body;
@@ -301,7 +254,6 @@ app.post("/api/auth", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/auth/set-password — update password after forced change
 app.post("/api/auth/set-password", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
@@ -314,6 +266,8 @@ app.post("/api/auth/set-password", async (req, res) => {
 
 // ─────────────────────────────────────────────
 // AGENTS
+// Upsert does NOT rely on ON CONFLICT — uses explicit SELECT then INSERT/UPDATE
+// to avoid failing when unique constraint is missing
 // ─────────────────────────────────────────────
 app.get("/api/agents", async (req, res) => {
   try {
@@ -321,35 +275,64 @@ app.get("/api/agents", async (req, res) => {
     res.json(org_id ? await sql`SELECT * FROM agents WHERE org_id=${org_id} ORDER BY name` : await sql`SELECT * FROM agents ORDER BY name`);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.post("/api/agents", async (req, res) => {
   const { org_id, name, email, mobile, role = "agent", password, mustChangePassword } = req.body;
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
   try {
     const pw = password || null;
     const mcp = mustChangePassword !== false;
-    const rows = await sql`INSERT INTO agents (org_id, name, email, mobile, role, password_hash, must_change_password) VALUES (${org_id},${name},${email},${mobile},${role},${pw},${mcp}) ON CONFLICT (email) DO UPDATE SET name=EXCLUDED.name, mobile=COALESCE(EXCLUDED.mobile,agents.mobile), role=EXCLUDED.role, password_hash=COALESCE(EXCLUDED.password_hash,agents.password_hash), must_change_password=EXCLUDED.must_change_password RETURNING *`;
+    // Check if agent already exists
+    const existing = await sql`SELECT id FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+    let rows;
+    if (existing.length) {
+      // UPDATE — preserve existing password if new one not provided
+      rows = await sql`
+        UPDATE agents SET
+          name = ${name},
+          mobile = COALESCE(${mobile || null}, mobile),
+          role = ${role},
+          password_hash = CASE WHEN ${pw}::text IS NOT NULL THEN ${pw} ELSE password_hash END,
+          must_change_password = ${mcp},
+          active = true
+        WHERE LOWER(email) = LOWER(${email})
+        RETURNING *
+      `;
+    } else {
+      // INSERT
+      rows = await sql`
+        INSERT INTO agents (org_id, name, email, mobile, role, password_hash, must_change_password)
+        VALUES (${org_id}, ${name}, ${email}, ${mobile || null}, ${role}, ${pw}, ${mcp})
+        RETURNING *
+      `;
+    }
     res.status(201).json(rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error("POST /api/agents error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
+
 app.patch("/api/agents/:id", async (req, res) => {
   const { name, email, mobile, role, status, sms_alerts, password, mustChangePassword, active } = req.body;
   try {
     const rows = await sql`
       UPDATE agents SET
-        name=COALESCE(${name??null},name),
-        email=COALESCE(${email??null},email),
-        mobile=COALESCE(${mobile??null},mobile),
-        role=COALESCE(${role??null},role),
-        status=COALESCE(${status??null},status),
-        sms_alerts=COALESCE(${sms_alerts??null},sms_alerts),
-        password_hash=COALESCE(${password??null},password_hash),
-        must_change_password=COALESCE(${mustChangePassword??null},must_change_password),
-        active=COALESCE(${active??null},active)
+        name=COALESCE(${name ?? null},name),
+        email=COALESCE(${email ?? null},email),
+        mobile=COALESCE(${mobile ?? null},mobile),
+        role=COALESCE(${role ?? null},role),
+        status=COALESCE(${status ?? null},status),
+        sms_alerts=COALESCE(${sms_alerts ?? null},sms_alerts),
+        password_hash=CASE WHEN ${password ?? null}::text IS NOT NULL THEN ${password ?? null} ELSE password_hash END,
+        must_change_password=COALESCE(${mustChangePassword ?? null},must_change_password),
+        active=COALESCE(${active ?? null},active)
       WHERE id=${req.params.id} RETURNING *`;
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.delete("/api/agents/:id", async (req, res) => {
   try { await sql`DELETE FROM agents WHERE id=${req.params.id}`; res.json({ deleted: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
