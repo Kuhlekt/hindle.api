@@ -36,6 +36,43 @@ app.post("/api/chat", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set on server" });
 
+  // If caller sent an explicit system prompt (e.g. test chat), use it.
+  // Widget does not send system — fall back to DB stored config.
+  let effectiveSystem = system || null;
+  if (!effectiveSystem && tenantId) {
+    try {
+      let cfg = tenantConfigsMemory[tenantId];
+      if (!cfg) {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId}`;
+        if (rows.length) { cfg = rows[0].config; tenantConfigsMemory[tenantId] = cfg; }
+      }
+      if (cfg && cfg.systemPrompt) {
+        effectiveSystem = cfg.systemPrompt;
+        // Append KB context from stored docs
+        if (cfg.kb && cfg.kb.length) {
+          const kbCtx = cfg.kb.filter(d => d.content).map(d => "=== " + (d.title||d.name) + " ===\n" + d.content).join("\n\n");
+          if (kbCtx) effectiveSystem += "\n\nAnswer from the knowledge base below. Do not answer questions about topics not covered here — say you will connect the visitor to a human instead.\n\n" + kbCtx;
+        }
+      }
+    } catch (_) {}
+  }
+  // For test chat that sends system but no KB in payload — append KB from DB
+  if (system && tenantId) {
+    try {
+      let cfg = tenantConfigsMemory[tenantId];
+      if (!cfg) {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId}`;
+        if (rows.length) { cfg = rows[0].config; tenantConfigsMemory[tenantId] = cfg; }
+      }
+      if (cfg && cfg.kb && cfg.kb.length) {
+        const kbCtx = cfg.kb.filter(d => d.content).map(d => "=== " + (d.title||d.name) + " ===\n" + d.content).join("\n\n");
+        if (kbCtx && !effectiveSystem.includes("knowledge base")) {
+          effectiveSystem += "\n\nAnswer from the knowledge base below. Do not answer questions about topics not covered here — say you will connect the visitor to a human instead.\n\n" + kbCtx;
+        }
+      }
+    } catch (_) {}
+  }
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -43,7 +80,7 @@ app.post("/api/chat", async (req, res) => {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 600,
-        system: system || "You are a helpful support assistant. Answer concisely and helpfully.",
+        system: effectiveSystem || "You are a helpful support assistant. Answer concisely and helpfully.",
         messages: messages.map((m) => ({
           role: m.role === "visitor" || m.role === "user" ? "user" : "assistant",
           content: m.content || m.text || "",
@@ -59,9 +96,10 @@ app.post("/api/chat", async (req, res) => {
     const data = await response.json();
     const reply = data.content?.[0]?.text || "";
 
+    // NOTE: Widget calls /api/conversations/:id/messages to save both visitor and bot messages.
+    // Server only updates the timestamp so the conversation appears active.
     if (conversationId) {
       try {
-        await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${conversationId}, 'bot', 'AI', ${reply})`;
         await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${conversationId}`;
       } catch (_) {}
     }
