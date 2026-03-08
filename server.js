@@ -177,11 +177,15 @@ app.post("/api/handoff", async (req, res) => {
     const orgId = orgRows.length ? orgRows[0].id : null;
 
     if (conversationId) {
-      await sql`UPDATE conversations SET status='handoff', visitor_name=${visitorLabel}, visitor_email=${visitorEmail || null}, updated_at=NOW() WHERE id=${conversationId}`;
+      const vPhone = req.body.visitorPhone || null;
+      const vCompany = req.body.visitorCompany || null;
+      await sql`UPDATE conversations SET status='handoff', visitor_name=${visitorLabel}, visitor_email=${visitorEmail || null}, visitor_phone=${vPhone}, visitor_company=${vCompany}, updated_at=NOW() WHERE id=${conversationId}`;
     } else {
+      const vPhone2 = req.body.visitorPhone || null;
+      const vCompany2 = req.body.visitorCompany || null;
       const convRows = await sql`
-        INSERT INTO conversations (org_id, visitor_name, visitor_email, page, status)
-        VALUES (${orgId}, ${visitorLabel}, ${visitorEmail || null}, ${page || "/"}, 'handoff')
+        INSERT INTO conversations (org_id, visitor_name, visitor_email, visitor_phone, visitor_company, page, status)
+        VALUES (${orgId}, ${visitorLabel}, ${visitorEmail || null}, ${vPhone2}, ${vCompany2}, ${page || "/"}, 'handoff')
         RETURNING id
       `;
       conversationId = convRows[0].id;
@@ -248,6 +252,20 @@ app.post("/api/fetch-url", async (req, res) => {
 app.get("/api/tenants", async (req, res) => {
   try { res.json(await sql`SELECT * FROM organisations ORDER BY created_at DESC`); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Look up org by agent email — used to auto-set tenantId on login
+app.get("/api/org-by-email/:email", async (req, res) => {
+  try {
+    const rows = await sql`
+      SELECT o.* FROM organisations o
+      JOIN agents a ON a.org_id = o.id
+      WHERE LOWER(a.email) = LOWER(${req.params.email})
+      LIMIT 1
+    `;
+    if (!rows.length) return res.status(404).json({ error: "not found" });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get("/api/tenants/:id", async (req, res) => {
   try {
