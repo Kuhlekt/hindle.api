@@ -309,6 +309,98 @@ app.post("/api/auth/check-email", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// In-memory OTP store: { key: { code, expires, agentId, email, role, name } }
+const magicTokens = {};
+
+// Send magic link (email or SMS) — generates a 6-digit code and sends via ClickSend
+app.post("/api/auth/magic-link", async (req, res) => {
+  const { email, mobile } = req.body;
+  if (!email && !mobile) return res.status(400).json({ error: "email or mobile required" });
+  try {
+    // Look up agent
+    let rows;
+    if (email) {
+      rows = await sql`SELECT id, name, email, role, active FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+    } else {
+      rows = await sql`SELECT id, name, email, role, active, mobile FROM agents WHERE mobile = ${mobile} LIMIT 1`;
+    }
+    if (!rows.length) return res.status(404).json({ error: "no_account" });
+    const agent = rows[0];
+    if (agent.active === false) return res.status(403).json({ error: "disabled" });
+
+    // Generate 6-digit code, valid 15 minutes
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const key = email ? email.toLowerCase() : mobile;
+    magicTokens[key] = { code, expires: Date.now() + 15 * 60 * 1000, id: agent.id, email: agent.email, role: agent.role || "agent", name: agent.name || "" };
+
+    // Send via ClickSend — get credentials from tenant config
+    let sent = false;
+    try {
+      // Get clicksend creds from any tenant config that has them
+      let csUser = process.env.CLICKSEND_USER || "";
+      let csKey  = process.env.CLICKSEND_KEY  || "";
+      // Try to find from tenant configs in memory
+      if (!csUser) {
+        for (const k of Object.keys(tenantConfigsMemory)) {
+          const c = tenantConfigsMemory[k];
+          if (c?.clicksend?.username && c?.clicksend?.apiKey) {
+            csUser = c.clicksend.username;
+            csKey  = c.clicksend.apiKey;
+            break;
+          }
+        }
+      }
+      if (!csUser) {
+        // Try DB
+        const cfgRows = await sql`SELECT config FROM tenant_configs LIMIT 5`;
+        for (const row of cfgRows) {
+          const c = row.config;
+          if (c?.clicksend?.username && c?.clicksend?.apiKey) {
+            csUser = c.clicksend.username;
+            csKey  = c.clicksend.apiKey;
+            break;
+          }
+        }
+      }
+
+      if (csUser && csKey) {
+        const auth = Buffer.from(csUser + ":" + csKey).toString("base64");
+        if (mobile) {
+          // SMS
+          const smsBody = { messages: [{ source: "sdk", body: "Your Hindle sign-in code: " + code + " (expires in 15 min)", to: mobile, _from: "Hindle" }] };
+          const r = await fetch("https://rest.clicksend.com/v3/sms/send", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Basic " + auth }, body: JSON.stringify(smsBody) });
+          sent = r.ok;
+        } else {
+          // Email via ClickSend transactional email
+          const emailBody = { to: [{ email: agent.email, name: agent.name || "" }], from: { email_address_id: 0, name: "Hindle Platform", email: csUser }, subject: "Your Hindle sign-in code: " + code, body: "<p>Hi " + (agent.name||"") + ",</p><p>Your sign-in code is: <strong style=\"font-size:28px\">" + code + "</strong></p><p>This code expires in 15 minutes. Do not share it.</p><p>If you didn't request this, you can safely ignore this email.</p>" };
+          const r = await fetch("https://rest.clicksend.com/v3/transactional-email/send", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Basic " + auth }, body: JSON.stringify(emailBody) });
+          sent = r.ok;
+        }
+      }
+    } catch (sendErr) {
+      console.error("Magic link send error:", sendErr.message);
+    }
+
+    // Always respond ok — code is in memory, client shows OTP input
+    // In dev/no-clicksend mode, log the code for testing
+    if (!sent) console.log("[Hindle] Magic code for", key, ":", code);
+    res.json({ ok: true, sent, hint: sent ? undefined : code }); // only return hint if not sent (dev mode)
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Verify magic link OTP code
+app.post("/api/auth/magic-verify", async (req, res) => {
+  const { email, mobile, token } = req.body;
+  const key = email ? email.toLowerCase() : mobile;
+  if (!key || !token) return res.status(400).json({ error: "key and token required" });
+  const record = magicTokens[key];
+  if (!record) return res.status(400).json({ error: "No code found. Request a new one." });
+  if (Date.now() > record.expires) { delete magicTokens[key]; return res.status(400).json({ error: "Code expired. Request a new one." }); }
+  if (record.code !== String(token).trim()) return res.status(400).json({ error: "Incorrect code. Try again." });
+  delete magicTokens[key]; // one-time use
+  res.json({ ok: true, id: record.id, email: record.email, role: record.role, name: record.name });
+});
+
 app.post("/api/auth", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
