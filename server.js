@@ -419,20 +419,13 @@ app.post("/api/auth", async (req, res) => {
     if (agent.active === false) return res.status(403).json({ error: "disabled" });
     if (!agent.password_hash) return res.status(401).json({ error: "no_password" });
     if (agent.password_hash !== password) return res.status(401).json({ error: "wrong_password" });
-    // If agent has no org_id, try to assign one by matching org email or domain
+    // Resolve org_id — try exact email match on organisations table
     let orgId = agent.org_id || null;
     if (!orgId) {
       try {
-        // Match by exact email first, then by domain
-        const domain = email.split("@")[1] || "";
-        const orgRows = await sql`
-          SELECT id FROM organisations
-          WHERE LOWER(email) = LOWER(${email})
-             OR LOWER(email) LIKE ${"%" + domain}
-          ORDER BY created_at LIMIT 1
-        `;
-        if (orgRows.length) {
-          orgId = orgRows[0].id;
+        const orgByEmail = await sql`SELECT id FROM organisations WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+        if (orgByEmail.length) {
+          orgId = orgByEmail[0].id;
           await sql`UPDATE agents SET org_id=${orgId} WHERE id=${agent.id}`;
         }
       } catch (_) {}
