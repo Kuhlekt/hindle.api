@@ -296,6 +296,19 @@ app.delete("/api/tenants/:id", async (req, res) => {
 // ─────────────────────────────────────────────
 // AUTH
 // ─────────────────────────────────────────────
+// Check if email exists — used for magic link flow (no password needed)
+app.post("/api/auth/check-email", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  try {
+    const rows = await sql`SELECT id, name, email, role, active FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "no_account" });
+    const a = rows[0];
+    if (a.active === false) return res.status(403).json({ error: "disabled" });
+    res.json({ ok: true, id: a.id, name: a.name, email: a.email, role: a.role || "agent" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post("/api/auth", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
