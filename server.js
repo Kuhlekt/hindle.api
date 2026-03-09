@@ -505,13 +505,15 @@ app.delete("/api/agents/:id", async (req, res) => {
 app.get("/api/conversations", async (req, res) => {
   try {
     const { org_id, status } = req.query;
+    // Must have org_id — never return all tenants' conversations
+    if (!org_id && req.query.super !== "1") return res.json([]);
     let rows;
     if (org_id && status) rows = await sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id=a.id WHERE c.org_id=${org_id} AND c.status=${status} ORDER BY c.updated_at DESC`;
     else if (org_id) rows = await sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id=a.id WHERE c.org_id=${org_id} ORDER BY c.updated_at DESC`;
     else rows = await sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id=a.id ORDER BY c.updated_at DESC`;
-    res.json(rows);
+    res.json(rows || []);
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
+});;
 app.get("/api/conversations/:id", async (req, res) => {
   try {
     const rows = await sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id=a.id WHERE c.id=${req.params.id}`;
@@ -560,9 +562,13 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
 app.get("/api/alert-log", async (req, res) => {
   try {
     const { org_id } = req.query;
-    res.json(org_id ? await sql`SELECT * FROM alert_log WHERE org_id=${org_id} ORDER BY created_at DESC` : await sql`SELECT * FROM alert_log ORDER BY created_at DESC`);
+    if (!org_id && req.query.super !== "1") return res.json([]);
+    res.json(org_id
+      ? await sql`SELECT * FROM alert_log WHERE org_id=${org_id} ORDER BY created_at DESC`
+      : await sql`SELECT * FROM alert_log ORDER BY created_at DESC`
+    );
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
+});;
 app.post("/api/alert-log", async (req, res) => {
   const { org_id, conversation_id, agent_name, mobile, visitor_name, page, token } = req.body;
   try { res.status(201).json((await sql`INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token) VALUES (${org_id},${conversation_id},${agent_name},${mobile},${visitor_name},${page},${token}) RETURNING *`)[0]); }
