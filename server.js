@@ -257,14 +257,22 @@ app.get("/api/tenants", async (req, res) => {
 // Look up org by agent email — used to auto-set tenantId on login
 app.get("/api/org-by-email/:email", async (req, res) => {
   try {
-    const rows = await sql`
-      SELECT o.* FROM organisations o
-      JOIN agents a ON a.org_id = o.id
-      WHERE LOWER(a.email) = LOWER(${req.params.email})
-      LIMIT 1
-    `;
-    if (!rows.length) return res.status(404).json({ error: "not found" });
-    res.json(rows[0]);
+    // First find the agent
+    const agents = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${req.params.email}) LIMIT 1`;
+    if (!agents.length) return res.status(404).json({ error: "not found" });
+    const agent = agents[0];
+    // If agent has org_id, fetch that org
+    if (agent.org_id) {
+      const orgs = await sql`SELECT * FROM organisations WHERE id = ${agent.org_id} LIMIT 1`;
+      if (orgs.length) return res.json(orgs[0]);
+    }
+    // Fallback: match org by email domain or direct email match
+    const orgs = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${req.params.email}) LIMIT 1`;
+    if (orgs.length) return res.json(orgs[0]);
+    // Last resort: return first org (single-tenant fallback)
+    const allOrgs = await sql`SELECT * FROM organisations ORDER BY created_at LIMIT 1`;
+    if (allOrgs.length) return res.json(allOrgs[0]);
+    return res.status(404).json({ error: "not found" });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get("/api/tenants/:id", async (req, res) => {
@@ -411,7 +419,25 @@ app.post("/api/auth", async (req, res) => {
     if (agent.active === false) return res.status(403).json({ error: "disabled" });
     if (!agent.password_hash) return res.status(401).json({ error: "no_password" });
     if (agent.password_hash !== password) return res.status(401).json({ error: "wrong_password" });
-    res.json({ ok: true, id: agent.id, name: agent.name, email: agent.email, role: agent.role || "agent", mustChangePassword: agent.must_change_password || false });
+    // If agent has no org_id, try to assign one by matching org email or domain
+    let orgId = agent.org_id || null;
+    if (!orgId) {
+      try {
+        // Match by exact email first, then by domain
+        const domain = email.split("@")[1] || "";
+        const orgRows = await sql`
+          SELECT id FROM organisations
+          WHERE LOWER(email) = LOWER(${email})
+             OR LOWER(email) LIKE ${"%" + domain}
+          ORDER BY created_at LIMIT 1
+        `;
+        if (orgRows.length) {
+          orgId = orgRows[0].id;
+          await sql`UPDATE agents SET org_id=${orgId} WHERE id=${agent.id}`;
+        }
+      } catch (_) {}
+    }
+    res.json({ ok: true, id: agent.id, name: agent.name, email: agent.email, role: agent.role || "agent", org_id: orgId, mustChangePassword: agent.must_change_password || false });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
