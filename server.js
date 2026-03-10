@@ -522,35 +522,37 @@ app.post("/api/handoff", async (req, res) => {
     (page ? ` on ${page}` : "") +
     `.\nJoin here: ${magicUrl}`;
 
-  // Send SMS via Twilio
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken  = process.env.TWILIO_AUTH_TOKEN;
-  const fromNumber = process.env.TWILIO_FROM_NUMBER;
+  // Send SMS via ClickSend
+  const csUsername = process.env.CLICKSEND_USERNAME;
+  const csApiKey   = process.env.CLICKSEND_API_KEY;
+  const fromNumber = process.env.CLICKSEND_FROM || "HindleChat";
 
-  if (!accountSid || !authToken || !fromNumber) {
-    // SMS env vars not configured — log alert and return the magic URL anyway
-    console.warn("Twilio env vars not set; SMS not sent.");
-    return res.json({ ok: true, smsSent: false, magicUrl, warning: "Twilio not configured" });
+  if (!csUsername || !csApiKey) {
+    console.warn("ClickSend env vars not set; SMS not sent.");
+    return res.json({ ok: true, smsSent: false, magicUrl, warning: "ClickSend not configured" });
   }
 
   try {
-    const twilioRes = await fetch(
-      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Authorization: "Basic " + Buffer.from(`${accountSid}:${authToken}`).toString("base64"),
-        },
-        body: new URLSearchParams({ From: fromNumber, To: agentMobile, Body: smsBody }),
-      }
-    );
+    const csRes = await fetch("https://rest.clicksend.com/v3/sms/send", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Basic " + Buffer.from(`${csUsername}:${csApiKey}`).toString("base64"),
+      },
+      body: JSON.stringify({
+        messages: [{
+          to: agentMobile,
+          body: smsBody,
+          source: fromNumber,
+        }],
+      }),
+    });
 
-    const twilioData = await twilioRes.json();
+    const csData = await csRes.json();
 
-    if (!twilioRes.ok) {
-      console.error("Twilio error:", twilioData);
-      return res.status(502).json({ error: "SMS failed", detail: twilioData });
+    if (!csRes.ok || csData.response_code !== "SUCCESS") {
+      console.error("ClickSend error:", csData);
+      return res.status(502).json({ error: "SMS failed", detail: csData });
     }
 
     // Log the alert to DB if we have a conversationId
@@ -565,7 +567,7 @@ app.post("/api/handoff", async (req, res) => {
       }
     }
 
-    res.json({ ok: true, smsSent: true, magicUrl, sid: twilioData.sid });
+    res.json({ ok: true, smsSent: true, magicUrl });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
