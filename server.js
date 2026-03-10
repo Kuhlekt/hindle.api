@@ -143,9 +143,20 @@ app.post("/api/tenant-config", async (req, res) => {
 app.get("/api/tenant-config/:tenantId", async (req, res) => {
   const { tenantId } = req.params;
   try {
+    // Try direct match first
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId}`;
     if (rows.length) return res.json(rows[0].config);
-  } catch (e) {}
+    // Try resolving slug → UUID via organisations table
+    const orgRows = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    if (orgRows.length) {
+      const uuid = orgRows[0].id;
+      const rows2 = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${uuid}`;
+      if (rows2.length) return res.json(rows2[0].config);
+    }
+  } catch (e) {
+    console.error("tenant-config GET error:", e.message);
+    return res.status(500).json({ error: "DB error: " + e.message });
+  }
   const cfg = tenantConfigsMemory[tenantId];
   if (!cfg) return res.status(404).json({ error: "No config found" });
   res.json(cfg);
@@ -169,7 +180,7 @@ app.post("/api/handoff", async (req, res) => {
   const smsSender = cs.smsSender || "SUPPORT";
   const token = Math.random().toString(36).slice(2, 10).toUpperCase();
   const visitorLabel = visitorName || visitorEmail || "Website Visitor";
-  const magicUrl = (url || page || "/") + (url && url.includes("?") ? "&" : "?") + "token=" + token;
+  const magicUrl = "https://chatbot.hindleconsultants.com/?token=" + token + (conversationId ? "&conv=" + conversationId : "");
 
   let conversationId = existingConvId || null;
   try {
@@ -588,6 +599,31 @@ app.get("/api/alert-log", async (req, res) => {
     );
   } catch (e) { res.status(500).json({ error: e.message }); }
 });;
+// Resolve handoff token → org + conversation (for SMS magic link)
+app.get("/api/handoff-token/:token", async (req, res) => {
+  try {
+    const rows = await sql`SELECT * FROM alert_log WHERE token = ${req.params.token} LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "Invalid or expired link" });
+    const row = rows[0];
+    // Get org info
+    const orgs = await sql`SELECT * FROM organisations WHERE id = ${row.org_id} LIMIT 1`;
+    const org = orgs[0] || null;
+    // Get first tenant_admin agent for this org to auto-login
+    const agents = await sql`SELECT * FROM agents WHERE org_id = ${row.org_id} AND role = 'tenant_admin' LIMIT 1`;
+    const agent = agents[0] || null;
+    res.json({
+      ok: true,
+      token: row.token,
+      org_id: row.org_id,
+      conversation_id: row.conversation_id,
+      visitor_name: row.visitor_name,
+      page: row.page,
+      org,
+      agent,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post("/api/alert-log", async (req, res) => {
   const { org_id, conversation_id, agent_name, mobile, visitor_name, page, token } = req.body;
   try { res.status(201).json((await sql`INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token) VALUES (${org_id},${conversation_id},${agent_name},${mobile},${visitor_name},${page},${token}) RETURNING *`)[0]); }
