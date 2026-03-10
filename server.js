@@ -498,6 +498,80 @@ app.delete("/api/kb/:id", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// HANDOFF  — notify agent via SMS with magic link
+// POST /api/handoff
+// Body: { token, conversationId, agentMobile, agentName, visitorName, page, org_id }
+// ─────────────────────────────────────────────
+app.post("/api/handoff", async (req, res) => {
+  // Destructure ALL variables first — conversationId must be declared before magicUrl
+  const { token, conversationId, agentMobile, agentName, visitorName, page, org_id } = req.body;
+
+  if (!token || !agentMobile) {
+    return res.status(400).json({ error: "token and agentMobile required" });
+  }
+
+  // Build magic URL now that conversationId is safely in scope
+  const magicUrl =
+    "https://chatbot.hindleconsultants.com/?token=" +
+    token +
+    (conversationId ? "&conv=" + conversationId : "");
+
+  const smsBody =
+    `Hindle Chat – handoff request` +
+    (visitorName ? ` from ${visitorName}` : "") +
+    (page ? ` on ${page}` : "") +
+    `.\nJoin here: ${magicUrl}`;
+
+  // Send SMS via Twilio
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken  = process.env.TWILIO_AUTH_TOKEN;
+  const fromNumber = process.env.TWILIO_FROM_NUMBER;
+
+  if (!accountSid || !authToken || !fromNumber) {
+    // SMS env vars not configured — log alert and return the magic URL anyway
+    console.warn("Twilio env vars not set; SMS not sent.");
+    return res.json({ ok: true, smsSent: false, magicUrl, warning: "Twilio not configured" });
+  }
+
+  try {
+    const twilioRes = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization: "Basic " + Buffer.from(`${accountSid}:${authToken}`).toString("base64"),
+        },
+        body: new URLSearchParams({ From: fromNumber, To: agentMobile, Body: smsBody }),
+      }
+    );
+
+    const twilioData = await twilioRes.json();
+
+    if (!twilioRes.ok) {
+      console.error("Twilio error:", twilioData);
+      return res.status(502).json({ error: "SMS failed", detail: twilioData });
+    }
+
+    // Log the alert to DB if we have a conversationId
+    if (conversationId) {
+      try {
+        await sql`
+          INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token, status)
+          VALUES (${org_id || null}, ${conversationId}, ${agentName || null}, ${agentMobile}, ${visitorName || null}, ${page || null}, ${token}, 'sent')
+        `;
+      } catch (dbErr) {
+        console.warn("alert_log insert failed:", dbErr.message);
+      }
+    }
+
+    res.json({ ok: true, smsSent: true, magicUrl, sid: twilioData.sid });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
