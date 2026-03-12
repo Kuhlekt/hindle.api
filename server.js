@@ -252,10 +252,12 @@ app.post("/api/handoff", async (req, res) => {
   // ── Resolve / create conversation ─────────────────────────────────────────
   // IMPORTANT: declare conversationId BEFORE building magicUrl
   let conversationId = existingConvId || null;
+  let resolvedOrgId = null;
 
   try {
     const orgRows = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
     const orgId   = orgRows.length ? orgRows[0].id : null;
+    resolvedOrgId = orgId;
     console.log(`[Handoff] conversation orgId: ${orgId}, conversationId: ${conversationId}`);
 
     if (conversationId) {
@@ -299,7 +301,7 @@ app.post("/api/handoff", async (req, res) => {
   try {
     await sql`
       INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token)
-      VALUES (${tenantId}, ${conversationId || null}, ${"Widget Handoff"}, ${"—"}, ${visitorLabel}, ${page || "/"}, ${handoffToken})
+      VALUES (${resolvedOrgId || tenantId}, ${conversationId || null}, ${"Widget Handoff"}, ${"—"}, ${visitorLabel}, ${page || "/"}, ${handoffToken})
     `;
   } catch (e) {}
 
