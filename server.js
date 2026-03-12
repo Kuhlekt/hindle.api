@@ -180,12 +180,22 @@ app.post("/api/handoff", async (req, res) => {
   if (!tenantConfig?.clicksend?.username) {
     try {
       let pCfg = tenantConfigsMemory["platform"] || {};
-      if (!pCfg.clicksend) {
+      if (!pCfg?.clicksend?.username) {
         const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
         if (rows.length) { pCfg = rows[0].config; tenantConfigsMemory["platform"] = pCfg; }
       }
       if (pCfg?.clicksend?.username) {
         tenantConfig = { ...tenantConfig, clicksend: { ...pCfg.clicksend, ...(tenantConfig.clicksend || {}) } };
+      }
+    } catch (e) {}
+  }
+
+  // Last resort — find any tenant_configs row with clicksend credentials
+  if (!tenantConfig?.clicksend?.username) {
+    try {
+      const rows = await sql`SELECT config FROM tenant_configs WHERE (config->'clicksend'->>'username') IS NOT NULL AND (config->'clicksend'->>'username') != '' LIMIT 1`;
+      if (rows.length && rows[0].config?.clicksend?.username) {
+        tenantConfig = { ...tenantConfig, clicksend: { ...rows[0].config.clicksend, ...(tenantConfig.clicksend || {}) } };
       }
     } catch (e) {}
   }
@@ -679,15 +689,26 @@ app.post("/api/sms-test", async (req, res) => {
     } catch (e) {}
   }
 
-  // Fall back to platform-level credentials if tenant has none
+  // Fall back to platform-level credentials, then any configured tenant
   if (!csUser || !csKey) {
     try {
       let pCfg = tenantConfigsMemory["platform"] || {};
-      if (!pCfg.clicksend) {
+      if (!pCfg?.clicksend?.username) {
         const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
         if (rows.length) { pCfg = rows[0].config; tenantConfigsMemory["platform"] = pCfg; }
       }
       if (pCfg?.clicksend?.username) { csUser = pCfg.clicksend.username; csKey = pCfg.clicksend.apiKey; }
+    } catch (e) {}
+  }
+
+  // Last resort — find any tenant_configs row that has clicksend credentials
+  if (!csUser || !csKey) {
+    try {
+      const rows = await sql`SELECT config FROM tenant_configs WHERE (config->'clicksend'->>'username') IS NOT NULL AND (config->'clicksend'->>'username') != '' LIMIT 1`;
+      if (rows.length && rows[0].config?.clicksend?.username) {
+        csUser = rows[0].config.clicksend.username;
+        csKey  = rows[0].config.clicksend.apiKey;
+      }
     } catch (e) {}
   }
 
