@@ -111,18 +111,27 @@ app.post("/api/tenant-config", async (req, res) => {
   const { tenantId, ...config } = req.body;
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
   try {
-    const payload = JSON.stringify(config);
+    // Deep-merge with existing config so partial saves (e.g. just clicksend) don't wipe other keys
+    const existing = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId}`;
+    const merged = existing.length ? { ...existing[0].config, ...config } : config;
+    // Deep-merge nested objects (clicksend, brand, etc.)
+    for (const key of Object.keys(config)) {
+      if (config[key] && typeof config[key] === "object" && !Array.isArray(config[key]) && existing.length && existing[0].config[key]) {
+        merged[key] = { ...existing[0].config[key], ...config[key] };
+      }
+    }
+    const payload = JSON.stringify(merged);
     await sql`
       INSERT INTO tenant_configs (tenant_id, config, updated_at)
       VALUES (${tenantId}, ${payload}::jsonb, NOW())
       ON CONFLICT (tenant_id) DO UPDATE
         SET config = ${payload}::jsonb, updated_at = NOW()
     `;
-    const orgName = config.widget_name || (config.brand && config.brand.name) || null;
+    const orgName = merged.widget_name || (merged.brand && merged.brand.name) || null;
     if (orgName) {
       try { await sql`UPDATE organisations SET tenant_id = ${tenantId} WHERE name = ${orgName} AND (tenant_id IS NULL OR tenant_id = ${tenantId})`; } catch (_) {}
     }
-    tenantConfigsMemory[tenantId] = { ...config, updatedAt: new Date().toISOString() };
+    tenantConfigsMemory[tenantId] = { ...merged, updatedAt: new Date().toISOString() };
     res.json({ ok: true, tenantId, storage: "db" });
   } catch (e) {
     tenantConfigsMemory[tenantId] = { ...tenantConfigsMemory[tenantId], ...config, updatedAt: new Date().toISOString() };
@@ -277,7 +286,7 @@ app.post("/api/handoff", async (req, res) => {
   // ── Send SMS via ClickSend ─────────────────────────────────────────────────
   let smsSent = false, smsError = null, smsTargets = 0;
 
-  if (cs.configured && cs.username && cs.apiKey) {
+  if (cs.username && cs.apiKey) {
     const targets = agentsList.filter((a) => a.mobile && a.sms_alerts !== false && a.smsAlerts !== false && a.active !== false);
     smsTargets = targets.length;
     if (targets.length) {
@@ -300,7 +309,7 @@ app.post("/api/handoff", async (req, res) => {
       smsError = "No agents with mobile + SMS alerts enabled";
     }
   } else {
-    smsError = "ClickSend not configured in tenant settings";
+    smsError = "ClickSend credentials not available — check platform integration settings";
   }
 
   res.json({
