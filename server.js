@@ -667,7 +667,17 @@ app.get("/api/handoff-token/:token", async (req, res) => {
   try {
     const rows = await sql`SELECT * FROM alert_log WHERE token = ${req.params.token} LIMIT 1`;
     if (!rows.length) return res.status(404).json({ error: "Invalid or expired link" });
-    const row    = rows[0];
+    const row = rows[0];
+    // Enforce 5-minute expiry
+    const ageMinutes = (Date.now() - new Date(row.created_at).getTime()) / 60000;
+    if (ageMinutes > 5) {
+      await sql`UPDATE alert_log SET status = 'expired' WHERE token = ${req.params.token}`;
+      return res.status(410).json({ error: "This magic link has expired. Links are valid for 5 minutes." });
+    }
+    // Mark as clicked on first use
+    if (row.status !== 'clicked') {
+      await sql`UPDATE alert_log SET status = 'clicked' WHERE token = ${req.params.token}`;
+    }
     const orgs   = await sql`SELECT * FROM organisations WHERE id = ${row.org_id} LIMIT 1`;
     const agents = await sql`SELECT * FROM agents WHERE org_id = ${row.org_id} AND role = 'tenant_admin' LIMIT 1`;
     res.json({ ok: true, token: row.token, org_id: row.org_id, conversation_id: row.conversation_id, visitor_name: row.visitor_name, page: row.page, org: orgs[0] || null, agent: agents[0] || null });
