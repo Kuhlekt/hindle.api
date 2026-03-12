@@ -200,11 +200,26 @@ app.post("/api/handoff", async (req, res) => {
     } catch (e) {}
   }
 
-  const cs         = tenantConfig.clicksend || {};
-  const agents     = tenantConfig.agents    || [];
-  const smsSender  = cs.smsSender || "SUPPORT";
+  const csRaw      = tenantConfig.clicksend || {};
+  const agents_cfg = tenantConfig.agents    || [];
+  const smsSender  = csRaw.smsSender || "SUPPORT";
   const handoffToken = Math.random().toString(36).slice(2, 10).toUpperCase();
   const visitorLabel = visitorName || visitorEmail || "Website Visitor";
+
+  // Build effective cs — credentials may come from fallback, configured flag must reflect actual creds
+  const cs = { ...csRaw, configured: !!(csRaw.username && csRaw.apiKey) };
+
+  // Load agents from DB (source of truth), fall back to config-embedded agents
+  let agentsList = [];
+  try {
+    const orgRows2 = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
+    if (orgRows2.length) {
+      const dbAgents = await sql`SELECT * FROM agents WHERE org_id = ${orgRows2[0].id} AND active = true`;
+      agentsList = dbAgents.length ? dbAgents : agents_cfg;
+    } else {
+      agentsList = agents_cfg;
+    }
+  } catch (e) { agentsList = agents_cfg; }
 
   // ── Resolve / create conversation ─────────────────────────────────────────
   // IMPORTANT: declare conversationId BEFORE building magicUrl
@@ -263,7 +278,7 @@ app.post("/api/handoff", async (req, res) => {
   let smsSent = false, smsError = null, smsTargets = 0;
 
   if (cs.configured && cs.username && cs.apiKey) {
-    const targets = agents.filter((a) => a.mobile && a.smsAlerts !== false && a.active !== false);
+    const targets = agentsList.filter((a) => a.mobile && a.sms_alerts !== false && a.smsAlerts !== false && a.active !== false);
     smsTargets = targets.length;
     if (targets.length) {
       try {
