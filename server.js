@@ -176,6 +176,20 @@ app.post("/api/handoff", async (req, res) => {
     if (rows.length) tenantConfig = rows[0].config;
   } catch (e) {}
 
+  // If tenant has no clicksend credentials, fall back to platform-level creds
+  if (!tenantConfig?.clicksend?.username) {
+    try {
+      let pCfg = tenantConfigsMemory["platform"] || {};
+      if (!pCfg.clicksend) {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
+        if (rows.length) { pCfg = rows[0].config; tenantConfigsMemory["platform"] = pCfg; }
+      }
+      if (pCfg?.clicksend?.username) {
+        tenantConfig = { ...tenantConfig, clicksend: { ...pCfg.clicksend, ...(tenantConfig.clicksend || {}) } };
+      }
+    } catch (e) {}
+  }
+
   const cs         = tenantConfig.clicksend || {};
   const agents     = tenantConfig.agents    || [];
   const smsSender  = cs.smsSender || "SUPPORT";
@@ -662,6 +676,18 @@ app.post("/api/sms-test", async (req, res) => {
         if (rows.length) cfg = rows[0].config;
       }
       if (cfg?.clicksend?.username) { csUser = cfg.clicksend.username; csKey = cfg.clicksend.apiKey; }
+    } catch (e) {}
+  }
+
+  // Fall back to platform-level credentials if tenant has none
+  if (!csUser || !csKey) {
+    try {
+      let pCfg = tenantConfigsMemory["platform"] || {};
+      if (!pCfg.clicksend) {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
+        if (rows.length) { pCfg = rows[0].config; tenantConfigsMemory["platform"] = pCfg; }
+      }
+      if (pCfg?.clicksend?.username) { csUser = pCfg.clicksend.username; csKey = pCfg.clicksend.apiKey; }
     } catch (e) {}
   }
 
