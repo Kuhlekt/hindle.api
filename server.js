@@ -221,22 +221,25 @@ app.post("/api/handoff", async (req, res) => {
   // Load agents from DB (source of truth), fall back to config-embedded agents
   let agentsList = [];
   try {
-    const orgRows2 = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
+    const orgRows2 = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
     if (orgRows2.length) {
       const dbAgents = await sql`SELECT * FROM agents WHERE org_id = ${orgRows2[0].id} AND active = true`;
       agentsList = dbAgents.length ? dbAgents : agents_cfg;
+      console.log(`[Handoff] org found: ${orgRows2[0].id}, agents: ${dbAgents.length}`);
     } else {
       agentsList = agents_cfg;
+      console.log(`[Handoff] no org found for tenantId: ${tenantId}, using config agents: ${agents_cfg.length}`);
     }
-  } catch (e) { agentsList = agents_cfg; }
+  } catch (e) { agentsList = agents_cfg; console.log(`[Handoff] agent lookup error: ${e.message}`); }
 
   // ── Resolve / create conversation ─────────────────────────────────────────
   // IMPORTANT: declare conversationId BEFORE building magicUrl
   let conversationId = existingConvId || null;
 
   try {
-    const orgRows = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
+    const orgRows = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
     const orgId   = orgRows.length ? orgRows[0].id : null;
+    console.log(`[Handoff] conversation orgId: ${orgId}, conversationId: ${conversationId}`);
 
     if (conversationId) {
       await sql`
@@ -289,6 +292,7 @@ app.post("/api/handoff", async (req, res) => {
   if (cs.username && cs.apiKey) {
     const targets = agentsList.filter((a) => a.mobile && a.sms_alerts !== false && a.smsAlerts !== false && a.active !== false);
     smsTargets = targets.length;
+    console.log(`[Handoff] SMS: creds ok, agents: ${agentsList.length}, targets with mobile+smsAlerts: ${targets.length}`);
     if (targets.length) {
       try {
         const auth    = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
@@ -310,6 +314,7 @@ app.post("/api/handoff", async (req, res) => {
     }
   } else {
     smsError = "ClickSend credentials not available — check platform integration settings";
+    console.log(`[Handoff] No ClickSend creds. cs.username=${cs.username||"none"}`);
   }
 
   res.json({
