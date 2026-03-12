@@ -4,7 +4,24 @@ const express = require("express");
 const cors = require("cors");
 const { neon } = require("@neondatabase/serverless");
 
-const sql = neon(process.env.DATABASE_URL);
+const _sql = neon(process.env.DATABASE_URL);
+// Retry wrapper — Neon serverless can fail on cold start; retry once after 800ms
+const sql = new Proxy(_sql, {
+  apply: async (target, thisArg, args) => {
+    try { return await target.apply(thisArg, args); }
+    catch (e) {
+      if (e.message && (e.message.includes("connection") || e.message.includes("timeout") || e.message.includes("ECONNRESET"))) {
+        await new Promise(r => setTimeout(r, 800));
+        return await target.apply(thisArg, args);
+      }
+      throw e;
+    }
+  },
+  get: (target, prop) => {
+    const val = target[prop];
+    return typeof val === "function" ? val.bind(target) : val;
+  }
+});
 const app = express();
 const PORT = process.env.PORT || 3000;
 
