@@ -642,6 +642,52 @@ app.delete("/api/kb/:id", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// SMS TEST  — send a real test SMS via ClickSend
+// POST /api/sms-test
+// Body: { to, username?, apiKey?, tenantId?, sender? }
+// ─────────────────────────────────────────────
+app.post("/api/sms-test", async (req, res) => {
+  const { to, username: bodyUser, apiKey: bodyKey, tenantId, sender } = req.body;
+  if (!to) return res.status(400).json({ error: "to (mobile number) required" });
+
+  // Resolve credentials — explicit body creds take priority, then tenant config
+  let csUser = bodyUser || "";
+  let csKey  = bodyKey  || "";
+
+  if ((!csUser || !csKey) && tenantId) {
+    try {
+      let cfg = tenantConfigsMemory[tenantId] || {};
+      if (!cfg.clicksend) {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId}`;
+        if (rows.length) cfg = rows[0].config;
+      }
+      if (cfg?.clicksend?.username) { csUser = cfg.clicksend.username; csKey = cfg.clicksend.apiKey; }
+    } catch (e) {}
+  }
+
+  if (!csUser || !csKey) return res.status(400).json({ error: "ClickSend credentials not found" });
+
+  const from    = sender || "HINDLE";
+  const smsBody = "[" + from + "] This is a test SMS from your Hindle chatbot platform. If you received this, SMS alerts are working correctly.";
+
+  try {
+    const auth = "Basic " + Buffer.from(csUser + ":" + csKey).toString("base64");
+    const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: JSON.stringify({ messages: [{ source: "sdk", to, body: smsBody, from }] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const d = await r.json();
+    const ok = d?.data?.messages?.[0]?.status === "SUCCESS";
+    if (!ok) return res.status(502).json({ error: d?.data?.messages?.[0]?.status || "Send failed", detail: d });
+    res.json({ ok: true, message: "Test SMS sent to " + to });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
