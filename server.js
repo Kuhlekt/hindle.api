@@ -141,7 +141,7 @@ app.get("/api/tenant-config/:tenantId", async (req, res) => {
   const { tenantId } = req.params;
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} LIMIT 1`;
-    if (!rows.length) return res.status(404).json({ error: "No config found for this tenant" });
+    if (!rows.length) return res.json({});
     res.json(rows[0].config);
   } catch (err) {
     console.error("GET /api/tenant-config error:", err.message);
