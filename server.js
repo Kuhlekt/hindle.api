@@ -362,34 +362,45 @@ app.post("/api/invite-agent", async (req, res) => {
     const loginUrl = "https://chatbot.hindleconsultants.com";
     const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
 
-    // ClickSend transactional email API
-    const emailBody = {
+    // ClickSend email API — POST /v3/email/send
+    const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
+<h2 style="color:#2563EB;margin-bottom:8px">Welcome to Hindle AI</h2>
+<p style="color:#334155">Hi ${name || "there"},</p>
+<p style="color:#334155">You've been invited to join the Hindle Consultants AI Dashboard as an agent.</p>
+<div style="background:#F8F9FB;border:1px solid #E2E6ED;border-radius:8px;padding:16px;margin:20px 0">
+  <p style="margin:0 0 8px;font-size:13px;color:#64748B;font-weight:600">Your login details:</p>
+  <p style="margin:0 0 6px"><strong>URL:</strong> <a href="${loginUrl}" style="color:#2563EB">${loginUrl}</a></p>
+  <p style="margin:0 0 6px"><strong>Email:</strong> ${email}</p>
+  <p style="margin:0"><strong>Temporary Password:</strong> <code style="background:#fff;border:1px solid #E2E6ED;padding:3px 10px;border-radius:4px;font-size:16px;font-weight:700">${tempPassword}</code></p>
+</div>
+<p style="color:#94A3B8;font-size:12px">Please change your password after first login via the menu in the bottom-left of the dashboard.</p>
+</div>`;
+
+    const emailPayload = {
       to: [{ email, name: name || "Agent" }],
       from: { email: cs.username, name: cs.smsSender || "Hindle Consultants" },
       subject: "You've been invited to Hindle AI Dashboard",
-      body: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
-  <h2 style="color:#2563EB;margin-bottom:8px">Welcome to Hindle AI</h2>
-  <p style="color:#334155">Hi ${name || "there"},</p>
-  <p style="color:#334155">You've been invited to join the Hindle Consultants AI Dashboard as an agent.</p>
-  <div style="background:#F8F9FB;border:1px solid #E2E6ED;border-radius:8px;padding:16px;margin:20px 0">
-    <p style="margin:0 0 6px;font-size:13px;color:#64748B">Your login details:</p>
-    <p style="margin:0 0 4px"><strong>URL:</strong> <a href="${loginUrl}" style="color:#2563EB">${loginUrl}</a></p>
-    <p style="margin:0 0 4px"><strong>Email:</strong> ${email}</p>
-    <p style="margin:0"><strong>Temporary Password:</strong> <code style="background:#fff;border:1px solid #E2E6ED;padding:2px 8px;border-radius:4px;font-size:15px">${tempPassword}</code></p>
-  </div>
-  <p style="color:#94A3B8;font-size:12px">Please change your password after first login.</p>
-</div>`,
+      body: htmlBody,
     };
 
-    const r = await fetch("https://rest.clicksend.com/v3/transactional-email/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: auth },
-      body: JSON.stringify(emailBody),
-      signal: AbortSignal.timeout(10000),
-    });
-    const d = await r.json();
-    const sent = d?.data?.status === "SUCCESS" || r.ok;
-    res.json({ ok: sent, passwordSet: true, emailStatus: d?.data?.status || d?.response_code });
+    let sent = false;
+    let sendErr = null;
+    try {
+      const r = await fetch("https://rest.clicksend.com/v3/email/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: auth },
+        body: JSON.stringify(emailPayload),
+        signal: AbortSignal.timeout(10000),
+      });
+      const d = await r.json();
+      // ClickSend returns response_code "SUCCESS" at top level for email
+      sent = d?.response_code === "SUCCESS" || d?.data?.status === "SUCCESS" || r.ok;
+      if (!sent) sendErr = JSON.stringify(d).substring(0, 200);
+    } catch (fetchErr) {
+      sendErr = fetchErr.message;
+    }
+
+    res.json({ ok: sent, passwordSet: true, sendErr });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
