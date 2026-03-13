@@ -519,6 +519,384 @@ app.delete("/api/kb/:id", async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────
+// AUTH  — tenant admin login
+// POST /api/auth  { email, password }
+// Returns { ok, org_id, role, email, name }
+// ─────────────────────────────────────────────
+app.post("/api/auth", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ ok: false, error: "email and password required" });
+  try {
+    const rows = await sql`
+      SELECT * FROM organisations
+      WHERE email = ${email.trim().toLowerCase()}
+      LIMIT 1
+    `;
+    if (!rows.length) return res.status(401).json({ ok: false, error: "No account found for that email address." });
+    const org = rows[0];
+    // Password stored in tenant_configs under key "admin_password", fallback "admin"
+    let storedPass = "admin";
+    try {
+      const cfg = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org.id} LIMIT 1`;
+      if (cfg.length && cfg[0].config?.admin_password) storedPass = cfg[0].config.admin_password;
+    } catch (_) {}
+    if (password !== storedPass) return res.status(401).json({ ok: false, error: "Incorrect password." });
+    res.json({ ok: true, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// SMS TEST  — send a test SMS via ClickSend
+// POST /api/sms-test  { username, apiKey, to, sender } OR { tenantId, to }
+// ─────────────────────────────────────────────
+app.post("/api/sms-test", async (req, res) => {
+  let { username, apiKey, to, sender, tenantId } = req.body;
+  // If tenantId supplied, load credentials from DB
+  if (tenantId && (!username || !apiKey)) {
+    try {
+      // Try own tenant config first, then platform fallback
+      for (const tid of [tenantId, "platform"]) {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tid} LIMIT 1`;
+        if (rows.length && rows[0].config?.clicksend?.username) {
+          username = rows[0].config.clicksend.username;
+          apiKey   = rows[0].config.clicksend.apiKey;
+          sender   = sender || rows[0].config.clicksend.smsSender || "HINDLE";
+          break;
+        }
+      }
+    } catch (_) {}
+  }
+  if (!username || !apiKey) return res.status(400).json({ ok: false, error: "ClickSend credentials not configured" });
+  if (!to) return res.status(400).json({ ok: false, error: "to (phone number) required" });
+  try {
+    const body = { messages: [{ source: "sdk", body: "This is a test message from Hindle Consultants. If you received this, SMS is working.", to, from: sender || "HINDLE" }] };
+    const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${username}:${apiKey}`).toString("base64") },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.response_code === "SUCCESS" || d.data?.messages?.[0]?.status === "SUCCESS") {
+      res.json({ ok: true, detail: d });
+    } else {
+      res.status(400).json({ ok: false, error: d.response_msg || "ClickSend returned an error", detail: d });
+    }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// HANDOFF TOKEN  — resolve a magic link token
+// GET /api/handoff-token/:token
+// Returns { ok, org_id, conversation_id, agent: { name, email, mobile } }
+// Marks token clicked on first use; returns 410 if expired (>5 min)
+// ─────────────────────────────────────────────
+app.get("/api/handoff-token/:token", async (req, res) => {
+  const { token } = req.params;
+  try {
+    const rows = await sql`SELECT * FROM alert_log WHERE token = ${token} LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ ok: false, error: "Token not found" });
+    const row = rows[0];
+    // Check expiry — 5 minutes
+    const age = Date.now() - new Date(row.created_at).getTime();
+    if (age > 5 * 60 * 1000) {
+      await sql`UPDATE alert_log SET status = 'expired' WHERE id = ${row.id}`;
+      return res.status(410).json({ ok: false, error: "This link has expired (5-minute limit)." });
+    }
+    // Mark clicked (first use only)
+    if (row.status !== "clicked") {
+      await sql`UPDATE alert_log SET status = 'clicked' WHERE id = ${row.id}`;
+    }
+    // Look up agent details if possible
+    let agent = { name: row.agent_name, mobile: row.mobile, email: null };
+    try {
+      const agt = await sql`SELECT * FROM agents WHERE mobile = ${row.mobile} LIMIT 1`;
+      if (agt.length) agent = { name: agt[0].name, email: agt[0].email, mobile: agt[0].mobile };
+    } catch (_) {}
+    res.json({ ok: true, org_id: row.org_id, conversation_id: row.conversation_id, agent });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/handoff  — visitor-initiated handoff + ClickSend SMS
+// ─────────────────────────────────────────────
+app.post("/api/handoff", async (req, res) => {
+  const {
+    tenantId,
+    conversationId: existingConvId,
+    visitorEmail,
+    visitorName,
+    visitorPhone,
+    visitorCompany,
+    page,
+    history,
+  } = req.body;
+
+  if (!tenantId) return res.status(400).json({ error: "tenantId required" });
+
+  // ── Load tenant config (with platform fallback for ClickSend creds) ──
+  let tenantConfig = tenantConfigsMemory[tenantId] || {};
+  try {
+    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    if (rows.length) tenantConfig = rows[0].config;
+  } catch (e) {}
+
+  if (!tenantConfig?.clicksend?.username) {
+    try {
+      let pCfg = tenantConfigsMemory["platform"] || {};
+      if (!pCfg?.clicksend?.username) {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
+        if (rows.length) { pCfg = rows[0].config; tenantConfigsMemory["platform"] = pCfg; }
+      }
+      if (pCfg?.clicksend?.username) {
+        tenantConfig = { ...tenantConfig, clicksend: { ...pCfg.clicksend, ...(tenantConfig.clicksend || {}) } };
+      }
+    } catch (e) {}
+  }
+
+  if (!tenantConfig?.clicksend?.username) {
+    try {
+      const rows = await sql`SELECT config FROM tenant_configs WHERE (config->'clicksend'->>'username') IS NOT NULL AND (config->'clicksend'->>'username') != '' LIMIT 1`;
+      if (rows.length && rows[0].config?.clicksend?.username) {
+        tenantConfig = { ...tenantConfig, clicksend: { ...rows[0].config.clicksend, ...(tenantConfig.clicksend || {}) } };
+      }
+    } catch (e) {}
+  }
+
+  const cs         = tenantConfig.clicksend || {};
+  const smsSender  = (cs.smsSender || "HINDLE").substring(0, 11);
+  const visitorLabel = visitorName || visitorEmail || "A visitor";
+
+  // ── Resolve org UUID ──────────────────────────────────────────────────
+  let resolvedOrgId = null;
+  try {
+    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    if (orgs.length) resolvedOrgId = orgs[0].id;
+  } catch (e) {}
+
+  // ── Load agents from DB ───────────────────────────────────────────────
+  let agentsList = [];
+  try {
+    if (resolvedOrgId) {
+      agentsList = await sql`SELECT * FROM agents WHERE org_id = ${resolvedOrgId} AND active != false`;
+    }
+  } catch (e) {}
+
+  // ── Upsert conversation ───────────────────────────────────────────────
+  let conversationId = existingConvId || null;
+  try {
+    if (!conversationId && resolvedOrgId) {
+      const convRows = await sql`
+        INSERT INTO conversations (org_id, visitor_name, visitor_email, page, status)
+        VALUES (${resolvedOrgId}, ${visitorLabel}, ${visitorEmail || null}, ${page || "/"}, 'handoff')
+        RETURNING id
+      `;
+      conversationId = convRows[0]?.id;
+    } else if (conversationId) {
+      await sql`UPDATE conversations SET status = 'handoff', updated_at = NOW() WHERE id = ${conversationId}`;
+    }
+  } catch (e) {}
+
+  // ── Build magic link ──────────────────────────────────────────────────
+  const handoffToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const magicUrl = `https://chatbot.hindleconsultants.com/?token=${handoffToken}`;
+
+  // ── Log alert ─────────────────────────────────────────────────────────
+  try {
+    await sql`
+      INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token)
+      VALUES (${resolvedOrgId}, ${conversationId || null}, ${"Widget Handoff"}, ${"—"}, ${visitorLabel}, ${page || "/"}, ${handoffToken})
+    `;
+  } catch (e) {}
+
+  // ── Send SMS via ClickSend ────────────────────────────────────────────
+  let smsSent = false, smsError = null, smsTargets = 0;
+
+  if (cs.username && cs.apiKey) {
+    const targets = agentsList.filter(a => a.mobile && a.sms_alerts !== false && a.active !== false);
+    smsTargets = targets.length;
+    if (targets.length) {
+      try {
+        const auth    = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
+        const smsBody = "[" + smsSender + "] " + visitorLabel + " on " + (page || "/") + " wants to chat. Join: " + magicUrl;
+        const msgs    = targets.map(a => ({ source: "sdk", to: a.mobile, from: smsSender, body: smsBody, schedule: 0 }));
+        const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: auth },
+          body: JSON.stringify({ messages: msgs }),
+          signal: AbortSignal.timeout(8000),
+        });
+        const d = await r.json();
+        smsSent  = d?.data?.messages?.every(m => m.status === "SUCCESS");
+        smsError = smsSent ? null : (d?.data?.messages?.[0]?.status || "Send failed");
+        try { await sql`UPDATE alert_log SET status = ${smsSent ? "sent" : "failed"} WHERE token = ${handoffToken}`; } catch (_) {}
+      } catch (e) { smsError = e.message; }
+    } else {
+      smsError = "No agents with mobile + SMS alerts enabled";
+    }
+  } else {
+    smsError = "ClickSend credentials not configured";
+  }
+
+  res.json({
+    ok: true, smsSent, smsTargets, smsError, token: handoffToken, conversationId,
+    message: smsSent ? "SMS sent to " + smsTargets + " agent(s)" : "Handoff logged — " + (smsError || "SMS not configured"),
+  });
+});
+
+// ─────────────────────────────────────────────
+// GET /api/handoff-token/:token  — magic link verification
+// ─────────────────────────────────────────────
+app.get("/api/handoff-token/:token", async (req, res) => {
+  try {
+    const rows = await sql`SELECT * FROM alert_log WHERE token = ${req.params.token} LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "Invalid or expired link" });
+    const row = rows[0];
+    // Check expiry (5 minutes)
+    const age = Date.now() - new Date(row.created_at).getTime();
+    if (age > 5 * 60 * 1000) {
+      try { await sql`UPDATE alert_log SET status = 'expired' WHERE token = ${req.params.token}`; } catch (_) {}
+      return res.status(410).json({ error: "Link expired", expired: true });
+    }
+    if (row.status === "expired") return res.status(410).json({ error: "Link expired", expired: true });
+    // Mark clicked
+    try { await sql`UPDATE alert_log SET status = 'clicked' WHERE token = ${req.params.token}`; } catch (_) {}
+    const orgs   = await sql`SELECT * FROM organisations WHERE id = ${row.org_id} LIMIT 1`;
+    const agents = await sql`SELECT * FROM agents WHERE org_id = ${row.org_id} AND role = 'tenant_admin' LIMIT 1`;
+    res.json({ ok: true, token: row.token, org_id: row.org_id, conversation_id: row.conversation_id,
+               visitor_name: row.visitor_name, page: row.page, org: orgs[0] || null, agent: agents[0] || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/org-by-email/:email
+// ─────────────────────────────────────────────
+app.get("/api/org-by-email/:email", async (req, res) => {
+  try {
+    const agents = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${req.params.email}) LIMIT 1`;
+    if (agents.length && agents[0].org_id) {
+      const orgs = await sql`SELECT * FROM organisations WHERE id = ${agents[0].org_id} LIMIT 1`;
+      if (orgs.length) return res.json(orgs[0]);
+    }
+    const orgs = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${req.params.email}) LIMIT 1`;
+    if (orgs.length) return res.json(orgs[0]);
+    const allOrgs = await sql`SELECT * FROM organisations ORDER BY created_at LIMIT 1`;
+    if (allOrgs.length) return res.json(allOrgs[0]);
+    return res.status(404).json({ error: "not found" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// AUTH
+// ─────────────────────────────────────────────
+app.post("/api/auth/check-email", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  try {
+    const rows = await sql`SELECT id, name, email, role, password_hash, org_id FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "no_account" });
+    const a = rows[0];
+    res.json({ exists: true, hasPassword: !!a.password_hash, name: a.name, role: a.role, org_id: a.org_id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/auth/magic-link", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  try {
+    const rows = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "no_account" });
+    const agent = rows[0];
+    const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    // Store the token (reuse alert_log or a dedicated table — using a temp JSON in tenant_configs)
+    // Simple approach: store in agent record temporarily
+    await sql`UPDATE agents SET magic_token = ${token}, magic_token_at = NOW() WHERE id = ${agent.id}`;
+    const link = `https://chatbot.hindleconsultants.com/?magic=${token}`;
+    // In production send via email — for now return it (dev mode)
+    res.json({ ok: true, link, message: "Magic link generated (send via email in production)" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/auth/magic-verify", async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: "token required" });
+  try {
+    const rows = await sql`SELECT * FROM agents WHERE magic_token = ${token} LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "invalid_token" });
+    const agent = rows[0];
+    const age = Date.now() - new Date(agent.magic_token_at || 0).getTime();
+    if (age > 30 * 60 * 1000) return res.status(410).json({ error: "token_expired" });
+    await sql`UPDATE agents SET magic_token = NULL, magic_token_at = NULL WHERE id = ${agent.id}`;
+    let orgId = agent.org_id;
+    if (!orgId) {
+      try {
+        const orgs = await sql`SELECT id FROM organisations WHERE LOWER(email) = LOWER(${agent.email}) LIMIT 1`;
+        if (orgs.length) orgId = orgs[0].id;
+      } catch (_) {}
+    }
+    res.json({ ok: true, id: agent.id, name: agent.name, email: agent.email, role: agent.role || "agent", org_id: orgId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/auth", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    const rows = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "no_account" });
+    const agent = rows[0];
+    if (agent.active === false) return res.status(403).json({ error: "disabled" });
+    if (!agent.password_hash) return res.status(401).json({ error: "no_password" });
+    if (agent.password_hash !== password) return res.status(401).json({ error: "wrong_password" });
+    let orgId = agent.org_id || null;
+    if (!orgId) {
+      try {
+        const orgByEmail = await sql`SELECT id FROM organisations WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+        if (orgByEmail.length) { orgId = orgByEmail[0].id; await sql`UPDATE agents SET org_id = ${orgId} WHERE id = ${agent.id}`; }
+      } catch (_) {}
+    }
+    res.json({ ok: true, id: agent.id, name: agent.name, email: agent.email, role: agent.role || "agent", org_id: orgId, mustChangePassword: agent.must_change_password || false });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/auth/set-password", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email and password required" });
+  try {
+    const rows = await sql`UPDATE agents SET password_hash = ${password}, must_change_password = false WHERE LOWER(email) = LOWER(${email}) RETURNING id, name, email, role`;
+    if (!rows.length) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true, ...rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// POST /api/sms-test  — test ClickSend credentials
+// ─────────────────────────────────────────────
+app.post("/api/sms-test", async (req, res) => {
+  const { username, apiKey, to, sender } = req.body;
+  if (!username || !apiKey || !to) return res.status(400).json({ error: "username, apiKey, and to are required" });
+  try {
+    const auth = "Basic " + Buffer.from(username + ":" + apiKey).toString("base64");
+    const from = (sender || "HINDLE").substring(0, 11);
+    const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: JSON.stringify({ messages: [{ source: "sdk", to, from, body: "Hindle SMS test — your ClickSend integration is working correctly.", schedule: 0 }] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const d = await r.json();
+    const ok = d?.data?.messages?.[0]?.status === "SUCCESS";
+    res.json({ ok, status: d?.data?.messages?.[0]?.status || "unknown", raw: d });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
