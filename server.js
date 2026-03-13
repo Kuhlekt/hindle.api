@@ -43,7 +43,7 @@ app.post("/api/chat", async (req, res) => {
   if (conversationId) {
     try {
       const [conv] = await sql`SELECT status FROM conversations WHERE id = ${conversationId}`;
-      if (conv && conv.status === "handoff") {
+      if (conv && (conv.status === "handoff" || conv.status === "claimed")) {
         const lastMsg = [...messages].reverse().find(m => m.role === "visitor" || m.role === "user");
         const text = (lastMsg?.content || lastMsg?.text || "").trim().toLowerCase();
         const defaults = ["/status", "/cancel", "/restart", "/help", "/agent"];
@@ -52,12 +52,12 @@ app.post("/api/chat", async (req, res) => {
           : defaults;
         const matched = cmds.some(c => text === c || text.startsWith(c + " "));
         if (!matched) {
-          // Silent — widget shows nothing
+          // Silent — a human agent is handling this conversation
           return res.json({ reply: null, handoff_active: true });
         }
         // Command matched — brief contextual reply only
         const cmdSys = (system || "") +
-          "\n\nThis conversation has been escalated to a human agent who has been notified by SMS. " +
+          "\n\nThis conversation has been escalated to a human agent who is now handling it. " +
           "You may only respond to visitor commands (/status /cancel /restart /help /agent). " +
           "Keep replies under 2 sentences. Do not offer to help with the original issue.";
         const r2 = await fetch("https://api.anthropic.com/v1/messages", {
@@ -326,32 +326,70 @@ app.post("/api/agents/:id/password", async (req, res) => {
   }
 });
 
-// POST /api/invite-agent — send SMS invite to new agent with login link
+// POST /api/invite-agent — create login credentials and send email with password
 app.post("/api/invite-agent", async (req, res) => {
   const { tenantId, name, email, mobile } = req.body;
-  if (!mobile) return res.status(400).json({ error: "mobile required" });
+  if (!email) return res.status(400).json({ error: "email required" });
   try {
-    // Load ClickSend creds
+    // Generate a readable temp password
+    const adjectives = ["Blue","Fast","Bright","Clear","Bold","Swift","Sharp","Clean"];
+    const nouns     = ["Eagle","River","Storm","Cloud","Stone","Ridge","Flame","Coast"];
+    const tempPassword =
+      adjectives[Math.floor(Math.random()*adjectives.length)] +
+      nouns[Math.floor(Math.random()*nouns.length)] +
+      Math.floor(Math.random()*900+100);
+
+    // Set the password on the agent record so they can log in immediately
+    await sql`
+      UPDATE agents
+      SET password_hash = ${tempPassword}, must_change_password = true
+      WHERE LOWER(email) = LOWER(${email})
+    `;
+
+    // Load ClickSend creds (tenant first, then platform fallback)
     let cs = {};
     for (const tid of [tenantId, "platform"]) {
       if (!tid) continue;
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tid} LIMIT 1`;
       if (rows.length && rows[0].config?.clicksend?.username) { cs = rows[0].config.clicksend; break; }
     }
-    if (!cs.username || !cs.apiKey) return res.status(400).json({ error: "ClickSend not configured" });
+
+    if (!cs.username || !cs.apiKey) {
+      // No ClickSend — password still set, just can't send email
+      return res.json({ ok: false, passwordSet: true, tempPassword, error: "ClickSend not configured — password set but email not sent" });
+    }
 
     const loginUrl = "https://chatbot.hindleconsultants.com";
-    const body = `Hi ${name}, you've been invited to the Hindle AI dashboard. Log in at: ${loginUrl} using ${email}`;
     const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
-    const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+
+    // ClickSend transactional email API
+    const emailBody = {
+      to: [{ email, name: name || "Agent" }],
+      from: { email: cs.username, name: cs.smsSender || "Hindle Consultants" },
+      subject: "You've been invited to Hindle AI Dashboard",
+      body: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
+  <h2 style="color:#2563EB;margin-bottom:8px">Welcome to Hindle AI</h2>
+  <p style="color:#334155">Hi ${name || "there"},</p>
+  <p style="color:#334155">You've been invited to join the Hindle Consultants AI Dashboard as an agent.</p>
+  <div style="background:#F8F9FB;border:1px solid #E2E6ED;border-radius:8px;padding:16px;margin:20px 0">
+    <p style="margin:0 0 6px;font-size:13px;color:#64748B">Your login details:</p>
+    <p style="margin:0 0 4px"><strong>URL:</strong> <a href="${loginUrl}" style="color:#2563EB">${loginUrl}</a></p>
+    <p style="margin:0 0 4px"><strong>Email:</strong> ${email}</p>
+    <p style="margin:0"><strong>Temporary Password:</strong> <code style="background:#fff;border:1px solid #E2E6ED;padding:2px 8px;border-radius:4px;font-size:15px">${tempPassword}</code></p>
+  </div>
+  <p style="color:#94A3B8;font-size:12px">Please change your password after first login.</p>
+</div>`,
+    };
+
+    const r = await fetch("https://rest.clicksend.com/v3/transactional-email/send", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth },
-      body: JSON.stringify({ messages: [{ source: "sdk", to: mobile, from: (cs.smsSender||"HINDLE").substring(0,11), body, schedule: 0 }] }),
-      signal: AbortSignal.timeout(8000),
+      body: JSON.stringify(emailBody),
+      signal: AbortSignal.timeout(10000),
     });
     const d = await r.json();
-    const sent = d?.data?.messages?.[0]?.status === "SUCCESS";
-    res.json({ ok: sent, status: d?.data?.messages?.[0]?.status });
+    const sent = d?.data?.status === "SUCCESS" || r.ok;
+    res.json({ ok: sent, passwordSet: true, emailStatus: d?.data?.status || d?.response_code });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -420,12 +458,14 @@ app.post("/api/conversations", async (req, res) => {
 });
 
 app.patch("/api/conversations/:id", async (req, res) => {
-  const { status, assigned_agent_id } = req.body;
+  const { status, assigned_agent_id, claimed_by_id, claimed_by_name } = req.body;
   try {
     const rows = await sql`
       UPDATE conversations SET
         status            = COALESCE(${status},            status),
         assigned_agent_id = COALESCE(${assigned_agent_id}, assigned_agent_id),
+        claimed_by_id     = ${claimed_by_id   !== undefined ? claimed_by_id   : null},
+        claimed_by_name   = ${claimed_by_name !== undefined ? claimed_by_name : null},
         updated_at        = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
@@ -433,6 +473,25 @@ app.patch("/api/conversations/:id", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
+    // If claimed_by columns don't exist yet, add them and retry
+    if (e.message && e.message.includes("claimed_by")) {
+      try {
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS claimed_by_id TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS claimed_by_name TEXT`;
+        const rows = await sql`
+          UPDATE conversations SET
+            status            = COALESCE(${status},            status),
+            assigned_agent_id = COALESCE(${assigned_agent_id}, assigned_agent_id),
+            claimed_by_id     = ${claimed_by_id   !== undefined ? claimed_by_id   : null},
+            claimed_by_name   = ${claimed_by_name !== undefined ? claimed_by_name : null},
+            updated_at        = NOW()
+          WHERE id = ${req.params.id}
+          RETURNING *
+        `;
+        if (!rows.length) return res.status(404).json({ error: "Not found" });
+        return res.json(rows[0]);
+      } catch (e2) { return res.status(500).json({ error: e2.message }); }
+    }
     res.status(500).json({ error: e.message });
   }
 });
