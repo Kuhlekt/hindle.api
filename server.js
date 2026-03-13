@@ -115,21 +115,38 @@ app.post("/api/chat", async (req, res) => {
 // GET  /api/tenant-config/:id
 // ─────────────────────────────────────────────
 
-// In-memory store (persists for the life of the Railway instance).
-// Replace with a DB table if you want permanent storage across restarts.
-const tenantConfigs = {};
-
-app.post("/api/tenant-config", (req, res) => {
+app.post("/api/tenant-config", async (req, res) => {
   const { tenantId, ...config } = req.body;
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
-  tenantConfigs[tenantId] = { ...tenantConfigs[tenantId], ...config, updatedAt: new Date().toISOString() };
-  res.json({ ok: true, tenantId });
+  try {
+    // Look up org to get the canonical UUID
+    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    const orgId = orgs.length ? orgs[0].id : tenantId;
+    // Deep-merge with existing config
+    const existing = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`;
+    const merged = existing.length ? { ...existing[0].config, ...config } : config;
+    await sql`
+      INSERT INTO tenant_configs (tenant_id, config)
+      VALUES (${orgId}, ${JSON.stringify(merged)})
+      ON CONFLICT (tenant_id) DO UPDATE SET config = ${JSON.stringify(merged)}
+    `;
+    res.json({ ok: true, tenantId: orgId });
+  } catch (err) {
+    console.error("POST /api/tenant-config error:", err.message);
+    res.status(500).json({ error: "Failed to save config" });
+  }
 });
 
-app.get("/api/tenant-config/:tenantId", (req, res) => {
-  const cfg = tenantConfigs[req.params.tenantId];
-  if (!cfg) return res.status(404).json({ error: "No config found for this tenant" });
-  res.json(cfg);
+app.get("/api/tenant-config/:tenantId", async (req, res) => {
+  const { tenantId } = req.params;
+  try {
+    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "No config found for this tenant" });
+    res.json(rows[0].config);
+  } catch (err) {
+    console.error("GET /api/tenant-config error:", err.message);
+    res.status(500).json({ error: "Failed to load config" });
+  }
 });
 
 // ─────────────────────────────────────────────
@@ -642,7 +659,7 @@ app.post("/api/handoff", async (req, res) => {
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
 
   // ── Load tenant config (with platform fallback for ClickSend creds) ──
-  let tenantConfig = tenantConfigsMemory[tenantId] || {};
+  let tenantConfig = {};
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
     if (rows.length) tenantConfig = rows[0].config;
@@ -650,11 +667,9 @@ app.post("/api/handoff", async (req, res) => {
 
   if (!tenantConfig?.clicksend?.username) {
     try {
-      let pCfg = tenantConfigsMemory["platform"] || {};
-      if (!pCfg?.clicksend?.username) {
-        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
-        if (rows.length) { pCfg = rows[0].config; tenantConfigsMemory["platform"] = pCfg; }
-      }
+      let pCfg = {};
+      const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
+      if (rows.length) pCfg = rows[0].config;
       if (pCfg?.clicksend?.username) {
         tenantConfig = { ...tenantConfig, clicksend: { ...pCfg.clicksend, ...(tenantConfig.clicksend || {}) } };
       }
