@@ -619,11 +619,11 @@ app.get("/api/handoff-token/:token", async (req, res) => {
     const rows = await sql`SELECT * FROM alert_log WHERE token = ${token} LIMIT 1`;
     if (!rows.length) return res.status(404).json({ ok: false, error: "Token not found" });
     const row = rows[0];
-    // Check expiry — 5 minutes
+    // Check expiry — 3 minutes
     const age = Date.now() - new Date(row.created_at).getTime();
-    if (age > 5 * 60 * 1000) {
+    if (age > 3 * 60 * 1000) {
       await sql`UPDATE alert_log SET status = 'expired' WHERE id = ${row.id}`;
-      return res.status(410).json({ ok: false, error: "This link has expired (5-minute limit)." });
+      return res.status(410).json({ ok: false, error: "This link has expired (3-minute limit)." });
     }
     // Mark clicked (first use only)
     if (row.status !== "clicked") {
@@ -774,9 +774,9 @@ app.get("/api/handoff-token/:token", async (req, res) => {
     const rows = await sql`SELECT * FROM alert_log WHERE token = ${req.params.token} LIMIT 1`;
     if (!rows.length) return res.status(404).json({ error: "Invalid or expired link" });
     const row = rows[0];
-    // Check expiry (5 minutes)
+    // Check expiry (3 minutes)
     const age = Date.now() - new Date(row.created_at).getTime();
-    if (age > 5 * 60 * 1000) {
+    if (age > 3 * 60 * 1000) {
       try { await sql`UPDATE alert_log SET status = 'expired' WHERE token = ${req.params.token}`; } catch (_) {}
       return res.status(410).json({ error: "Link expired", expired: true });
     }
