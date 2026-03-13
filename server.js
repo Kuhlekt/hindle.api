@@ -671,7 +671,14 @@ app.post("/api/handoff", async (req, res) => {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
       if (rows.length) pCfg = rows[0].config;
       if (pCfg?.clicksend?.username) {
-        tenantConfig = { ...tenantConfig, clicksend: { ...pCfg.clicksend, ...(tenantConfig.clicksend || {}) } };
+        // Platform creds as base — only override with tenant values that are actually set
+        const tCs = tenantConfig.clicksend || {};
+        tenantConfig = { ...tenantConfig, clicksend: {
+          ...pCfg.clicksend,
+          ...(tCs.username ? { username: tCs.username } : {}),
+          ...(tCs.apiKey   ? { apiKey:   tCs.apiKey   } : {}),
+          ...(tCs.smsSender? { smsSender:tCs.smsSender} : {}),
+        }};
       }
     } catch (e) {}
   }
@@ -680,7 +687,7 @@ app.post("/api/handoff", async (req, res) => {
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE (config->'clicksend'->>'username') IS NOT NULL AND (config->'clicksend'->>'username') != '' LIMIT 1`;
       if (rows.length && rows[0].config?.clicksend?.username) {
-        tenantConfig = { ...tenantConfig, clicksend: { ...rows[0].config.clicksend, ...(tenantConfig.clicksend || {}) } };
+        tenantConfig = { ...tenantConfig, clicksend: rows[0].config.clicksend };
       }
     } catch (e) {}
   }
