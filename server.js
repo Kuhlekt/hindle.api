@@ -314,6 +314,49 @@ app.delete("/api/agents/:id", async (req, res) => {
   }
 });
 
+// POST /api/agents/:id/password
+app.post("/api/agents/:id/password", async (req, res) => {
+  const { password } = req.body;
+  if (!password || !password.trim()) return res.status(400).json({ error: "password required" });
+  try {
+    await sql`UPDATE agents SET password_hash = ${password.trim()}, must_change_password = false WHERE id = ${req.params.id}`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/invite-agent — send SMS invite to new agent with login link
+app.post("/api/invite-agent", async (req, res) => {
+  const { tenantId, name, email, mobile } = req.body;
+  if (!mobile) return res.status(400).json({ error: "mobile required" });
+  try {
+    // Load ClickSend creds
+    let cs = {};
+    for (const tid of [tenantId, "platform"]) {
+      if (!tid) continue;
+      const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tid} LIMIT 1`;
+      if (rows.length && rows[0].config?.clicksend?.username) { cs = rows[0].config.clicksend; break; }
+    }
+    if (!cs.username || !cs.apiKey) return res.status(400).json({ error: "ClickSend not configured" });
+
+    const loginUrl = "https://chatbot.hindleconsultants.com";
+    const body = `Hi ${name}, you've been invited to the Hindle AI dashboard. Log in at: ${loginUrl} using ${email}`;
+    const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
+    const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: JSON.stringify({ messages: [{ source: "sdk", to: mobile, from: (cs.smsSender||"HINDLE").substring(0,11), body, schedule: 0 }] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const d = await r.json();
+    const sent = d?.data?.messages?.[0]?.status === "SUCCESS";
+    res.json({ ok: sent, status: d?.data?.messages?.[0]?.status });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────
 // CONVERSATIONS
 // ─────────────────────────────────────────────
