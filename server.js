@@ -120,7 +120,7 @@ app.post("/api/tenant-config", async (req, res) => {
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
   try {
     // Look up org to get the canonical UUID
-    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
     const orgId = orgs.length ? orgs[0].id : tenantId;
     // Deep-merge with existing config
     const existing = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`;
@@ -140,7 +140,7 @@ app.post("/api/tenant-config", async (req, res) => {
 app.get("/api/tenant-config/:tenantId", async (req, res) => {
   const { tenantId } = req.params;
   try {
-    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} LIMIT 1`;
     if (!rows.length) return res.status(404).json({ error: "No config found for this tenant" });
     res.json(rows[0].config);
   } catch (err) {
@@ -661,7 +661,7 @@ app.post("/api/handoff", async (req, res) => {
   // ── Load tenant config (with platform fallback for ClickSend creds) ──
   let tenantConfig = {};
   try {
-    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} LIMIT 1`;
     if (rows.length) tenantConfig = rows[0].config;
   } catch (e) {}
 
@@ -692,7 +692,7 @@ app.post("/api/handoff", async (req, res) => {
   // ── Resolve org UUID ──────────────────────────────────────────────────
   let resolvedOrgId = null;
   try {
-    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
+    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
     if (orgs.length) resolvedOrgId = orgs[0].id;
   } catch (e) {}
 
