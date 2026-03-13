@@ -692,7 +692,7 @@ app.post("/api/handoff", async (req, res) => {
   // ── Resolve org UUID ──────────────────────────────────────────────────
   let resolvedOrgId = null;
   try {
-    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
+    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
     if (orgs.length) resolvedOrgId = orgs[0].id;
   } catch (e) {}
 
