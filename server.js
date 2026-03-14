@@ -426,14 +426,16 @@ app.get("/api/conversations", async (req, res) => {
       rows = await sql`
         SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE c.org_id = ${org_id} AND c.status = ${status}
+        WHERE (c.org_id::text = ${org_id} OR c.org_id::text = (SELECT id::text FROM organisations WHERE id::text = ${org_id} OR tenant_id = ${org_id} LIMIT 1))
+          AND c.status = ${status}
         ORDER BY c.updated_at DESC
       `;
     } else if (org_id) {
       rows = await sql`
         SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE c.org_id = ${org_id}
+        WHERE c.org_id::text = ${org_id}
+           OR c.org_id::text = (SELECT id::text FROM organisations WHERE id::text = ${org_id} OR tenant_id = ${org_id} LIMIT 1)
         ORDER BY c.updated_at DESC
       `;
     } else {
@@ -441,6 +443,7 @@ app.get("/api/conversations", async (req, res) => {
         SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
         ORDER BY c.updated_at DESC
+        LIMIT 500
       `;
     }
     res.json(rows);
@@ -464,28 +467,59 @@ app.get("/api/conversations/:id", async (req, res) => {
 });
 
 app.post("/api/conversations", async (req, res) => {
-  const { org_id, visitor_name, visitor_email, page } = req.body;
+  const { org_id, tenant_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status } = req.body;
+  // Resolve org_id: widget sends tenant_id (= organisations.id UUID), dashboard sends org_id
+  let resolvedOrgId = org_id || null;
+  if (!resolvedOrgId && tenant_id) {
+    // tenant_id IS the org UUID — verify it exists
+    try {
+      const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenant_id} OR tenant_id = ${tenant_id} LIMIT 1`;
+      if (orgs.length) resolvedOrgId = orgs[0].id;
+    } catch (_) {}
+    if (!resolvedOrgId) resolvedOrgId = tenant_id; // store as-is so we can still query it
+  }
   try {
     const rows = await sql`
-      INSERT INTO conversations (org_id, visitor_name, visitor_email, page)
-      VALUES (${org_id}, ${visitor_name}, ${visitor_email}, ${page})
+      INSERT INTO conversations (org_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status)
+      VALUES (${resolvedOrgId}, ${visitor_name || 'Website Visitor'}, ${visitor_email || null}, ${visitor_phone || null}, ${visitor_company || null}, ${visitor_location || null}, ${page || '/'}, ${subject || 'Chat'}, ${status || 'open'})
       RETURNING *
     `;
     res.status(201).json(rows[0]);
   } catch (e) {
+    // Auto-add missing columns and retry
+    if (e.message && (e.message.includes("column") || e.message.includes("does not exist"))) {
+      try {
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_phone TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_company TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_location TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS subject TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS claimed_by_id TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS claimed_by_name TEXT`;
+        const rows = await sql`
+          INSERT INTO conversations (org_id, visitor_name, visitor_email, page, status)
+          VALUES (${resolvedOrgId}, ${visitor_name || 'Website Visitor'}, ${visitor_email || null}, ${page || '/'}, ${status || 'open'})
+          RETURNING *
+        `;
+        return res.status(201).json(rows[0]);
+      } catch (e2) { return res.status(500).json({ error: e2.message }); }
+    }
     res.status(500).json({ error: e.message });
   }
 });
 
 app.patch("/api/conversations/:id", async (req, res) => {
-  const { status, assigned_agent_id, claimed_by_id, claimed_by_name } = req.body;
+  const { status, assigned_agent_id, claimed_by_id, claimed_by_name,
+          visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location } = req.body;
   try {
     const rows = await sql`
       UPDATE conversations SET
         status            = COALESCE(${status},            status),
         assigned_agent_id = COALESCE(${assigned_agent_id}, assigned_agent_id),
-        claimed_by_id     = ${claimed_by_id   !== undefined ? claimed_by_id   : null},
-        claimed_by_name   = ${claimed_by_name !== undefined ? claimed_by_name : null},
+        claimed_by_id     = ${claimed_by_id    !== undefined ? claimed_by_id    : null},
+        claimed_by_name   = ${claimed_by_name  !== undefined ? claimed_by_name  : null},
+        visitor_name      = COALESCE(${visitor_name},      visitor_name),
+        visitor_email     = COALESCE(${visitor_email},     visitor_email),
         updated_at        = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
@@ -493,11 +527,16 @@ app.patch("/api/conversations/:id", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
-    // If claimed_by columns don't exist yet, add them and retry
-    if (e.message && e.message.includes("claimed_by")) {
+    // Auto-add missing columns and retry with minimal update
+    if (e.message && (e.message.includes("claimed_by") || e.message.includes("visitor_email") || e.message.includes("column"))) {
       try {
         await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS claimed_by_id TEXT`;
         await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS claimed_by_name TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_email TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_name TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_phone TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_company TEXT`;
+        await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_location TEXT`;
         const rows = await sql`
           UPDATE conversations SET
             status            = COALESCE(${status},            status),
@@ -664,27 +703,49 @@ app.delete("/api/kb/:id", async (req, res) => {
 // POST /api/auth  { email, password }
 // Returns { ok, org_id, role, email, name }
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// UNIFIED AUTH — checks organisations (tenant admins) then agents
+// POST /api/auth  { email, password }
+// ─────────────────────────────────────────────
 app.post("/api/auth", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ ok: false, error: "email and password required" });
+
+  // 1. Try tenant admin (organisations table)
   try {
-    const rows = await sql`
-      SELECT * FROM organisations
-      WHERE email = ${email.trim().toLowerCase()}
-      LIMIT 1
-    `;
-    if (!rows.length) return res.status(401).json({ ok: false, error: "No account found for that email address." });
-    const org = rows[0];
-    // Password stored in tenant_configs under key "admin_password", fallback "admin"
-    let storedPass = "admin";
-    try {
-      const cfg = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org.id} LIMIT 1`;
-      if (cfg.length && cfg[0].config?.admin_password) storedPass = cfg[0].config.admin_password;
-    } catch (_) {}
-    if (password !== storedPass) return res.status(401).json({ ok: false, error: "Incorrect password." });
-    res.json({ ok: true, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });
+    const rows = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1`;
+    if (rows.length) {
+      const org = rows[0];
+      let storedPass = "admin";
+      try {
+        const cfg = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org.id} LIMIT 1`;
+        if (cfg.length && cfg[0].config?.admin_password) storedPass = cfg[0].config.admin_password;
+      } catch (_) {}
+      if (password !== storedPass) return res.status(401).json({ ok: false, error: "Incorrect password." });
+      return res.json({ ok: true, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });
+    }
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+
+  // 2. Try agent (agents table)
+  try {
+    const rows = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1`;
+    if (!rows.length) return res.status(401).json({ ok: false, error: "No account found for that email address." });
+    const agent = rows[0];
+    if (agent.active === false) return res.status(403).json({ ok: false, error: "Account is disabled." });
+    if (!agent.password_hash) return res.status(401).json({ ok: false, error: "No password set. Contact your administrator." });
+    if (agent.password_hash !== password) return res.status(401).json({ ok: false, error: "Incorrect password." });
+    let orgId = agent.org_id || null;
+    if (!orgId) {
+      try {
+        const orgs = await sql`SELECT id FROM organisations LIMIT 1`;
+        if (orgs.length) { orgId = orgs[0].id; await sql`UPDATE agents SET org_id = ${orgId} WHERE id = ${agent.id}`; }
+      } catch (_) {}
+    }
+    return res.json({ ok: true, id: agent.id, org_id: orgId, role: agent.role || "agent", email: agent.email, name: agent.name, mustChangePassword: agent.must_change_password || false });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -986,27 +1047,6 @@ app.post("/api/auth/magic-verify", async (req, res) => {
       } catch (_) {}
     }
     res.json({ ok: true, id: agent.id, name: agent.name, email: agent.email, role: agent.role || "agent", org_id: orgId });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post("/api/auth", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "email and password required" });
-  try {
-    const rows = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
-    if (!rows.length) return res.status(404).json({ error: "no_account" });
-    const agent = rows[0];
-    if (agent.active === false) return res.status(403).json({ error: "disabled" });
-    if (!agent.password_hash) return res.status(401).json({ error: "no_password" });
-    if (agent.password_hash !== password) return res.status(401).json({ error: "wrong_password" });
-    let orgId = agent.org_id || null;
-    if (!orgId) {
-      try {
-        const orgByEmail = await sql`SELECT id FROM organisations WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
-        if (orgByEmail.length) { orgId = orgByEmail[0].id; await sql`UPDATE agents SET org_id = ${orgId} WHERE id = ${agent.id}`; }
-      } catch (_) {}
-    }
-    res.json({ ok: true, id: agent.id, name: agent.name, email: agent.email, role: agent.role || "agent", org_id: orgId, mustChangePassword: agent.must_change_password || false });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
