@@ -1290,7 +1290,9 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
 async function runTrialScheduler() {
   try {
     // Ensure columns exist
-    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ DEFAULT created_at`;
+    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ`;
+    // Backfill trial_start_date from created_at where null
+    await sql`UPDATE organisations SET trial_start_date = created_at WHERE trial_start_date IS NULL`.catch(()=>{});
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_day INT DEFAULT 0`;
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_reminded JSONB DEFAULT '[]'`;
 
