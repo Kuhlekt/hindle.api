@@ -291,8 +291,23 @@ app.post("/api/agents", async (req, res) => {
     const rows = await doInsert();
     res.status(201).json(rows[0]);
   } catch (e) {
-    // Auto-add missing columns and retry once
-    if (e.message && (e.message.includes("sms_alerts") || e.message.includes("column"))) {
+    const msg = e.message || "";
+    // Duplicate email — return existing agent so invite can still send credentials
+    if (msg.includes("duplicate") || msg.includes("unique") || msg.includes("already exists")) {
+      try {
+        const existing = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+        if (existing.length) {
+          // Update org_id if it was missing
+          if (!existing[0].org_id && org_id) {
+            await sql`UPDATE agents SET org_id = ${org_id} WHERE id = ${existing[0].id}`;
+          }
+          return res.status(201).json({ ...existing[0], _existed: true });
+        }
+      } catch (_) {}
+      return res.status(409).json({ error: "An agent with that email already exists." });
+    }
+    // Missing columns — auto-migrate and retry
+    if (msg.includes("column") || msg.includes("does not exist")) {
       try {
         await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_alerts BOOLEAN DEFAULT true`;
         await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS password_hash TEXT`;
@@ -304,7 +319,7 @@ app.post("/api/agents", async (req, res) => {
         return res.status(201).json(rows[0]);
       } catch (e2) { return res.status(500).json({ error: e2.message }); }
     }
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: msg || "Failed to create agent" });
   }
 });
 
