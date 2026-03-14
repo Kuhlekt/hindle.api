@@ -160,6 +160,50 @@ app.get("/api/tenant-config/:tenantId", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// ADMIN SETTINGS — super admin profile + platform config + github config
+// Stored under tenant_id = 'platform' in tenant_configs
+// GET  /api/admin-settings
+// POST /api/admin-settings  { profile, platform, github }
+// ─────────────────────────────────────────────
+app.get("/api/admin-settings", async (req, res) => {
+  try {
+    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+    if (!rows.length) return res.json({});
+    const cfg = rows[0].config || {};
+    res.json({
+      profile:  cfg._adminProfile  || {},
+      platform: cfg._platformConfig || {},
+      github:   cfg._githubConfig   || {},
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/admin-settings", async (req, res) => {
+  const { profile, platform, github } = req.body;
+  try {
+    // Load existing platform config so we don't overwrite clicksend etc.
+    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+    const existing = rows.length ? (rows[0].config || {}) : {};
+    const merged = {
+      ...existing,
+      ...(profile  ? { _adminProfile:   profile  } : {}),
+      ...(platform ? { _platformConfig: platform } : {}),
+      ...(github   ? { _githubConfig:   github   } : {}),
+    };
+    await sql`
+      INSERT INTO tenant_configs (tenant_id, config)
+      VALUES ('platform', ${JSON.stringify(merged)})
+      ON CONFLICT (tenant_id) DO UPDATE SET config = ${JSON.stringify(merged)}
+    `;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 // FETCH URL  — server-side fetch for KB URL import (avoids CORS)
 // POST /api/fetch-url   { url }
 // ─────────────────────────────────────────────
