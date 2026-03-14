@@ -579,6 +579,9 @@ app.patch("/api/conversations/:id", async (req, res) => {
         claimed_by_name   = ${claimed_by_name  !== undefined ? claimed_by_name  : null},
         visitor_name      = COALESCE(${visitor_name},      visitor_name),
         visitor_email     = COALESCE(${visitor_email},     visitor_email),
+        visitor_phone     = COALESCE(${visitor_phone},     visitor_phone),
+        visitor_company   = COALESCE(${visitor_company},   visitor_company),
+        visitor_location  = COALESCE(${visitor_location},  visitor_location),
         updated_at        = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
