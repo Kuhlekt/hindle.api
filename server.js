@@ -171,9 +171,10 @@ app.get("/api/admin-settings", async (req, res) => {
     if (!rows.length) return res.json({});
     const cfg = rows[0].config || {};
     res.json({
-      profile:  cfg._adminProfile  || {},
-      platform: cfg._platformConfig || {},
-      github:   cfg._githubConfig   || {},
+      profile:     cfg._adminProfile   || {},
+      platform:    cfg._platformConfig || {},
+      github:      cfg._githubConfig   || {},
+      superConfig: cfg._superConfig    || {},
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -181,16 +182,16 @@ app.get("/api/admin-settings", async (req, res) => {
 });
 
 app.post("/api/admin-settings", async (req, res) => {
-  const { profile, platform, github } = req.body;
+  const { profile, platform, github, superConfig } = req.body;
   try {
-    // Load existing platform config so we don't overwrite clicksend etc.
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     const existing = rows.length ? (rows[0].config || {}) : {};
     const merged = {
       ...existing,
-      ...(profile  ? { _adminProfile:   profile  } : {}),
-      ...(platform ? { _platformConfig: platform } : {}),
-      ...(github   ? { _githubConfig:   github   } : {}),
+      ...(profile     ? { _adminProfile:   profile     } : {}),
+      ...(platform    ? { _platformConfig: platform    } : {}),
+      ...(github      ? { _githubConfig:   github      } : {}),
+      ...(superConfig ? { _superConfig:    superConfig } : {}),
     };
     await sql`
       INSERT INTO tenant_configs (tenant_id, config)
