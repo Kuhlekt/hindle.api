@@ -23,6 +23,20 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+// Quick diagnostic — count conversations for an org
+app.get("/api/diag/convos", async (req, res) => {
+  const { org_id } = req.query;
+  if (!org_id) return res.status(400).json({ error: "org_id required" });
+  try {
+    const total  = await sql`SELECT COUNT(*)::int as n FROM conversations WHERE org_id::text = ${org_id}`;
+    const byStatus = await sql`SELECT status, COUNT(*)::int as n FROM conversations WHERE org_id::text = ${org_id} GROUP BY status`;
+    const sample = await sql`SELECT id, org_id::text, status, visitor_name, created_at FROM conversations WHERE org_id::text = ${org_id} ORDER BY created_at DESC LIMIT 5`;
+    res.json({ total: total[0]?.n, byStatus, sample });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────
 // AI CHAT  — routes messages through Claude
 // POST /api/chat
