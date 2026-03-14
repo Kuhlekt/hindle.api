@@ -1145,6 +1145,253 @@ app.post("/api/sms-test", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// AUDIT LOG
+// ─────────────────────────────────────────────
+async function ensureAuditTable() {
+  try {
+    await sql`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id          BIGSERIAL PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        event_type  TEXT NOT NULL,
+        description TEXT,
+        meta        JSONB,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS audit_log_tenant_idx ON audit_log (tenant_id, created_at DESC)`;
+  } catch (_) {}
+}
+async function writeAudit(tenantId, eventType, description, meta) {
+  try {
+    await sql`
+      INSERT INTO audit_log (tenant_id, event_type, description, meta)
+      VALUES (${tenantId}, ${eventType}, ${description || null}, ${meta ? JSON.stringify(meta) : null})
+    `;
+  } catch (_) {}
+}
+ensureAuditTable();
+
+app.get("/api/audit-log/:tenantId", async (req, res) => {
+  try {
+    const rows = await sql`
+      SELECT * FROM audit_log WHERE tenant_id = ${req.params.tenantId}
+      ORDER BY created_at DESC LIMIT 200
+    `;
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/audit-log", async (req, res) => {
+  // Super admin — all tenants
+  try {
+    const rows = await sql`SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 500`;
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/audit-log", async (req, res) => {
+  const { tenantId, eventType, description, meta } = req.body;
+  if (!tenantId || !eventType) return res.status(400).json({ error: "tenantId and eventType required" });
+  try {
+    await writeAudit(tenantId, eventType, description, meta);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// PLAN ENFORCEMENT — usage limits per plan
+// ─────────────────────────────────────────────
+const PLAN_LIMITS = {
+  free:         { agents: 1,  conversations_month: 100,  kb_docs: 0  },
+  starter:      { agents: 5,  conversations_month: 500,  kb_docs: 5  },
+  professional: { agents: 10, conversations_month: 2000, kb_docs: 999 },
+  enterprise:   { agents: 999,conversations_month: 999999,kb_docs: 999 },
+};
+
+app.get("/api/tenants/:id/usage", async (req, res) => {
+  try {
+    const [org] = await sql`SELECT * FROM organisations WHERE id = ${req.params.id}`;
+    if (!org) return res.status(404).json({ error: "Not found" });
+    const plan = org.plan || "free";
+    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+    // Count agents
+    const [agentCount] = await sql`SELECT COUNT(*)::int as count FROM agents WHERE org_id = ${org.id} AND active != false`;
+    // Count conversations this calendar month
+    const [convCount] = await sql`
+      SELECT COUNT(*)::int as count FROM conversations
+      WHERE org_id = ${org.id}
+        AND created_at >= DATE_TRUNC('month', NOW())
+    `;
+    // Count KB docs
+    const [kbCount] = await sql`SELECT COUNT(*)::int as count FROM kb_documents WHERE org_id = ${org.id}`.catch(()=>[{count:0}]);
+    res.json({
+      plan, limits,
+      usage: {
+        agents: agentCount?.count || 0,
+        conversations_month: convCount?.count || 0,
+        kb_docs: kbCount?.count || 0,
+      },
+      trial_start_date: org.trial_start_date || org.created_at,
+      trial_day: org.trial_day || 0,
+      status: org.status || "trial",
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Plan management — change plan, extend trial, suspend/reactivate
+app.post("/api/tenants/:id/manage", async (req, res) => {
+  const { action, plan, note, trialDays } = req.body;
+  try {
+    const [org] = await sql`SELECT * FROM organisations WHERE id = ${req.params.id}`;
+    if (!org) return res.status(404).json({ error: "Not found" });
+    let updated;
+    if (action === "change_plan") {
+      [updated] = await sql`UPDATE organisations SET plan = ${plan}, status = 'active', updated_at = NOW() WHERE id = ${org.id} RETURNING *`.catch(async()=>{
+        await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`;
+        const r = await sql`UPDATE organisations SET plan = ${plan}, status = 'active' WHERE id = ${org.id} RETURNING *`;
+        return r;
+      });
+      await writeAudit(org.id, "plan_changed", `Plan changed to ${plan}${note?": "+note:""}`, { from: org.plan, to: plan });
+    } else if (action === "extend_trial") {
+      const days = parseInt(trialDays) || 7;
+      [updated] = await sql`UPDATE organisations SET trial_day = GREATEST(0, COALESCE(trial_day,0) - ${days}), status = 'trial' WHERE id = ${org.id} RETURNING *`.catch(async()=>{
+        await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_day INT DEFAULT 0`;
+        const r = await sql`UPDATE organisations SET trial_day = 0, status = 'trial' WHERE id = ${org.id} RETURNING *`;
+        return r;
+      });
+      await writeAudit(org.id, "trial_extended", `Trial extended by ${days} days${note?": "+note:""}`, { days });
+    } else if (action === "suspend") {
+      [updated] = await sql`UPDATE organisations SET status = 'suspended' WHERE id = ${org.id} RETURNING *`;
+      await writeAudit(org.id, "suspended", note || "Account suspended by admin", {});
+    } else if (action === "reactivate") {
+      [updated] = await sql`UPDATE organisations SET status = 'active' WHERE id = ${org.id} RETURNING *`;
+      await writeAudit(org.id, "reactivated", note || "Account reactivated by admin", {});
+    } else if (action === "reset_trial") {
+      [updated] = await sql`UPDATE organisations SET trial_day = 0, status = 'trial', trial_start_date = NOW() WHERE id = ${org.id} RETURNING *`.catch(async()=>{
+        await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ DEFAULT NOW()`;
+        await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_day INT DEFAULT 0`;
+        const r = await sql`UPDATE organisations SET trial_day = 0, status = 'trial', trial_start_date = NOW() WHERE id = ${org.id} RETURNING *`;
+        return r;
+      });
+      await writeAudit(org.id, "trial_reset", note || "Trial reset by admin", {});
+    } else {
+      return res.status(400).json({ error: "Unknown action" });
+    }
+    res.json({ ok: true, tenant: updated });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// TRIAL EMAIL SCHEDULER
+// Runs once on startup, then every hour
+// Days 12, 13, 14: sends reminder via ClickSend email
+// ─────────────────────────────────────────────
+async function runTrialScheduler() {
+  try {
+    // Ensure columns exist
+    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ DEFAULT created_at`;
+    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_day INT DEFAULT 0`;
+    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_reminded JSONB DEFAULT '[]'`;
+
+    // Update trial_day for all trialling orgs
+    await sql`
+      UPDATE organisations
+      SET trial_day = EXTRACT(DAY FROM (NOW() - COALESCE(trial_start_date, created_at)))::int
+      WHERE status IS NULL OR status IN ('trial', 'active')
+    `.catch(()=>{});
+
+    // Fetch orgs that need a reminder (day 12, 13, or 14) and haven't been reminded yet for that day
+    const orgs = await sql`
+      SELECT * FROM organisations
+      WHERE (status IS NULL OR status IN ('trial'))
+        AND trial_day BETWEEN 12 AND 14
+    `.catch(()=>[]);
+
+    if (!orgs.length) return;
+
+    // Load platform ClickSend creds
+    let cs = {};
+    try {
+      const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+      if (cfg?.config?.clicksend?.username) cs = cfg.config.clicksend;
+    } catch (_) {}
+    if (!cs.username || !cs.apiKey) return; // no email configured
+
+    const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
+
+    for (const org of orgs) {
+      const reminded = Array.isArray(org.trial_reminded) ? org.trial_reminded : [];
+      const day = org.trial_day || 0;
+      if (reminded.includes(day)) continue; // already sent for this day
+
+      const daysLeft = 14 - day;
+      const subject = daysLeft <= 0
+        ? `Your Hindle AI trial has ended — upgrade to keep access`
+        : `${daysLeft} day${daysLeft !== 1 ? "s" : ""} left on your Hindle AI trial`;
+
+      const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px">
+<h2 style="color:#2563EB;margin-bottom:8px">Hindle AI</h2>
+<p style="color:#334155">Hi ${org.name || "there"},</p>
+<p style="color:#334155">${daysLeft <= 0
+  ? "Your 14-day free trial has ended. Upgrade now to continue using Hindle AI — your data and settings are saved."
+  : `Your free trial ends in <strong>${daysLeft} day${daysLeft !== 1 ? "s" : ""}</strong>. Upgrade before it expires to keep your chatbot running without interruption.`
+}</p>
+<div style="margin:24px 0">
+  <a href="https://chatbot.hindleconsultants.com" style="background:#2563EB;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block">
+    ${daysLeft <= 0 ? "Upgrade Now →" : "Upgrade Before Trial Ends →"}
+  </a>
+</div>
+<p style="color:#94A3B8;font-size:12px">You received this because you have an active trial on Hindle AI. Questions? Reply to this email.</p>
+</div>`;
+
+      try {
+        const r = await fetch("https://rest.clicksend.com/v3/email/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: auth },
+          body: JSON.stringify({
+            to: [{ email: org.email, name: org.name || "Tenant" }],
+            from: { email: cs.username, name: cs.smsSender || "Hindle Consultants" },
+            subject,
+            body: htmlBody,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+        const d = await r.json();
+        const sent = d?.response_code === "SUCCESS" || r.ok;
+
+        // Mark this day as reminded
+        const newReminded = [...reminded, day];
+        await sql`UPDATE organisations SET trial_reminded = ${JSON.stringify(newReminded)} WHERE id = ${org.id}`.catch(()=>{});
+
+        // Write to audit log
+        await writeAudit(org.id, "trial_reminder_sent", `Day ${day} reminder email ${sent ? "sent" : "failed"} to ${org.email}`, {
+          day, daysLeft, sent, email: org.email,
+        });
+
+        console.log(`[TrialScheduler] Day ${day} reminder ${sent ? "sent" : "FAILED"} → ${org.email}`);
+      } catch (err) {
+        console.warn(`[TrialScheduler] Error sending to ${org.email}:`, err.message);
+        await writeAudit(org.id, "trial_reminder_failed", `Day ${day} reminder failed: ${err.message}`, { day, email: org.email });
+      }
+    }
+
+    // Expire orgs past day 14
+    await sql`
+      UPDATE organisations SET status = 'expired'
+      WHERE (status IS NULL OR status = 'trial') AND trial_day > 14
+    `.catch(()=>{});
+
+  } catch (err) {
+    console.error("[TrialScheduler] Error:", err.message);
+  }
+}
+
+// Run immediately on startup, then every hour
+runTrialScheduler();
+setInterval(runTrialScheduler, 60 * 60 * 1000);
+
+// ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
