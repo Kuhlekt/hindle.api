@@ -1224,6 +1224,25 @@ const PLAN_LIMITS = {
   enterprise:   { agents: 999,conversations_month: 999999,kb_docs: 999 },
 };
 
+// Load admin-configured plan limits from DB (overrides hardcoded defaults)
+async function getAdminPlanLimits() {
+  try {
+    const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+    return cfg?.config?._superConfig?.planLimits || null;
+  } catch (_) { return null; }
+}
+
+function getEffectiveLimits(org, adminPlanLimits) {
+  // Priority: per-org custom_limits > admin-configured planLimits > hardcoded PLAN_LIMITS
+  const planBase = (adminPlanLimits && adminPlanLimits[org.plan]) || PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
+  const custom = (org.custom_limits && typeof org.custom_limits === "object") ? org.custom_limits : {};
+  return {
+    agents:              custom.agents              ?? planBase.agents,
+    conversations_month: custom.conversations_month ?? planBase.conversations_month,
+    kb_docs:             custom.kb_docs             ?? planBase.kb_docs,
+  };
+}
+
 // Ensure account_notes and custom_limits columns exist
 (async()=>{
   try{
@@ -1232,24 +1251,14 @@ const PLAN_LIMITS = {
   }catch(_){}
 })();
 
-// Returns effective limits — plan defaults merged with per-account overrides
-function getEffectiveLimits(org) {
-  const base = PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
-  const custom = (org.custom_limits && typeof org.custom_limits === "object") ? org.custom_limits : {};
-  return {
-    agents:              custom.agents              ?? base.agents,
-    conversations_month: custom.conversations_month ?? base.conversations_month,
-    kb_docs:             custom.kb_docs             ?? base.kb_docs,
-  };
-}
-
 // Check agent limit before creating
 async function checkAgentLimit(org_id) {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
-    if (!org) return null; // can't check — allow
-    const limits = getEffectiveLimits(org);
-    if (limits.agents >= 999) return null; // unlimited
+    if (!org) return null;
+    const apl = await getAdminPlanLimits();
+    const limits = getEffectiveLimits(org, apl);
+    if (limits.agents >= 999) return null;
     const [count] = await sql`SELECT COUNT(*)::int as c FROM agents WHERE org_id = ${org_id}`;
     if ((count?.c || 0) >= limits.agents) {
       return { error: `Agent limit reached for ${org.plan} plan (${limits.agents} agents). Upgrade your plan to add more.`, code: "LIMIT_AGENTS" };
@@ -1263,7 +1272,8 @@ async function checkKbLimit(org_id) {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
     if (!org) return null;
-    const limits = getEffectiveLimits(org);
+    const apl = await getAdminPlanLimits();
+    const limits = getEffectiveLimits(org, apl);
     if (limits.kb_docs >= 999) return null;
     if (limits.kb_docs === 0) return { error: `Knowledge base not available on ${org.plan} plan. Upgrade to Starter or above.`, code: "LIMIT_KB" };
     const [count] = await sql`SELECT COUNT(*)::int as c FROM kb_documents WHERE org_id = ${org_id}`;
@@ -1279,7 +1289,8 @@ async function checkConvoLimit(org_id) {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
     if (!org) return null;
-    const limits = getEffectiveLimits(org);
+    const apl = await getAdminPlanLimits();
+    const limits = getEffectiveLimits(org, apl);
     if (limits.conversations_month >= 999999) return null;
     const [count] = await sql`
       SELECT COUNT(*)::int as c FROM conversations
@@ -1297,7 +1308,9 @@ app.get("/api/tenants/:id/usage", async (req, res) => {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${req.params.id}`;
     if (!org) return res.status(404).json({ error: "Not found" });
     const plan = org.plan || "free";
-    const limits = getEffectiveLimits(org);
+    const apl = await getAdminPlanLimits();
+    const limits = getEffectiveLimits(org, apl);
+    const planLimits = (apl && apl[plan]) || PLAN_LIMITS[plan] || PLAN_LIMITS.free; // base plan limits without custom overrides
     // Count agents
     const [agentCount] = await sql`SELECT COUNT(*)::int as count FROM agents WHERE org_id = ${org.id} AND active != false`;
     // Count conversations this calendar month
@@ -1310,6 +1323,7 @@ app.get("/api/tenants/:id/usage", async (req, res) => {
     const [kbCount] = await sql`SELECT COUNT(*)::int as count FROM kb_documents WHERE org_id = ${org.id}`.catch(()=>[{count:0}]);
     res.json({
       plan, limits,
+      plan_limits: planLimits, // base plan limits (no custom overrides) for display
       custom_limits: org.custom_limits || {},
       account_notes: org.account_notes || "",
       usage: {
