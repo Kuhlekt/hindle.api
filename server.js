@@ -42,39 +42,49 @@ app.post("/api/chat", async (req, res) => {
   // It only speaks if the visitor sends a recognised listening command.
   if (conversationId) {
     try {
-      const [conv] = await sql`SELECT status FROM conversations WHERE id = ${conversationId}`;
+      const [conv] = await sql`SELECT status, updated_at FROM conversations WHERE id = ${conversationId}`;
       if (conv && (conv.status === "handoff" || conv.status === "claimed")) {
-        const lastMsg = [...messages].reverse().find(m => m.role === "visitor" || m.role === "user");
-        const text = (lastMsg?.content || lastMsg?.text || "").trim().toLowerCase();
-        const defaults = ["/status", "/cancel", "/restart", "/help", "/agent"];
-        const cmds = Array.isArray(handoffCommands)
-          ? [...defaults, ...handoffCommands.map(c => c.toLowerCase())]
-          : defaults;
-        const matched = cmds.some(c => text === c || text.startsWith(c + " "));
-        if (!matched) {
-          // Silent — a human agent is handling this conversation
-          return res.json({ reply: null, handoff_active: true });
+        // Check last message time from DB — if >60s with no agent reply, let bot back in
+        const [lastDbMsg] = await sql`
+          SELECT created_at FROM messages WHERE conversation_id = ${conversationId}
+          ORDER BY created_at DESC LIMIT 1
+        `.catch(() => [null]);
+        const lastMsgAge = lastDbMsg
+          ? (Date.now() - new Date(lastDbMsg.created_at).getTime()) / 1000
+          : 9999;
+        // If no activity for >60s, fall through to normal AI response
+        if (lastMsgAge <= 60) {
+          const lastMsg = [...messages].reverse().find(m => m.role === "visitor" || m.role === "user");
+          const text = (lastMsg?.content || lastMsg?.text || "").trim().toLowerCase();
+          const defaults = ["/status", "/cancel", "/restart", "/help", "/agent"];
+          const cmds = Array.isArray(handoffCommands)
+            ? [...defaults, ...handoffCommands.map(c => c.toLowerCase())]
+            : defaults;
+          const matched = cmds.some(c => text === c || text.startsWith(c + " "));
+          if (!matched) {
+            return res.json({ reply: null, handoff_active: true });
+          }
+          const cmdSys = (system || "") +
+            "\n\nThis conversation has been escalated to a human agent who is now handling it. " +
+            "You may only respond to visitor commands (/status /cancel /restart /help /agent). " +
+            "Keep replies under 2 sentences. Do not offer to help with the original issue.";
+          const r2 = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-20250514", max_tokens: 150, system: cmdSys,
+              messages: messages.map(m => ({ role: m.role === "visitor" || m.role === "user" ? "user" : "assistant", content: m.content || m.text || "" })),
+            }),
+          });
+          const d2 = await r2.json();
+          const cmdReply = d2.content?.[0]?.text || "";
+          try {
+            await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${conversationId}, 'bot', 'AI', ${cmdReply})`;
+            await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${conversationId}`;
+          } catch (_) {}
+          return res.json({ reply: cmdReply, handoff_active: true, command_matched: true });
         }
-        // Command matched — brief contextual reply only
-        const cmdSys = (system || "") +
-          "\n\nThis conversation has been escalated to a human agent who is now handling it. " +
-          "You may only respond to visitor commands (/status /cancel /restart /help /agent). " +
-          "Keep replies under 2 sentences. Do not offer to help with the original issue.";
-        const r2 = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-20250514", max_tokens: 150, system: cmdSys,
-            messages: messages.map(m => ({ role: m.role === "visitor" || m.role === "user" ? "user" : "assistant", content: m.content || m.text || "" })),
-          }),
-        });
-        const d2 = await r2.json();
-        const cmdReply = d2.content?.[0]?.text || "";
-        try {
-          await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${conversationId}, 'bot', 'AI', ${cmdReply})`;
-          await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${conversationId}`;
-        } catch (_) {}
-        return res.json({ reply: cmdReply, handoff_active: true, command_matched: true });
+        // else: >60s inactivity — fall through to normal AI response
       }
     } catch (_) {}
   }
@@ -270,16 +280,30 @@ app.get("/api/agents/:id", async (req, res) => {
 });
 
 app.post("/api/agents", async (req, res) => {
-  const { org_id, name, email, mobile, role = "agent" } = req.body;
+  const { org_id, name, email, mobile, role = "agent", sms_alerts = true } = req.body;
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  const doInsert = async () => sql`
+    INSERT INTO agents (org_id, name, email, mobile, role, sms_alerts)
+    VALUES (${org_id}, ${name}, ${email}, ${mobile || null}, ${role}, ${sms_alerts})
+    RETURNING *
+  `;
   try {
-    const rows = await sql`
-      INSERT INTO agents (org_id, name, email, mobile, role)
-      VALUES (${org_id}, ${name}, ${email}, ${mobile}, ${role})
-      RETURNING *
-    `;
+    const rows = await doInsert();
     res.status(201).json(rows[0]);
   } catch (e) {
+    // Auto-add missing columns and retry once
+    if (e.message && (e.message.includes("sms_alerts") || e.message.includes("column"))) {
+      try {
+        await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_alerts BOOLEAN DEFAULT true`;
+        await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS password_hash TEXT`;
+        await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT false`;
+        await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS magic_token TEXT`;
+        await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS magic_token_at TIMESTAMPTZ`;
+        await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`;
+        const rows = await doInsert();
+        return res.status(201).json(rows[0]);
+      } catch (e2) { return res.status(500).json({ error: e2.message }); }
+    }
     res.status(500).json({ error: e.message });
   }
 });
@@ -326,14 +350,14 @@ app.post("/api/agents/:id/password", async (req, res) => {
   }
 });
 
-// POST /api/invite-agent — create login credentials and send email with password
+// POST /api/invite-agent — create login credentials and notify agent via SMS
 app.post("/api/invite-agent", async (req, res) => {
   const { tenantId, name, email, mobile } = req.body;
   if (!email) return res.status(400).json({ error: "email required" });
   try {
     // Generate a readable temp password
     const adjectives = ["Blue","Fast","Bright","Clear","Bold","Swift","Sharp","Clean"];
-    const nouns     = ["Eagle","River","Storm","Cloud","Stone","Ridge","Flame","Coast"];
+    const nouns      = ["Eagle","River","Storm","Cloud","Stone","Ridge","Flame","Coast"];
     const tempPassword =
       adjectives[Math.floor(Math.random()*adjectives.length)] +
       nouns[Math.floor(Math.random()*nouns.length)] +
@@ -346,6 +370,11 @@ app.post("/api/invite-agent", async (req, res) => {
       WHERE LOWER(email) = LOWER(${email})
     `;
 
+    // If no mobile, return password for manual sharing
+    if (!mobile) {
+      return res.json({ ok: false, passwordSet: true, tempPassword, sendErr: "No mobile number provided" });
+    }
+
     // Load ClickSend creds (tenant first, then platform fallback)
     let cs = {};
     for (const tid of [tenantId, "platform"]) {
@@ -355,52 +384,32 @@ app.post("/api/invite-agent", async (req, res) => {
     }
 
     if (!cs.username || !cs.apiKey) {
-      // No ClickSend — password still set, just can't send email
-      return res.json({ ok: false, passwordSet: true, tempPassword, error: "ClickSend not configured — password set but email not sent" });
+      return res.json({ ok: false, passwordSet: true, tempPassword, sendErr: "ClickSend not configured" });
     }
 
     const loginUrl = "https://chatbot.hindleconsultants.com";
-    const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
-
-    // ClickSend email API — POST /v3/email/send
-    const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px">
-<h2 style="color:#2563EB;margin-bottom:8px">Welcome to Hindle AI</h2>
-<p style="color:#334155">Hi ${name || "there"},</p>
-<p style="color:#334155">You've been invited to join the Hindle Consultants AI Dashboard as an agent.</p>
-<div style="background:#F8F9FB;border:1px solid #E2E6ED;border-radius:8px;padding:16px;margin:20px 0">
-  <p style="margin:0 0 8px;font-size:13px;color:#64748B;font-weight:600">Your login details:</p>
-  <p style="margin:0 0 6px"><strong>URL:</strong> <a href="${loginUrl}" style="color:#2563EB">${loginUrl}</a></p>
-  <p style="margin:0 0 6px"><strong>Email:</strong> ${email}</p>
-  <p style="margin:0"><strong>Temporary Password:</strong> <code style="background:#fff;border:1px solid #E2E6ED;padding:3px 10px;border-radius:4px;font-size:16px;font-weight:700">${tempPassword}</code></p>
-</div>
-<p style="color:#94A3B8;font-size:12px">Please change your password after first login via the menu in the bottom-left of the dashboard.</p>
-</div>`;
-
-    const emailPayload = {
-      to: [{ email, name: name || "Agent" }],
-      from: { email: cs.username, name: cs.smsSender || "Hindle Consultants" },
-      subject: "You've been invited to Hindle AI Dashboard",
-      body: htmlBody,
-    };
+    const smsBody  = `Hi ${name || "there"}, you're invited to Hindle AI. Login: ${loginUrl} Email: ${email} Password: ${tempPassword} (change after first login)`;
+    const auth     = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
 
     let sent = false;
     let sendErr = null;
     try {
-      const r = await fetch("https://rest.clicksend.com/v3/email/send", {
+      const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: auth },
-        body: JSON.stringify(emailPayload),
+        body: JSON.stringify({
+          messages: [{ source: "sdk", to: mobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: smsBody, schedule: 0 }],
+        }),
         signal: AbortSignal.timeout(10000),
       });
       const d = await r.json();
-      // ClickSend returns response_code "SUCCESS" at top level for email
-      sent = d?.response_code === "SUCCESS" || d?.data?.status === "SUCCESS" || r.ok;
-      if (!sent) sendErr = JSON.stringify(d).substring(0, 200);
+      sent = d?.data?.messages?.[0]?.status === "SUCCESS";
+      if (!sent) sendErr = d?.data?.messages?.[0]?.status || JSON.stringify(d).substring(0, 120);
     } catch (fetchErr) {
       sendErr = fetchErr.message;
     }
 
-    res.json({ ok: sent, passwordSet: true, sendErr });
+    res.json({ ok: sent, passwordSet: true, tempPassword, sendErr });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
