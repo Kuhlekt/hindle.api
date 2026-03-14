@@ -327,6 +327,11 @@ app.get("/api/agents/:id", async (req, res) => {
 app.post("/api/agents", async (req, res) => {
   const { org_id, name, email, mobile, role = "agent", sms_alerts = true } = req.body;
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  // Plan enforcement
+  if (org_id) {
+    const limitErr = await checkAgentLimit(org_id);
+    if (limitErr) return res.status(403).json(limitErr);
+  }
   const doInsert = async () => sql`
     INSERT INTO agents (org_id, name, email, mobile, role, sms_alerts)
     VALUES (${org_id}, ${name}, ${email}, ${mobile || null}, ${role}, ${sms_alerts})
@@ -536,7 +541,12 @@ app.post("/api/conversations", async (req, res) => {
       const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenant_id} OR tenant_id = ${tenant_id} LIMIT 1`;
       if (orgs.length) resolvedOrgId = orgs[0].id;
     } catch (_) {}
-    if (!resolvedOrgId) resolvedOrgId = tenant_id; // store as-is so we can still query it
+    if (!resolvedOrgId) resolvedOrgId = tenant_id;
+  }
+  // Plan enforcement — only block if we can resolve the org
+  if (resolvedOrgId) {
+    const limitErr = await checkConvoLimit(resolvedOrgId);
+    if (limitErr) return res.status(403).json(limitErr);
   }
   try {
     const rows = await sql`
@@ -718,6 +728,11 @@ app.get("/api/kb", async (req, res) => {
 app.post("/api/kb", async (req, res) => {
   const { org_id, name, category, sub_category, size_kb, chunks } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
+  // Plan enforcement
+  if (org_id) {
+    const limitErr = await checkKbLimit(org_id);
+    if (limitErr) return res.status(403).json(limitErr);
+  }
   try {
     const rows = await sql`
       INSERT INTO kb_documents (org_id, name, category, sub_category, size_kb, chunks)
@@ -1203,18 +1218,86 @@ app.post("/api/audit-log", async (req, res) => {
 // PLAN ENFORCEMENT — usage limits per plan
 // ─────────────────────────────────────────────
 const PLAN_LIMITS = {
-  free:         { agents: 1,  conversations_month: 100,  kb_docs: 0  },
-  starter:      { agents: 5,  conversations_month: 500,  kb_docs: 5  },
+  free:         { agents: 1,  conversations_month: 100,  kb_docs: 0   },
+  starter:      { agents: 5,  conversations_month: 500,  kb_docs: 5   },
   professional: { agents: 10, conversations_month: 2000, kb_docs: 999 },
   enterprise:   { agents: 999,conversations_month: 999999,kb_docs: 999 },
 };
+
+// Ensure account_notes and custom_limits columns exist
+(async()=>{
+  try{
+    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS account_notes TEXT`;
+    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS custom_limits JSONB DEFAULT '{}'`;
+  }catch(_){}
+})();
+
+// Returns effective limits — plan defaults merged with per-account overrides
+function getEffectiveLimits(org) {
+  const base = PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
+  const custom = (org.custom_limits && typeof org.custom_limits === "object") ? org.custom_limits : {};
+  return {
+    agents:              custom.agents              ?? base.agents,
+    conversations_month: custom.conversations_month ?? base.conversations_month,
+    kb_docs:             custom.kb_docs             ?? base.kb_docs,
+  };
+}
+
+// Check agent limit before creating
+async function checkAgentLimit(org_id) {
+  try {
+    const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
+    if (!org) return null; // can't check — allow
+    const limits = getEffectiveLimits(org);
+    if (limits.agents >= 999) return null; // unlimited
+    const [count] = await sql`SELECT COUNT(*)::int as c FROM agents WHERE org_id = ${org_id}`;
+    if ((count?.c || 0) >= limits.agents) {
+      return { error: `Agent limit reached for ${org.plan} plan (${limits.agents} agents). Upgrade your plan to add more.`, code: "LIMIT_AGENTS" };
+    }
+  } catch (_) {}
+  return null;
+}
+
+// Check KB doc limit before creating
+async function checkKbLimit(org_id) {
+  try {
+    const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
+    if (!org) return null;
+    const limits = getEffectiveLimits(org);
+    if (limits.kb_docs >= 999) return null;
+    if (limits.kb_docs === 0) return { error: `Knowledge base not available on ${org.plan} plan. Upgrade to Starter or above.`, code: "LIMIT_KB" };
+    const [count] = await sql`SELECT COUNT(*)::int as c FROM kb_documents WHERE org_id = ${org_id}`;
+    if ((count?.c || 0) >= limits.kb_docs) {
+      return { error: `KB document limit reached for ${org.plan} plan (${limits.kb_docs} docs). Upgrade your plan to add more.`, code: "LIMIT_KB" };
+    }
+  } catch (_) {}
+  return null;
+}
+
+// Check monthly conversation limit
+async function checkConvoLimit(org_id) {
+  try {
+    const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
+    if (!org) return null;
+    const limits = getEffectiveLimits(org);
+    if (limits.conversations_month >= 999999) return null;
+    const [count] = await sql`
+      SELECT COUNT(*)::int as c FROM conversations
+      WHERE org_id = ${org_id} AND created_at >= DATE_TRUNC('month', NOW())
+    `;
+    if ((count?.c || 0) >= limits.conversations_month) {
+      return { error: `Monthly conversation limit reached for ${org.plan} plan (${limits.conversations_month}/mo). Upgrade your plan to continue.`, code: "LIMIT_CONVOS" };
+    }
+  } catch (_) {}
+  return null;
+}
 
 app.get("/api/tenants/:id/usage", async (req, res) => {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${req.params.id}`;
     if (!org) return res.status(404).json({ error: "Not found" });
     const plan = org.plan || "free";
-    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+    const limits = getEffectiveLimits(org);
     // Count agents
     const [agentCount] = await sql`SELECT COUNT(*)::int as count FROM agents WHERE org_id = ${org.id} AND active != false`;
     // Count conversations this calendar month
@@ -1227,6 +1310,8 @@ app.get("/api/tenants/:id/usage", async (req, res) => {
     const [kbCount] = await sql`SELECT COUNT(*)::int as count FROM kb_documents WHERE org_id = ${org.id}`.catch(()=>[{count:0}]);
     res.json({
       plan, limits,
+      custom_limits: org.custom_limits || {},
+      account_notes: org.account_notes || "",
       usage: {
         agents: agentCount?.count || 0,
         conversations_month: convCount?.count || 0,
@@ -1275,6 +1360,27 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
         return r;
       });
       await writeAudit(org.id, "trial_reset", note || "Trial reset by admin", {});
+    } else if (action === "update_limits") {
+      // Custom per-account limit overrides (discretionary)
+      const custom = {};
+      if (req.body.custom_agents     != null) custom.agents              = parseInt(req.body.custom_agents)     || null;
+      if (req.body.custom_convos     != null) custom.conversations_month = parseInt(req.body.custom_convos)     || null;
+      if (req.body.custom_kb         != null) custom.kb_docs             = parseInt(req.body.custom_kb)         || null;
+      // Remove nulls — null means "use plan default"
+      Object.keys(custom).forEach(k => { if (custom[k] == null) delete custom[k]; });
+      [updated] = await sql`UPDATE organisations SET custom_limits = ${JSON.stringify(custom)} WHERE id = ${org.id} RETURNING *`
+        .catch(async () => {
+          await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS custom_limits JSONB DEFAULT '{}'`;
+          return sql`UPDATE organisations SET custom_limits = ${JSON.stringify(custom)} WHERE id = ${org.id} RETURNING *`;
+        });
+      await writeAudit(org.id, "limits_updated", `Custom limits updated${note ? ": " + note : ""}`, { custom });
+    } else if (action === "update_notes") {
+      [updated] = await sql`UPDATE organisations SET account_notes = ${req.body.notes || null} WHERE id = ${org.id} RETURNING *`
+        .catch(async () => {
+          await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS account_notes TEXT`;
+          return sql`UPDATE organisations SET account_notes = ${req.body.notes || null} WHERE id = ${org.id} RETURNING *`;
+        });
+      await writeAudit(org.id, "notes_updated", "Account notes updated by admin", {});
     } else {
       return res.status(400).json({ error: "Unknown action" });
     }
