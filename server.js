@@ -2,16 +2,21 @@ const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-// Stripe — STRIPE_SECRET_KEY must be set in Railway env vars
+// Stripe — loaded dynamically so missing package never crashes the server
 let stripe = null;
-try {
-  if (process.env.STRIPE_SECRET_KEY) {
-    stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-    console.log("[Stripe] Initialised OK");
-  } else {
-    console.warn("[Stripe] STRIPE_SECRET_KEY not set — payments disabled");
+(function() {
+  try {
+    if (process.env.STRIPE_SECRET_KEY) {
+      const Stripe = require("stripe");
+      stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+      console.log("[Stripe] Initialised OK");
+    } else {
+      console.log("[Stripe] STRIPE_SECRET_KEY not set — payments disabled");
+    }
+  } catch (e) {
+    console.log("[Stripe] Module not installed — payments disabled. Run: npm install stripe");
   }
-} catch (e) { console.warn("[Stripe] Load error:", e.message); }
+}());
 const { neon } = require("@neondatabase/serverless");
 
 const sql = neon(process.env.DATABASE_URL);
