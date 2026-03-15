@@ -1091,10 +1091,27 @@ app.post("/api/conversations", async (req, res) => {
     const limitErr = await checkConvoLimit(resolvedOrgId);
     if (limitErr) return res.status(403).json(limitErr);
   }
+  // Auto-detect location from IP if not supplied
+  let resolvedLocation = visitor_location || null;
+  if (!resolvedLocation) {
+    try {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
+      if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
+        const geoR = await fetch(`https://ipapi.co/${ip}/json/`);
+        if (geoR.ok) {
+          const geo = await geoR.json();
+          if (geo.city || geo.country_name) {
+            resolvedLocation = [geo.city, geo.region, geo.country_name].filter(Boolean).join(", ");
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
   try {
     const rows = await sql`
       INSERT INTO conversations (org_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status)
-      VALUES (${resolvedOrgId}, ${visitor_name || 'Website Visitor'}, ${visitor_email || null}, ${visitor_phone || null}, ${visitor_company || null}, ${visitor_location || null}, ${page || '/'}, ${subject || 'Chat'}, ${status || 'open'})
+      VALUES (${resolvedOrgId}, ${visitor_name || 'Website Visitor'}, ${visitor_email || null}, ${visitor_phone || null}, ${visitor_company || null}, ${resolvedLocation || null}, ${page || '/'}, ${subject || 'Chat'}, ${status || 'open'})
       RETURNING *
     `;
     res.status(201).json(rows[0]);
