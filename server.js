@@ -699,11 +699,13 @@ app.get("/api/admin-settings", async (req, res) => {
     if (!rows.length) return res.json({});
     const cfg = rows[0].config || {};
     res.json({
-      profile:       cfg._adminProfile   || {},
-      platform:      cfg._platformConfig || {},
-      github:        cfg._githubConfig   || {},
-      superConfig:   cfg._superConfig    || {},
-      adminPassword: cfg._adminPassword  || null,
+      profile:         cfg._adminProfile   || {},
+      platform:        cfg._platformConfig || {},
+      github:          cfg._githubConfig   || {},
+      superConfig:     cfg._superConfig    || {},
+      adminPassword:   cfg._adminPassword  || null,
+      adminAccounts:   cfg._adminAccounts  || [],
+      _adminPasswords: cfg._adminPasswords || {},
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -711,18 +713,24 @@ app.get("/api/admin-settings", async (req, res) => {
 });
 
 app.post("/api/admin-settings", async (req, res) => {
-  const { profile, platform, github, superConfig, adminPassword } = req.body;
+  const { profile, platform, github, superConfig, adminPassword, adminAccounts, adminPasswordFor } = req.body;
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     const existing = rows.length ? (rows[0].config || {}) : {};
     const merged = {
       ...existing,
-      ...(profile       ? { _adminProfile:   profile     } : {}),
-      ...(platform      ? { _platformConfig: platform    } : {}),
-      ...(github        ? { _githubConfig:   github      } : {}),
-      ...(superConfig   ? { _superConfig:    superConfig } : {}),
-      ...(adminPassword ? { _adminPassword:  adminPassword } : {}),
+      ...(profile         ? { _adminProfile:   profile       } : {}),
+      ...(platform        ? { _platformConfig: platform      } : {}),
+      ...(github          ? { _githubConfig:   github        } : {}),
+      ...(superConfig     ? { _superConfig:    superConfig   } : {}),
+      ...(adminPassword   ? { _adminPassword:  adminPassword } : {}),
+      ...(adminAccounts   ? { _adminAccounts:  adminAccounts } : {}),
     };
+    // Per-account password: store as _adminPasswords[email]
+    if (adminPasswordFor?.email && adminPasswordFor?.password) {
+      const passwords = { ...(existing._adminPasswords || {}), [adminPasswordFor.email]: adminPasswordFor.password };
+      merged._adminPasswords = passwords;
+    }
     await sql`
       INSERT INTO tenant_configs (tenant_id, config)
       VALUES ('platform', ${JSON.stringify(merged)})
