@@ -1,7 +1,50 @@
-const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const https = require("https");
+const http = require("http");
+
+// Safe fetch using built-in https/http — avoids node-fetch ESM issues
+const fetch = (url, opts = {}) => new Promise((resolve, reject) => {
+  const parsed = new URL(url);
+  const mod = parsed.protocol === "https:" ? https : http;
+  const options = {
+    hostname: parsed.hostname,
+    port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+    path: parsed.pathname + parsed.search,
+    method: opts.method || "GET",
+    headers: opts.headers || {},
+  };
+  const body = opts.body;
+  if (body && !options.headers["Content-Length"]) {
+    options.headers["Content-Length"] = Buffer.byteLength(body);
+  }
+  const req = mod.request(options, (res) => {
+    const chunks = [];
+    res.on("data", c => chunks.push(c));
+    res.on("end", () => {
+      const buf = Buffer.concat(chunks);
+      resolve({
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        status: res.statusCode,
+        statusText: res.statusMessage,
+        json: () => Promise.resolve(JSON.parse(buf.toString())),
+        text: () => Promise.resolve(buf.toString()),
+      });
+    });
+  });
+  req.on("error", reject);
+  if (body) req.write(body);
+  req.end();
+});
+
+// Prevent unhandled rejections from crashing the server
+process.on("unhandledRejection", (reason) => {
+  console.error("[Server] Unhandled rejection:", reason?.message || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[Server] Uncaught exception:", err.message);
+});
 // Stripe — loaded dynamically so missing package never crashes the server
 let stripe = null;
 (function() {
@@ -22,6 +65,8 @@ const { neon } = require("@neondatabase/serverless");
 const sql = neon(process.env.DATABASE_URL);
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+app.use(cors());
 
 // Stripe webhook MUST receive raw body for signature verification
 // Register this route BEFORE express.json() middleware
