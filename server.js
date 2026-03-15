@@ -531,7 +531,7 @@ app.get("/api/onboarding/:orgId", async (req, res) => {
 // Body: { tenantId, system, messages: [{role, content}] }
 // ─────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
-  const { system, messages, tenantId, conversationId, handoffCommands } = req.body;
+  const { system, messages, tenantId, conversationId, handoffCommands, handoffInactivityTimeout, additionalInstructions } = req.body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages array required" });
@@ -559,8 +559,10 @@ app.post("/api/chat", async (req, res) => {
         const lastMsgAge = lastDbMsg
           ? (Date.now() - new Date(lastDbMsg.created_at).getTime()) / 1000
           : 9999;
-        // If no activity for >60s, fall through to normal AI response
-        if (lastMsgAge <= 60) {
+        // Check last message time from DB — silence period comes from tenant config
+        const silenceSecs = (handoffInactivityTimeout && handoffInactivityTimeout > 0) ? handoffInactivityTimeout : 120;
+        // If no activity for less than the silence period, keep AI quiet
+        if (lastMsgAge <= silenceSecs) {
           const lastMsg = [...messages].reverse().find(m => m.role === "visitor" || m.role === "user");
           const text = (lastMsg?.content || lastMsg?.text || "").trim().toLowerCase();
           const defaults = ["/status", "/cancel", "/restart", "/help", "/agent"];
@@ -601,6 +603,7 @@ app.post("/api/chat", async (req, res) => {
     // Build confidence-aware system prompt
     const { confidenceThreshold = 0.6, sessionHistory } = req.body;
     const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
+      (additionalInstructions ? "\n\nAdditional instructions:\n" + additionalInstructions : "") +
       "\n\nIMPORTANT: After your answer, on a new line write exactly: CONFIDENCE:[0.0-1.0] where the number reflects how confident you are in your answer (1.0 = certain, 0.5 = unsure, 0.0 = no idea). If confidence is below 0.6, end with: SUGGEST_HUMAN:true";
 
     // Include session history for conversation memory (last 6 turns from prior sessions)
@@ -1263,9 +1266,8 @@ app.patch("/api/alert-log/:id", async (req, res) => {
 app.get("/api/kb", async (req, res) => {
   try {
     const { org_id } = req.query;
-    const rows = org_id
-      ? await sql`SELECT * FROM kb_documents WHERE org_id = ${org_id} ORDER BY created_at DESC`
-      : await sql`SELECT * FROM kb_documents ORDER BY created_at DESC`;
+    if (!org_id) return res.status(400).json({ error: "org_id required" });
+    const rows = await sql`SELECT * FROM kb_documents WHERE org_id = ${org_id} ORDER BY created_at DESC`;
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1293,8 +1295,13 @@ app.post("/api/kb", async (req, res) => {
 });
 
 app.patch("/api/kb/:id", async (req, res) => {
-  const { name, category, sub_category, chunks, status } = req.body;
+  const { name, category, sub_category, chunks, status, org_id } = req.body;
   try {
+    // Verify ownership if org_id provided
+    if (org_id) {
+      const check = await sql`SELECT id FROM kb_documents WHERE id = ${req.params.id} AND org_id = ${org_id} LIMIT 1`;
+      if (!check.length) return res.status(403).json({ error: "Not authorised" });
+    }
     const rows = await sql`
       UPDATE kb_documents SET
         name         = COALESCE(${name},         name),
@@ -1315,6 +1322,11 @@ app.patch("/api/kb/:id", async (req, res) => {
 
 app.delete("/api/kb/:id", async (req, res) => {
   try {
+    const { org_id } = req.query;
+    if (org_id) {
+      const check = await sql`SELECT id FROM kb_documents WHERE id = ${req.params.id} AND org_id = ${org_id} LIMIT 1`;
+      if (!check.length) return res.status(403).json({ error: "Not authorised" });
+    }
     await sql`DELETE FROM kb_documents WHERE id = ${req.params.id}`;
     res.json({ deleted: true });
   } catch (e) {
