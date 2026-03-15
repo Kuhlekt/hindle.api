@@ -177,6 +177,85 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// SUPER ADMIN 2FA
+// POST /api/auth/2fa/send   — generate code, email it
+// POST /api/auth/2fa/verify — verify code
+// ─────────────────────────────────────────────
+const twoFaCodes = new Map(); // email → { code, expiresAt, attempts }
+
+app.post("/api/auth/2fa/send", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  twoFaCodes.set(email.toLowerCase(), { code, expiresAt, attempts: 0 });
+
+  // Send via ClickSend email
+  try {
+    const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(() => [null]);
+    const cs = cfg?.config?.clicksend || cfg?.config?._platformConfig?.clicksend || {};
+    const username = cs.username || process.env.CLICKSEND_USERNAME;
+    const apiKey   = cs.apiKey   || process.env.CLICKSEND_API_KEY;
+
+    if (username && apiKey) {
+      const body = JSON.stringify({
+        to: [{ email_address_id: 1, name: "Admin", email: email }],
+        from: { email_address_id: 1, name: cs.fromName || "Hindle Consultants" },
+        subject: "Your Hindle Admin login code",
+        body: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">
+  <h2 style="margin:0 0 8px">Login verification code</h2>
+  <p style="color:#64748b;margin:0 0 20px">Enter this code to complete your sign in:</p>
+  <div style="background:#f1f5f9;border-radius:8px;padding:20px;text-align:center;font-size:36px;font-weight:800;letter-spacing:8px;color:#1e293b">${code}</div>
+  <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">This code expires in 10 minutes. If you did not request this, change your password immediately.</p>
+</div>`,
+      });
+      const r = await fetch("https://rest.clicksend.com/v3/email/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64"),
+        },
+        body,
+      });
+      const d = await r.json();
+      console.log("[2FA] Email send result:", d?.response_code, "→", email);
+    } else {
+      // No ClickSend — log code for dev (remove in prod)
+      console.log(`[2FA] CODE for ${email}: ${code} (ClickSend not configured)`);
+    }
+  } catch (e) {
+    console.error("[2FA] Email error:", e.message);
+  }
+
+  res.json({ ok: true, expires: expiresAt });
+});
+
+app.post("/api/auth/2fa/verify", (req, res) => {
+  const { email, code } = req.body;
+  if (!email || !code) return res.status(400).json({ error: "email and code required" });
+
+  const entry = twoFaCodes.get(email.toLowerCase());
+  if (!entry) return res.status(400).json({ error: "No code found — request a new one" });
+  if (Date.now() > entry.expiresAt) {
+    twoFaCodes.delete(email.toLowerCase());
+    return res.status(400).json({ error: "Code expired — request a new one" });
+  }
+  entry.attempts++;
+  if (entry.attempts > 5) {
+    twoFaCodes.delete(email.toLowerCase());
+    return res.status(429).json({ error: "Too many attempts — request a new code" });
+  }
+  if (code.trim() !== entry.code) {
+    return res.status(400).json({ error: `Incorrect code (${5 - entry.attempts} attempts remaining)` });
+  }
+
+  twoFaCodes.delete(email.toLowerCase());
+  res.json({ ok: true });
+});
+
+
 // Quick diagnostic — count conversations for an org
 
 // ─────────────────────────────────────────────
