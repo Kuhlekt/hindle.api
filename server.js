@@ -12,6 +12,48 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 // ─────────────────────────────────────────────
+// IN-MEMORY RATE LIMITER  (per tenant, per minute)
+// ─────────────────────────────────────────────
+const rateBuckets = new Map(); // tenantId → { count, resetAt }
+function checkRateLimit(tenantId, limit = 30) {
+  const now = Date.now();
+  let bucket = rateBuckets.get(tenantId);
+  if (!bucket || now > bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + 60000 };
+    rateBuckets.set(tenantId, bucket);
+  }
+  bucket.count++;
+  if (bucket.count > limit) return false;
+  return true;
+}
+// Clean up old buckets every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateBuckets.entries()) {
+    if (now > v.resetAt + 60000) rateBuckets.delete(k);
+  }
+}, 300000);
+
+// ─────────────────────────────────────────────
+// TYPING INDICATORS  (in-memory, TTL 5s)
+// ─────────────────────────────────────────────
+const typingState = new Map(); // conversationId → { agent: bool, visitor: bool, ts: number }
+function setTyping(convId, role, val) {
+  const cur = typingState.get(convId) || { agent: false, visitor: false };
+  cur[role] = val;
+  cur.ts = Date.now();
+  typingState.set(convId, cur);
+}
+function getTyping(convId) {
+  const s = typingState.get(convId);
+  if (!s) return { agent: false, visitor: false };
+  // Auto-expire after 5s inactivity
+  if (Date.now() - s.ts > 5000) { typingState.delete(convId); return { agent: false, visitor: false }; }
+  return s;
+}
+
+
+// ─────────────────────────────────────────────
 // HEALTH
 // ─────────────────────────────────────────────
 app.get("/api/health", async (req, res) => {
@@ -38,6 +80,113 @@ app.get("/api/diag/convos", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// TYPING INDICATORS
+// POST /api/typing  { conversationId, role, typing }
+// GET  /api/typing/:conversationId
+// ─────────────────────────────────────────────
+app.post("/api/typing", (req, res) => {
+  const { conversationId, role, typing } = req.body;
+  if (!conversationId || !role) return res.status(400).json({ error: "conversationId and role required" });
+  setTyping(conversationId, role === "agent" ? "agent" : "visitor", !!typing);
+  res.json({ ok: true });
+});
+app.get("/api/typing/:conversationId", (req, res) => {
+  res.json(getTyping(req.params.conversationId));
+});
+
+// ─────────────────────────────────────────────
+// CSAT  — store rating on conversation
+// POST /api/conversations/:id/csat  { rating: 1|0, comment? }
+// ─────────────────────────────────────────────
+app.post("/api/conversations/:id/csat", async (req, res) => {
+  const { rating, comment } = req.body;
+  if (rating === undefined) return res.status(400).json({ error: "rating required" });
+  try {
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_rating INT`.catch(() => {});
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_comment TEXT`.catch(() => {});
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_at TIMESTAMPTZ`.catch(() => {});
+    await sql`
+      UPDATE conversations
+      SET csat_rating = ${rating}, csat_comment = ${comment || null}, csat_at = NOW(), updated_at = NOW()
+      WHERE id = ${req.params.id}
+    `;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// ANALYTICS  — first response time + CSAT summary
+// GET /api/analytics/:orgId?days=30
+// ─────────────────────────────────────────────
+app.get("/api/analytics/:orgId", async (req, res) => {
+  const { orgId } = req.params;
+  const { days = "30" } = req.query;
+  try {
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_rating INT`.catch(() => {});
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS first_response_at TIMESTAMPTZ`.catch(() => {});
+    const since = new Date(Date.now() - Number(days) * 86400000).toISOString();
+    const csatRows = await sql`
+      SELECT csat_rating, COUNT(*)::int as n FROM conversations
+      WHERE org_id::text = ${orgId} AND csat_rating IS NOT NULL AND created_at >= ${since}
+      GROUP BY csat_rating
+    `;
+    const csatTotal = csatRows.reduce((s, r) => s + r.n, 0);
+    const csatPositive = csatRows.filter(r => r.csat_rating === 1).reduce((s, r) => s + r.n, 0);
+    const csatScore = csatTotal === 0 ? null : Math.round(csatPositive / csatTotal * 100);
+    const frtRows = await sql`
+      SELECT c.id, EXTRACT(EPOCH FROM (MIN(m.created_at) - c.created_at)) AS frt_seconds
+      FROM conversations c
+      JOIN messages m ON m.conversation_id = c.id AND m.type = 'agent'
+      WHERE c.org_id::text = ${orgId} AND c.created_at >= ${since}
+      GROUP BY c.id, c.created_at
+    `.catch(() => []);
+    const frtValues = frtRows.map(r => Number(r.frt_seconds)).filter(v => v > 0 && v < 86400);
+    const avgFrt = frtValues.length === 0 ? null : Math.round(frtValues.reduce((s, v) => s + v, 0) / frtValues.length);
+    const medFrt = frtValues.length === 0 ? null : [...frtValues].sort((a, b) => a - b)[Math.floor(frtValues.length / 2)];
+    const dailyRows = await sql`
+      SELECT DATE(created_at) as day, COUNT(*)::int as total,
+             SUM(CASE WHEN claimed_by_id IS NOT NULL OR status IN ('claimed','resolved') THEN 1 ELSE 0 END)::int as human,
+             SUM(CASE WHEN csat_rating = 1 THEN 1 ELSE 0 END)::int as csat_pos,
+             SUM(CASE WHEN csat_rating IS NOT NULL THEN 1 ELSE 0 END)::int as csat_total
+      FROM conversations
+      WHERE org_id::text = ${orgId} AND created_at >= ${since}
+      GROUP BY DATE(created_at) ORDER BY day ASC
+    `.catch(() => []);
+    res.json({ csatScore, csatTotal, csatPositive, avgFrt, medFrt, frtCount: frtValues.length, dailyRows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// ONBOARDING CHECKLIST
+// GET /api/onboarding/:orgId
+// ─────────────────────────────────────────────
+app.get("/api/onboarding/:orgId", async (req, res) => {
+  const { orgId } = req.params;
+  try {
+    const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${orgId} LIMIT 1`.catch(() => [null]);
+    const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`.catch(() => [null]);
+    const [convRow] = await sql`SELECT COUNT(*)::int as n FROM conversations WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
+    const [agentRow] = await sql`SELECT COUNT(*)::int as n FROM agents WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
+    const [kbRow] = await sql`SELECT COUNT(*)::int as n FROM kb_documents WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
+    const c = cfg?.config || {};
+    const brand = c.brand || {};
+    const steps = [
+      { id: "profile",  label: "Complete organisation profile", done: !!(org?.name && c.org?.phone) },
+      { id: "branding", label: "Set brand colours & widget name", done: !!(brand.primary && brand.widget_name) },
+      { id: "logo",     label: "Upload custom logo",            done: !!(brand.customLogoUrl) },
+      { id: "agent",    label: "Add at least one agent",        done: (agentRow?.n || 0) > 0 },
+      { id: "kb",       label: "Add a knowledge base document", done: (kbRow?.n || 0) > 0 },
+      { id: "faq",      label: "Add at least one FAQ",          done: Array.isArray(c.faqs) && c.faqs.length > 0 },
+      { id: "widget",   label: "Install widget on your site",   done: !!(c.widgetInstalled) },
+      { id: "convo",    label: "Receive your first chat",       done: (convRow?.n || 0) > 0 },
+    ];
+    const pct = Math.round(steps.filter(s => s.done).length / steps.length * 100);
+    res.json({ steps, pct });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ─────────────────────────────────────────────
 // AI CHAT  — routes messages through Claude
 // POST /api/chat
 // Body: { tenantId, system, messages: [{role, content}] }
@@ -47,6 +196,11 @@ app.post("/api/chat", async (req, res) => {
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages array required" });
+  }
+
+  // Rate limit: 30 AI calls per tenant per minute
+  if (tenantId && !checkRateLimit(tenantId, 30)) {
+    return res.status(429).json({ error: "Rate limit exceeded. Please wait a moment before sending another message.", rate_limited: true });
   }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set on server" });
@@ -677,6 +831,13 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
       RETURNING *
     `;
     await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${req.params.id}`;
+    // Track first agent response time (only set once, on first agent message)
+    if (type === "agent") {
+      await sql`
+        UPDATE conversations SET first_response_at = NOW()
+        WHERE id = ${req.params.id} AND first_response_at IS NULL
+      `.catch(() => {});
+    }
     res.status(201).json(rows[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });
