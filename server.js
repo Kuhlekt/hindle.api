@@ -23,7 +23,59 @@ const sql = neon(process.env.DATABASE_URL);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// Stripe webhook MUST receive raw body for signature verification
+// Register this route BEFORE express.json() middleware
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured" });
+  const sig = req.headers["stripe-signature"];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
+  try {
+    event = webhookSecret
+      ? stripe.webhooks.constructEvent(req.body, sig, webhookSecret)
+      : JSON.parse(req.body.toString());
+  } catch (e) {
+    console.error("[Stripe] Webhook signature error:", e.message);
+    return res.status(400).json({ error: "Webhook signature error: " + e.message });
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const { planId, orgId, promoCode } = session.metadata || {};
+    const email = session.customer_email;
+    try {
+      let org = null;
+      if (orgId && orgId !== "") {
+        const rows = await sql`SELECT * FROM organisations WHERE id::text = ${orgId} LIMIT 1`;
+        org = rows[0] || null;
+      }
+      if (!org && email) {
+        const rows = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+        org = rows[0] || null;
+      }
+      if (org) {
+        await sql`UPDATE organisations SET status = 'paid', plan = ${planId || org.plan}, updated_at = NOW() WHERE id = ${org.id}`;
+        if (promoCode) {
+          const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+          if (cfg?.config?._superConfig?.promoCodes) {
+            const codes = cfg.config._superConfig.promoCodes.map(p =>
+              p.code === promoCode.toUpperCase() ? { ...p, used: (p.used || 0) + 1 } : p
+            );
+            const updated = { ...cfg.config, _superConfig: { ...cfg.config._superConfig, promoCodes: codes } };
+            await sql`UPDATE tenant_configs SET config = ${JSON.stringify(updated)} WHERE tenant_id = 'platform'`;
+          }
+        }
+        console.log(`[Stripe] Activated org ${org.id} (${org.email}) on plan ${planId}`);
+      } else {
+        console.warn(`[Stripe] Webhook: could not find org for email=${email} orgId=${orgId}`);
+      }
+    } catch (e) {
+      console.error("[Stripe] Webhook activation error:", e.message);
+    }
+  }
+  res.json({ received: true });
+});
+
 app.use(express.json({ limit: "2mb" }));
 
 // ─────────────────────────────────────────────
@@ -155,58 +207,7 @@ app.post("/api/stripe/checkout", async (req, res) => {
   }
 });
 
-// POST /api/stripe/webhook
-// Stripe sends events here — activates org on payment success
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: "Stripe not configured" });
-  const sig = req.headers["stripe-signature"];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  let event;
-  try {
-    event = webhookSecret
-      ? stripe.webhooks.constructEvent(req.body, sig, webhookSecret)
-      : JSON.parse(req.body);
-  } catch (e) {
-    return res.status(400).json({ error: "Webhook signature error: " + e.message });
-  }
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    const { planId, orgId, promoCode } = session.metadata || {};
-    const email = session.customer_email;
-    try {
-      // Find org by email or orgId and activate
-      let org = null;
-      if (orgId) {
-        const rows = await sql`SELECT * FROM organisations WHERE id::text = ${orgId} LIMIT 1`;
-        org = rows[0];
-      }
-      if (!org && email) {
-        const rows = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
-        org = rows[0];
-      }
-      if (org) {
-        await sql`UPDATE organisations SET status = 'paid', plan = ${planId || org.plan}, updated_at = NOW() WHERE id = ${org.id}`;
-        // Increment promo usage
-        if (promoCode) {
-          const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
-          if (cfg?.config?._superConfig?.promoCodes) {
-            const codes = cfg.config._superConfig.promoCodes.map(p =>
-              p.code === promoCode.toUpperCase() ? { ...p, used: (p.used || 0) + 1 } : p
-            );
-            const updated = { ...cfg.config, _superConfig: { ...cfg.config._superConfig, promoCodes: codes } };
-            await sql`UPDATE tenant_configs SET config = ${JSON.stringify(updated)} WHERE tenant_id = 'platform'`;
-          }
-        }
-        console.log(`[Stripe] Activated org ${org.id} on plan ${planId}`);
-      }
-    } catch (e) {
-      console.error("[Stripe] Webhook activation error:", e.message);
-    }
-  }
-
-  res.json({ received: true });
-});
+// Webhook handled above (before express.json middleware)
 
 // GET /api/stripe/status?session_id=xxx
 // Frontend polls this after redirect to confirm payment activated
