@@ -200,9 +200,11 @@ app.post("/api/auth/2fa/send", async (req, res) => {
     const apiKey   = cs.apiKey   || process.env.CLICKSEND_API_KEY;
 
     if (username && apiKey) {
+      const fromEmail = cs.fromEmail || cs.emailFrom || cs.username;
+      const fromName  = cs.fromName  || cs.emailName || "Hindle Consultants";
       const body = JSON.stringify({
-        to: [{ email_address_id: 1, name: "Admin", email: email }],
-        from: { email_address_id: 1, name: cs.fromName || "Hindle Consultants" },
+        to: [{ email: email, name: "Admin" }],
+        from: { email: fromEmail, name: fromName },
         subject: "Your Hindle Admin login code",
         body: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">
   <h2 style="margin:0 0 8px">Login verification code</h2>
@@ -220,7 +222,7 @@ app.post("/api/auth/2fa/send", async (req, res) => {
         body,
       });
       const d = await r.json();
-      console.log("[2FA] Email send result:", d?.response_code, "→", email);
+      console.log("[2FA] ClickSend result:", JSON.stringify(d), "→", email);
     } else {
       // No ClickSend — log code for dev (remove in prod)
       console.log(`[2FA] CODE for ${email}: ${code} (ClickSend not configured)`);
