@@ -575,10 +575,11 @@ app.get("/api/admin-settings", async (req, res) => {
     if (!rows.length) return res.json({});
     const cfg = rows[0].config || {};
     res.json({
-      profile:     cfg._adminProfile   || {},
-      platform:    cfg._platformConfig || {},
-      github:      cfg._githubConfig   || {},
-      superConfig: cfg._superConfig    || {},
+      profile:       cfg._adminProfile   || {},
+      platform:      cfg._platformConfig || {},
+      github:        cfg._githubConfig   || {},
+      superConfig:   cfg._superConfig    || {},
+      adminPassword: cfg._adminPassword  || null,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -586,16 +587,17 @@ app.get("/api/admin-settings", async (req, res) => {
 });
 
 app.post("/api/admin-settings", async (req, res) => {
-  const { profile, platform, github, superConfig } = req.body;
+  const { profile, platform, github, superConfig, adminPassword } = req.body;
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     const existing = rows.length ? (rows[0].config || {}) : {};
     const merged = {
       ...existing,
-      ...(profile     ? { _adminProfile:   profile     } : {}),
-      ...(platform    ? { _platformConfig: platform    } : {}),
-      ...(github      ? { _githubConfig:   github      } : {}),
-      ...(superConfig ? { _superConfig:    superConfig } : {}),
+      ...(profile       ? { _adminProfile:   profile     } : {}),
+      ...(platform      ? { _platformConfig: platform    } : {}),
+      ...(github        ? { _githubConfig:   github      } : {}),
+      ...(superConfig   ? { _superConfig:    superConfig } : {}),
+      ...(adminPassword ? { _adminPassword:  adminPassword } : {}),
     };
     await sql`
       INSERT INTO tenant_configs (tenant_id, config)
