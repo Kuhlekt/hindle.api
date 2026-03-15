@@ -2,6 +2,16 @@ const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+// Stripe — STRIPE_SECRET_KEY must be set in Railway env vars
+let stripe = null;
+try {
+  if (process.env.STRIPE_SECRET_KEY) {
+    stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+    console.log("[Stripe] Initialised OK");
+  } else {
+    console.warn("[Stripe] STRIPE_SECRET_KEY not set — payments disabled");
+  }
+} catch (e) { console.warn("[Stripe] Load error:", e.message); }
 const { neon } = require("@neondatabase/serverless");
 
 const sql = neon(process.env.DATABASE_URL);
@@ -66,6 +76,150 @@ app.get("/api/health", async (req, res) => {
 });
 
 // Quick diagnostic — count conversations for an org
+
+// ─────────────────────────────────────────────
+// STRIPE — Checkout Session + Webhook
+// ─────────────────────────────────────────────
+
+// POST /api/stripe/checkout
+// Body: { planId, billing, email, orgId?, promoCode? }
+// Returns: { url } (redirect to Stripe Checkout)
+app.post("/api/stripe/checkout", async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Payments not configured. STRIPE_SECRET_KEY missing." });
+  const { planId, billing, email, orgId, promoCode, successUrl, cancelUrl } = req.body;
+  if (!planId || !email) return res.status(400).json({ error: "planId and email required" });
+
+  try {
+    // Get pricing from admin config
+    const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+    const sc = cfg?.config?._superConfig || {};
+    const planPrices = { starter: sc.plans?.starter?.usd || 49, professional: sc.plans?.professional?.usd || 149 };
+    const monthlyUsd = planPrices[planId] || 49;
+    const isAnnual = billing === "annual";
+    const annualPct = sc.annualDiscountPct || 20;
+    const unitAmount = isAnnual
+      ? Math.round(monthlyUsd * (1 - annualPct / 100) * 12 * 100) // annual total in cents
+      : Math.round(monthlyUsd * 100); // monthly in cents
+
+    // Apply promo code discount if valid
+    let discounts = [];
+    if (promoCode && sc.promoCodes) {
+      const promo = sc.promoCodes.find(p =>
+        p.code === promoCode.toUpperCase() && p.active &&
+        (p.used || 0) < (p.limit || 999) &&
+        new Date(p.expiry) > new Date() &&
+        (p.plans || []).includes(planId)
+      );
+      if (promo) {
+        // Create or retrieve Stripe coupon
+        const couponId = `HINDLE_${promo.code}`;
+        try {
+          await stripe.coupons.retrieve(couponId);
+        } catch (_) {
+          await stripe.coupons.create({ id: couponId, percent_off: promo.pct, duration: "once", name: promo.code });
+        }
+        discounts = [{ coupon: couponId }];
+      }
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: isAnnual ? "payment" : "subscription",
+      payment_method_types: ["card"],
+      customer_email: email,
+      metadata: { planId, billing, orgId: orgId || "", promoCode: promoCode || "" },
+      line_items: [{
+        price_data: {
+          currency: "usd",
+          product_data: { name: `Hindle ${planId.charAt(0).toUpperCase() + planId.slice(1)} — ${isAnnual ? "Annual" : "Monthly"}` },
+          ...(isAnnual
+            ? { unit_amount: unitAmount }
+            : { unit_amount: unitAmount, recurring: { interval: "month" } }
+          ),
+        },
+        quantity: 1,
+      }],
+      discounts,
+      success_url: (successUrl || "https://chatbot.hindleconsultants.com") + "?payment=success&session_id={CHECKOUT_SESSION_ID}&plan=" + planId,
+      cancel_url: cancelUrl || "https://chatbot.hindleconsultants.com?payment=cancelled",
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (e) {
+    console.error("[Stripe] Checkout error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/stripe/webhook
+// Stripe sends events here — activates org on payment success
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured" });
+  const sig = req.headers["stripe-signature"];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
+  try {
+    event = webhookSecret
+      ? stripe.webhooks.constructEvent(req.body, sig, webhookSecret)
+      : JSON.parse(req.body);
+  } catch (e) {
+    return res.status(400).json({ error: "Webhook signature error: " + e.message });
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const { planId, orgId, promoCode } = session.metadata || {};
+    const email = session.customer_email;
+    try {
+      // Find org by email or orgId and activate
+      let org = null;
+      if (orgId) {
+        const rows = await sql`SELECT * FROM organisations WHERE id::text = ${orgId} LIMIT 1`;
+        org = rows[0];
+      }
+      if (!org && email) {
+        const rows = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
+        org = rows[0];
+      }
+      if (org) {
+        await sql`UPDATE organisations SET status = 'paid', plan = ${planId || org.plan}, updated_at = NOW() WHERE id = ${org.id}`;
+        // Increment promo usage
+        if (promoCode) {
+          const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+          if (cfg?.config?._superConfig?.promoCodes) {
+            const codes = cfg.config._superConfig.promoCodes.map(p =>
+              p.code === promoCode.toUpperCase() ? { ...p, used: (p.used || 0) + 1 } : p
+            );
+            const updated = { ...cfg.config, _superConfig: { ...cfg.config._superConfig, promoCodes: codes } };
+            await sql`UPDATE tenant_configs SET config = ${JSON.stringify(updated)} WHERE tenant_id = 'platform'`;
+          }
+        }
+        console.log(`[Stripe] Activated org ${org.id} on plan ${planId}`);
+      }
+    } catch (e) {
+      console.error("[Stripe] Webhook activation error:", e.message);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// GET /api/stripe/status?session_id=xxx
+// Frontend polls this after redirect to confirm payment activated
+app.get("/api/stripe/status", async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured" });
+  const { session_id } = req.query;
+  if (!session_id) return res.status(400).json({ error: "session_id required" });
+  try {
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    res.json({
+      status: session.payment_status,
+      paid: session.payment_status === "paid",
+      planId: session.metadata?.planId,
+      email: session.customer_email,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/api/diag/convos", async (req, res) => {
   const { org_id } = req.query;
   if (!org_id) return res.status(400).json({ error: "org_id required" });
@@ -84,6 +238,59 @@ app.get("/api/diag/convos", async (req, res) => {
 // POST /api/typing  { conversationId, role, typing }
 // GET  /api/typing/:conversationId
 // ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+// OFFLINE MESSAGE CAPTURE
+// POST /api/offline-message
+// Visitor leaves message when no agents available
+// ─────────────────────────────────────────────
+app.post("/api/offline-message", async (req, res) => {
+  const { tenantId, name, email, message, page } = req.body;
+  if (!tenantId || !message) return res.status(400).json({ error: "tenantId and message required" });
+  try {
+    // Resolve org
+    const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${tenantId} OR tenant_id = ${tenantId} LIMIT 1`;
+    if (!org) return res.status(404).json({ error: "Tenant not found" });
+    const orgId = org.id;
+
+    // Store as a conversation with status 'offline_msg'
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS offline_message BOOLEAN DEFAULT FALSE`.catch(()=>{});
+    const [conv] = await sql`
+      INSERT INTO conversations (org_id, visitor_name, visitor_email, page, subject, status)
+      VALUES (${orgId}, ${name || "Website Visitor"}, ${email || null}, ${page || "/"}, ${"Offline message"}, ${"open"})
+      RETURNING *
+    `;
+    await sql`
+      INSERT INTO messages (conversation_id, type, sender, content)
+      VALUES (${conv.id}, ${"visitor"}, ${name || "Visitor"}, ${message})
+    `;
+    await sql`UPDATE conversations SET offline_message = TRUE WHERE id = ${conv.id}`.catch(()=>{});
+
+    // Send email notification if ClickSend configured
+    try {
+      const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`;
+      const cs = cfg?.config?.clicksend || {};
+      if (cs.username && cs.apiKey && (cs.notifEmail || org.email)) {
+        const toEmail = cs.notifEmail || org.email;
+        const emailBody = `New offline message from ${name || "visitor"} (${email || "no email"}):
+
+"${message}"
+
+Page: ${page || "/"}
+
+Reply at: https://chatbot.hindleconsultants.com`;
+        await fetch("https://rest.clicksend.com/v3/email/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
+          body: JSON.stringify({ to: [{ email: toEmail, name: org.name || "Admin" }], from: { email_address_id: 1, name: cs.fromName || "Hindle" }, subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>` }),
+        }).catch(()=>{});
+      }
+    } catch (_) {}
+
+    res.json({ ok: true, conversationId: conv.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post("/api/typing", (req, res) => {
   const { conversationId, role, typing } = req.body;
   if (!conversationId || !role) return res.status(400).json({ error: "conversationId and role required" });
@@ -259,13 +466,23 @@ app.post("/api/chat", async (req, res) => {
 
   // ── Normal AI response ──────────────────────────────────────
   try {
+    // Build confidence-aware system prompt
+    const { confidenceThreshold = 0.6, sessionHistory } = req.body;
+    const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
+      "\n\nIMPORTANT: After your answer, on a new line write exactly: CONFIDENCE:[0.0-1.0] where the number reflects how confident you are in your answer (1.0 = certain, 0.5 = unsure, 0.0 = no idea). If confidence is below 0.6, end with: SUGGEST_HUMAN:true";
+
+    // Include session history for conversation memory (last 6 turns from prior sessions)
+    const fullMessages = sessionHistory && Array.isArray(sessionHistory)
+      ? [...sessionHistory.slice(-6), ...messages]
+      : messages;
+
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514", max_tokens: 600,
-        system: system || "You are a helpful support assistant. Answer concisely and helpfully.",
-        messages: messages.map(m => ({ role: m.role === "visitor" || m.role === "user" ? "user" : "assistant", content: m.content || m.text || "" })),
+        model: "claude-sonnet-4-20250514", max_tokens: 700,
+        system: confSystem,
+        messages: fullMessages.map(m => ({ role: m.role === "visitor" || m.role === "user" ? "user" : "assistant", content: m.content || m.text || "" })),
       }),
     });
     if (!response.ok) {
@@ -273,14 +490,27 @@ app.post("/api/chat", async (req, res) => {
       return res.status(502).json({ error: "Anthropic API error", detail: err });
     }
     const data = await response.json();
-    const reply = data.content?.[0]?.text || "";
+    let rawReply = data.content?.[0]?.text || "";
+
+    // Parse confidence score and suggestion flag
+    const confMatch = rawReply.match(/CONFIDENCE:\s*([\d.]+)/);
+    const confidence = confMatch ? parseFloat(confMatch[1]) : 1.0;
+    const suggestHuman = rawReply.includes("SUGGEST_HUMAN:true") || confidence < confidenceThreshold;
+
+    // Strip the confidence annotation from the reply
+    const reply = rawReply
+      .replace(/\nCONFIDENCE:[\d.]+/g, "")
+      .replace(/\nSUGGEST_HUMAN:(true|false)/g, "")
+      .trim();
+
     if (conversationId) {
       try {
         await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${conversationId}, 'bot', 'AI', ${reply})`;
         await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${conversationId}`;
       } catch (_) {}
     }
-    res.json({ reply });
+
+    res.json({ reply, confidence, suggest_human: suggestHuman });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
