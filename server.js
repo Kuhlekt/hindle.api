@@ -419,6 +419,53 @@ app.post("/api/conversations/:id/email-reply", async (req, res) => {
 });
 
 
+// ─────────────────────────────────────────────
+// KB — URL Import: fetch page text server-side
+// POST /api/kb/import-url  { org_id, url }
+// ─────────────────────────────────────────────
+app.post("/api/kb/import-url", async (req, res) => {
+  const { org_id, url } = req.body;
+  if (!org_id || !url) return res.status(400).json({ error: "org_id and url required" });
+  if (!url.startsWith("http://") && !url.startsWith("https://"))
+    return res.status(400).json({ error: "URL must start with http:// or https://" });
+  try {
+    const limitErr = await checkKbLimit(org_id);
+    if (limitErr) return res.status(403).json(limitErr);
+
+    // Fetch the page
+    const pageRes = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; HindleBot/1.0)" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!pageRes.ok) return res.status(502).json({ error: `Page returned ${pageRes.status}` });
+    const html = await pageRes.text();
+
+    // Strip HTML tags, collapse whitespace
+    const text = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/\s{2,}/g, " ")
+      .trim()
+      .slice(0, 50000); // cap at 50k chars
+
+    const slug = url.split("/").filter(Boolean).pop() || "page";
+    const name = slug.slice(0, 80) + " (imported)";
+
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+    const rows = await sql`
+      INSERT INTO kb_documents (org_id, name, content, size_kb, chunks, status)
+      VALUES (${org_id}, ${name}, ${text}, ${Math.round(text.length/1024)}, ${Math.ceil(text.length/500)}, 'indexed')
+      RETURNING *
+    `;
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 // Quick diagnostic — count conversations for an org
 
 // ─────────────────────────────────────────────
@@ -763,7 +810,33 @@ app.post("/api/chat", async (req, res) => {
   try {
     // Build confidence-aware system prompt
     const { confidenceThreshold = 0.6, sessionHistory } = req.body;
+
+    // ── Fetch KB documents from database and inject into system prompt ──
+    let kbContext = "";
+    if (tenantId) {
+      try {
+        // Resolve org UUID from tenantId
+        const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenantId} OR tenant_id = ${tenantId} LIMIT 1`;
+        const orgId = orgs.length ? orgs[0].id : tenantId;
+        // Load KB docs that have content (manual/text entries)
+        const kbDocs = await sql`
+          SELECT name, content FROM kb_documents
+          WHERE org_id = ${orgId}
+            AND status = 'indexed'
+            AND content IS NOT NULL
+            AND content != ''
+          ORDER BY created_at DESC
+          LIMIT 40
+        `;
+        if (kbDocs.length > 0) {
+          kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following information to answer questions. Only use information from this knowledge base when it is relevant. If the answer is not in the knowledge base, say so honestly.\n\n" +
+            kbDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
+        }
+      } catch (_) {}
+    }
+
     const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
+      kbContext +
       (additionalInstructions ? "\n\nAdditional instructions:\n" + additionalInstructions : "") +
       "\n\nIMPORTANT: After your answer, on a new line write exactly: CONFIDENCE:[0.0-1.0] where the number reflects how confident you are in your answer (1.0 = certain, 0.5 = unsure, 0.0 = no idea). If confidence is below 0.6, end with: SUGGEST_HUMAN:true";
 
@@ -1467,9 +1540,10 @@ app.post("/api/kb", async (req, res) => {
     if (limitErr) return res.status(403).json(limitErr);
   }
   try {
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
     const rows = await sql`
-      INSERT INTO kb_documents (org_id, name, category, sub_category, size_kb, chunks)
-      VALUES (${org_id}, ${name}, ${category}, ${sub_category}, ${size_kb}, ${chunks || 0})
+      INSERT INTO kb_documents (org_id, name, category, sub_category, size_kb, chunks, content)
+      VALUES (${org_id}, ${name}, ${category}, ${sub_category}, ${size_kb}, ${chunks || 0}, ${req.body.content || null})
       RETURNING *
     `;
     res.status(201).json(rows[0]);
@@ -1479,13 +1553,13 @@ app.post("/api/kb", async (req, res) => {
 });
 
 app.patch("/api/kb/:id", async (req, res) => {
-  const { name, category, sub_category, chunks, status, org_id } = req.body;
+  const { name, category, sub_category, chunks, status, org_id, content } = req.body;
   try {
-    // Verify ownership if org_id provided
     if (org_id) {
       const check = await sql`SELECT id FROM kb_documents WHERE id = ${req.params.id} AND org_id = ${org_id} LIMIT 1`;
       if (!check.length) return res.status(403).json({ error: "Not authorised" });
     }
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
     const rows = await sql`
       UPDATE kb_documents SET
         name         = COALESCE(${name},         name),
@@ -1493,6 +1567,7 @@ app.patch("/api/kb/:id", async (req, res) => {
         sub_category = COALESCE(${sub_category}, sub_category),
         chunks       = COALESCE(${chunks},       chunks),
         status       = COALESCE(${status},       status),
+        content      = COALESCE(${content},      content),
         updated_at   = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
