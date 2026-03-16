@@ -760,18 +760,21 @@ app.post("/api/chat", async (req, res) => {
     try {
       const [conv] = await sql`SELECT status, updated_at FROM conversations WHERE id = ${conversationId}`;
       if (conv && (conv.status === "handoff" || conv.status === "claimed")) {
-        // Check last message time from DB — if >60s with no agent reply, let bot back in
-        const [lastDbMsg] = await sql`
-          SELECT created_at FROM messages WHERE conversation_id = ${conversationId}
+        // Check last AGENT message time — if no agent reply within silenceSecs, let bot back in
+        const [lastAgentMsg] = await sql`
+          SELECT created_at FROM messages
+          WHERE conversation_id = ${conversationId} AND type IN ('agent','note')
           ORDER BY created_at DESC LIMIT 1
         `.catch(() => [null]);
-        const lastMsgAge = lastDbMsg
-          ? (Date.now() - new Date(lastDbMsg.created_at).getTime()) / 1000
-          : 9999;
-        // Check last message time from DB — silence period comes from tenant config
+
         const silenceSecs = (handoffInactivityTimeout && handoffInactivityTimeout > 0) ? handoffInactivityTimeout : 120;
-        // If no activity for less than the silence period, keep AI quiet
-        if (lastMsgAge <= silenceSecs) {
+
+        // If agent has responded recently, stay silent
+        const agentMsgAge = lastAgentMsg
+          ? (Date.now() - new Date(lastAgentMsg.created_at).getTime()) / 1000
+          : silenceSecs + 1; // no agent message ever → let bot respond
+
+        if (agentMsgAge <= silenceSecs) {
           const lastMsg = [...messages].reverse().find(m => m.role === "visitor" || m.role === "user");
           const text = (lastMsg?.content || lastMsg?.text || "").trim().toLowerCase();
           const defaults = ["/status", "/cancel", "/restart", "/help", "/agent"];
@@ -953,7 +956,57 @@ app.get("/api/admin-settings", async (req, res) => {
 });
 
 app.post("/api/admin-settings", async (req, res) => {
-  const { profile, platform, github, superConfig, adminPassword, adminAccounts, adminPasswordFor } = req.body;
+  const { profile, platform, github, superConfig, adminPassword, adminAccounts, adminPasswordFor, testSMS, testEmail } = req.body;
+
+  // ── Test SMS ──────────────────────────────────────────────────
+  if (testSMS) {
+    try {
+      const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+      const cfg = rows.length ? rows[0].config : {};
+      const cs = cfg.clicksend || {};
+      const username = cs.username || process.env.CLICKSEND_USERNAME;
+      const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
+      const sender = cs.smsSender || "HINDLE";
+      if (!username || !apiKey) return res.json({ ok: false, smsError: "ClickSend credentials not set" });
+      const body = `[TEST] Hindle SMS test from ${sender}. If you received this, SMS delivery is working correctly.`;
+      const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
+        body: JSON.stringify({ messages: [{ source: "sdk", to: testSMS, body, from: sender }] }),
+      });
+      const d = await r.json();
+      const ok = d?.data?.messages?.[0]?.status === "SUCCESS" || r.ok;
+      return res.json({ ok, smsSent: ok, smsError: ok ? null : (d?.data?.messages?.[0]?.status || "Send failed") });
+    } catch (e) { return res.json({ ok: false, smsError: e.message }); }
+  }
+
+  // ── Test Email ─────────────────────────────────────────────────
+  if (testEmail) {
+    try {
+      const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+      const cfg = rows.length ? rows[0].config : {};
+      const cs = cfg.clicksend || {};
+      const username = cs.username || process.env.CLICKSEND_USERNAME;
+      const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
+      const fromEmail = cs.emailFrom || username;
+      const fromName = cs.emailName || "Hindle Platform";
+      if (!username || !apiKey) return res.json({ ok: false, emailError: "ClickSend credentials not set" });
+      const r = await fetch("https://rest.clicksend.com/v3/email/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
+        body: JSON.stringify({
+          to: [{ email: testEmail, name: "Test Recipient" }],
+          from: { email: fromEmail, name: fromName },
+          subject: "Hindle — Test Email Delivery",
+          body: `<p>This is a test email from Hindle Platform.<br><br>If you received this, your ClickSend email integration is working correctly.<br><br>From: ${fromName} &lt;${fromEmail}&gt;</p>`
+        }),
+      });
+      const d = await r.json();
+      const ok = r.ok && d?.response_code !== "FAILED";
+      return res.json({ ok, emailSent: ok, emailError: ok ? null : (d?.response_code || "Send failed") });
+    } catch (e) { return res.json({ ok: false, emailError: e.message }); }
+  }
+
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     const existing = rows.length ? (rows[0].config || {}) : {};
