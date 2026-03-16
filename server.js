@@ -157,7 +157,8 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
   res.json({ received: true });
 });
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // ─────────────────────────────────────────────
 // IN-MEMORY RATE LIMITER  (per tenant, per minute)
@@ -593,6 +594,16 @@ app.post("/api/kb/upload-file", async (req, res) => {
 // POST /api/kb/parse-json  { org_id, json_text }
 // Returns: { keys, sample, items_count, suggested_mapping }
 // ─────────────────────────────────────────────
+// Temporary in-memory cache for parsed JSON items (cleared after 30 min)
+const _parseCache = new Map();
+const _parseCacheExpiry = new Map();
+setInterval(()=>{
+  const now = Date.now();
+  for(const [id, exp] of _parseCacheExpiry){
+    if(now > exp){ _parseCache.delete(id); _parseCacheExpiry.delete(id); }
+  }
+}, 5 * 60 * 1000);
+
 app.post("/api/kb/parse-json", async (req, res) => {
   const { json_text, org_id } = req.body;
   if (!json_text) return res.status(400).json({ error: "json_text required" });
@@ -600,47 +611,48 @@ app.post("/api/kb/parse-json", async (req, res) => {
     const raw = JSON.parse(json_text);
     let items = [];
 
-    // Detect shape
     if (Array.isArray(raw)) {
-      // [{...}, {...}] — most common
       items = raw;
     } else if (typeof raw === "object") {
-      // {"Category": [{...}]} — nested by category
       const keys = Object.keys(raw);
       const firstVal = raw[keys[0]];
       if (Array.isArray(firstVal)) {
-        // Flatten, inject category from key
         keys.forEach(cat => {
           const arr = Array.isArray(raw[cat]) ? raw[cat] : [];
           arr.forEach(item => items.push({ ...item, _detected_category: cat }));
         });
       } else if (typeof firstVal === "string") {
-        // {"Q: ...": "A: ..."} flat key-value
         items = Object.entries(raw).map(([k, v]) => ({ title: k, content: v }));
       } else {
-        items = [raw]; // single object
+        items = [raw];
       }
     }
 
     if (!items.length) return res.status(400).json({ error: "No items found in JSON" });
 
-    // Get all unique keys across first 10 items
     const keySet = new Set();
-    items.slice(0, 10).forEach(item => Object.keys(item).forEach(k => keySet.add(k)));
+    items.slice(0, 20).forEach(item => Object.keys(item).forEach(k => keySet.add(k)));
     const keys = [...keySet];
 
-    // Auto-suggest field mapping
     const suggest = (candidates) => keys.find(k => candidates.some(c => k.toLowerCase().includes(c))) || "";
     const suggested = {
-      title: suggest(["title","name","question","q","heading","subject","topic"]),
-      content: suggest(["content","answer","a","body","description","text","detail","response"]),
-      category: suggest(["category","cat","group","section","type","module","_detected_category"]),
+      title:        suggest(["title","name","question","q","heading","subject","topic"]),
+      content:      suggest(["content","answer","a","body","description","text","detail","response"]),
+      category:     suggest(["category","cat","group","section","type","module","_detected_category"]),
       sub_category: suggest(["sub","subcategory","sub_category","subtopic","tag"]),
-      tertiary: suggest(["tertiary","third","level3","tier"]),
+      tertiary:     suggest(["tertiary","third","level3","tier"]),
     };
 
+    // Store in cache so import-mapped can retrieve without re-sending all items
+    const parseId = `p_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    _parseCache.set(parseId, items);
+    _parseCacheExpiry.set(parseId, Date.now() + 30 * 60 * 1000);
+
+    // Return sample + keys + parseId (not full items, to keep response small)
     const sample = items.slice(0, 3);
-    res.json({ keys, sample, items_count: items.length, suggested, items });
+    res.json({ keys, sample, items_count: items.length, suggested, parseId,
+      // Include full items only if small (<= 100 items, < 500kb)
+      items: items.length <= 100 ? items : [] });
   } catch (e) {
     res.status(400).json({ error: "Invalid JSON: " + e.message });
   }
@@ -650,7 +662,13 @@ app.post("/api/kb/parse-json", async (req, res) => {
 // Body: { org_id, items[], mapping: {title, content, category, sub_category, tertiary} }
 // Saves each mapped item as a kb_document row
 app.post("/api/kb/import-mapped", async (req, res) => {
-  const { org_id, items, mapping } = req.body;
+  let { org_id, items, mapping, parseId } = req.body;
+  // If items not sent (large file), retrieve from cache
+  if ((!items || !items.length) && parseId && _parseCache.has(parseId)) {
+    items = _parseCache.get(parseId);
+    _parseCache.delete(parseId);
+    _parseCacheExpiry.delete(parseId);
+  }
   if (!org_id || !items?.length || !mapping?.title || !mapping?.content) {
     return res.status(400).json({ error: "org_id, items, mapping.title and mapping.content required" });
   }
