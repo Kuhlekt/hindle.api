@@ -232,7 +232,7 @@ app.post("/api/auth/2fa/send", async (req, res) => {
   // Send via ClickSend email
   try {
     const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(() => [null]);
-    const cs = cfg?.config?.clicksend || cfg?.config?._platformConfig?.clicksend || {};
+    const cs = cfg?.config?._superConfig?.clicksend || cfg?.config?.clicksend || cfg?.config?._platformConfig?.clicksend || {};
     const username = cs.username || process.env.CLICKSEND_USERNAME;
     const apiKey   = cs.apiKey   || process.env.CLICKSEND_API_KEY;
 
@@ -1206,7 +1206,8 @@ app.post("/api/admin-settings", async (req, res) => {
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
       const cfg = rows.length ? rows[0].config : {};
-      const cs = cfg.clicksend || {};
+      const cs = cfg._superConfig?.clicksend || cfg.clicksend || {};
+      dbg.push(`config_source: ${cfg._superConfig?.clicksend ? "_superConfig.clicksend" : cfg.clicksend ? "clicksend" : "none"}`);
       const username = cs.username || process.env.CLICKSEND_USERNAME;
       const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
       const sender = cs.smsSender || "HINDLE";
@@ -1235,7 +1236,8 @@ app.post("/api/admin-settings", async (req, res) => {
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
       const cfg = rows.length ? rows[0].config : {};
-      const cs = cfg.clicksend || {};
+      const cs = cfg._superConfig?.clicksend || cfg.clicksend || {};
+      dbg.push(`config_source: ${cfg._superConfig?.clicksend ? "_superConfig.clicksend" : cfg.clicksend ? "clicksend" : "none"}`);
       const username = cs.username || process.env.CLICKSEND_USERNAME;
       const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
       const fromName = cs.emailName || "Hindle Platform";
