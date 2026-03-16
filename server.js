@@ -258,6 +258,167 @@ app.post("/api/auth/2fa/verify", (req, res) => {
 });
 
 
+// ─────────────────────────────────────────────
+// AI AGENT TOOLS
+// ─────────────────────────────────────────────
+
+// POST /api/ai/suggest-replies
+// Body: { conversationId, messages[] }
+// Returns: { suggestions: string[] }
+app.post("/api/ai/suggest-replies", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: "AI not configured" });
+  const { messages = [], orgId } = req.body;
+  try {
+    const recent = messages.slice(-6).map(m =>
+      `${m.type === "visitor" ? "Visitor" : m.type === "agent" ? "Agent" : "AI"}: ${m.content}`
+    ).join("\n");
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514", max_tokens: 400,
+        system: "You are helping a customer support agent. Generate exactly 3 short, helpful reply suggestions for the agent to send next. Format as a JSON array of strings only, no other text. Each suggestion should be 1-2 sentences, professional, and directly relevant to the conversation.",
+        messages: [{ role: "user", content: `Conversation so far:\n${recent}\n\nGenerate 3 reply suggestions as a JSON array.` }],
+      }),
+    });
+    const data = await response.json();
+    const text = data.content?.[0]?.text || "[]";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const suggestions = JSON.parse(clean);
+    res.json({ suggestions: Array.isArray(suggestions) ? suggestions : [] });
+  } catch (e) {
+    res.json({ suggestions: [] });
+  }
+});
+
+// POST /api/ai/summarise
+// Body: { conversationId }
+// Returns: { summary: string }
+app.post("/api/ai/summarise", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: "AI not configured" });
+  const { conversationId } = req.body;
+  if (!conversationId) return res.status(400).json({ error: "conversationId required" });
+  try {
+    const msgs = await sql`SELECT type, sender, content FROM messages WHERE conversation_id = ${conversationId} ORDER BY created_at ASC LIMIT 50`;
+    const transcript = msgs.map(m => `${m.sender} (${m.type}): ${m.content}`).join("\n");
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514", max_tokens: 300,
+        system: "Summarise this customer support conversation in 2-4 bullet points. Cover: main issue, what was tried, outcome/status, any follow-up needed. Be concise and factual.",
+        messages: [{ role: "user", content: transcript || "No messages yet." }],
+      }),
+    });
+    const data = await response.json();
+    res.json({ summary: data.content?.[0]?.text || "No summary available." });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/ai/sentiment
+// Body: { text: string }
+// Returns: { sentiment: "positive"|"neutral"|"negative"|"frustrated", score: number }
+app.post("/api/ai/sentiment", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(503).json({ sentiment: "neutral", score: 0.5 });
+  const { text } = req.body;
+  if (!text) return res.json({ sentiment: "neutral", score: 0.5 });
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514", max_tokens: 60,
+        system: 'Analyse the sentiment of the customer message. Respond only with JSON: {"sentiment":"positive|neutral|negative|frustrated","score":0.0-1.0}',
+        messages: [{ role: "user", content: text.slice(0, 500) }],
+      }),
+    });
+    const data = await response.json();
+    const raw = data.content?.[0]?.text || "{}";
+    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    res.json({ sentiment: parsed.sentiment || "neutral", score: parsed.score ?? 0.5 });
+  } catch (e) {
+    res.json({ sentiment: "neutral", score: 0.5 });
+  }
+});
+
+
+// GET /api/analytics/:orgId/export?days=30&format=csv
+app.get("/api/analytics/:orgId/export", async (req, res) => {
+  const { orgId } = req.params;
+  const days = parseInt(req.query.days) || 30;
+  try {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+    const convos = await sql`
+      SELECT c.id, c.visitor_name, c.visitor_email, c.visitor_phone, c.visitor_company,
+             c.visitor_location, c.page, c.subject, c.status, c.priority,
+             c.claimed_by_name, c.csat_rating, c.first_response_at,
+             c.created_at, c.updated_at
+      FROM conversations c
+      WHERE c.org_id = ${orgId} AND c.created_at >= ${since}
+      ORDER BY c.created_at DESC
+      LIMIT 5000
+    `;
+    const headers = ["ID","Visitor","Email","Phone","Company","Location","Page","Subject","Status","Priority","Agent","CSAT","First Response","Created","Updated"];
+    const rows = convos.map(c => [
+      c.id, c.visitor_name||"", c.visitor_email||"", c.visitor_phone||"",
+      c.visitor_company||"", c.visitor_location||"", c.page||"",
+      c.subject||"", c.status||"", c.priority||"", c.claimed_by_name||"",
+      c.csat_rating!=null?c.csat_rating:"", c.first_response_at||"",
+      c.created_at||"", c.updated_at||""
+    ].map(v => `"${String(v).replace(/"/g,'""')}"`));
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="hindle-export-${days}d.csv"`);
+    res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/conversations/:id/snooze
+// Body: { until: ISO datetime }
+app.post("/api/conversations/:id/snooze", async (req, res) => {
+  const { until } = req.body;
+  try {
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS snoozed_until TIMESTAMPTZ`.catch(()=>{});
+    await sql`UPDATE conversations SET snoozed_until = ${until||null}, status = 'parked', updated_at = NOW() WHERE id = ${req.params.id}`;
+    res.json({ ok: true, snoozed_until: until });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/conversations/:id/email-reply
+// Body: { to, subject, body, agentName }
+app.post("/api/conversations/:id/email-reply", async (req, res) => {
+  const { to, subject, body, agentName } = req.body;
+  if (!to || !body) return res.status(400).json({ error: "to and body required" });
+  try {
+    // Get org ClickSend config
+    const [conv] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`;
+    if (!conv) return res.status(404).json({ error: "Conversation not found" });
+    const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${conv.org_id} LIMIT 1`.catch(()=>[null]);
+    const [platCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+    const cs = cfg?.config?.clicksend || platCfg?.config?.clicksend || {};
+    const username = cs.username || process.env.CLICKSEND_USERNAME;
+    const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
+    const fromEmail = cs.emailFrom || cs.emailFrom || cs.username;
+    const fromName = cs.emailName || agentName || "Support Team";
+    if (!username || !apiKey) return res.status(503).json({ error: "Email not configured" });
+    const r = await fetch("https://rest.clicksend.com/v3/email/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
+      body: JSON.stringify({ to: [{ email: to, name: "Customer" }], from: { email: fromEmail, name: fromName }, subject: subject || "Re: Your support request", body }),
+    });
+    const d = await r.json();
+    // Save as agent message
+    await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${req.params.id}, 'agent', ${agentName||'Agent'}, ${"[Email sent to " + to + "]: " + body.replace(/<[^>]+>/g,"").slice(0,200)})`;
+    res.json({ ok: true, result: d?.response_code });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 // Quick diagnostic — count conversations for an org
 
 // ─────────────────────────────────────────────
