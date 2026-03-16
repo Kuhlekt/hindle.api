@@ -258,8 +258,14 @@ app.post("/api/auth/2fa/send", async (req, res) => {
         },
         body,
       });
-      const d = await r.json();
-      console.log("[2FA] ClickSend result:", JSON.stringify(d), "→", email);
+      const rawText = await r.text();
+      let d = {};
+      try { d = JSON.parse(rawText); } catch(_) {}
+      console.log("[2FA] ClickSend HTTP:", r.status, "| response_code:", d?.response_code, "| response_msg:", d?.response_msg);
+      console.log("[2FA] Full response:", rawText.slice(0, 500));
+      if (!r.ok || d?.response_code === "FAILED") {
+        console.error("[2FA] Email delivery failed — check email_address_id and verified sender in ClickSend");
+      }
     } else {
       // No ClickSend — log code for dev (remove in prod)
       console.log(`[2FA] CODE for ${email}: ${code} (ClickSend not configured)`);
@@ -1239,11 +1245,12 @@ app.post("/api/admin-settings", async (req, res) => {
       dbg.push(`from_name: ${fromName} | to: ${testEmail}`);
       if (!username || !apiKey) { console.log("[TEST EMAIL] FAIL - missing creds"); return res.json({ ok: false, emailError: "ClickSend credentials not set", debug: dbg }); }
       if (!fromId) { console.log("[TEST EMAIL] FAIL - email_address_id is 0"); return res.json({ ok: false, emailError: "Email Address ID not set — add it in Integrations → SMS & Email Credentials", debug: dbg }); }
+      const htmlBody = `<p>Test email from Hindle.<br>email_address_id: ${fromId}<br>from_name: ${fromName}<br>Sent: ${new Date().toISOString()}</p>`;
       const payload = {
         to: [{ email: testEmail, name: "Test Recipient", list_id: 0 }],
         from: { email_address_id: fromId, name: fromName },
         subject: "Hindle — Test Email Delivery",
-        body: `<p>Test email from Hindle.<br>email_address_id: ${fromId}<br>from_name: ${fromName}</p>`
+        body: htmlBody,
       };
       dbg.push(`payload: ${JSON.stringify(payload)}`);
       console.log("[TEST EMAIL] Sending:", JSON.stringify(payload));
@@ -1252,11 +1259,14 @@ app.post("/api/admin-settings", async (req, res) => {
         headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
         body: JSON.stringify(payload),
       });
-      const d = await r.json();
-      const ok = r.ok && d?.response_code !== "FAILED";
-      dbg.push(`http: ${r.status} | response_code: ${d?.response_code} | response: ${JSON.stringify(d).slice(0,400)}`);
-      console.log("[TEST EMAIL] Response:", JSON.stringify(d));
-      return res.json({ ok, emailSent: ok, emailError: ok ? null : (d?.response_code || d?.response_msg || "Send failed"), debug: dbg });
+      const rawText = await r.text();
+      let d = {};
+      try { d = JSON.parse(rawText); } catch(_) { d = { raw: rawText }; }
+      const ok = r.ok && (d?.response_code === "SUCCESS" || (r.status >= 200 && r.status < 300 && d?.response_code !== "FAILED"));
+      dbg.push(`http: ${r.status} | response_code: ${d?.response_code} | response_msg: ${d?.response_msg} | raw: ${rawText.slice(0,600)}`);
+      console.log("[TEST EMAIL] HTTP Status:", r.status);
+      console.log("[TEST EMAIL] Raw Response:", rawText.slice(0, 1000));
+      return res.json({ ok, emailSent: ok, emailError: ok ? null : (d?.response_code || d?.response_msg || `HTTP ${r.status}` || "Send failed"), debug: dbg });
     } catch (e) { console.error("[TEST EMAIL] Exception:", e.message); return res.json({ ok: false, emailError: e.message, debug: dbg }); }
   }
   try {
