@@ -56,7 +56,23 @@ process.on("unhandledRejection", (reason) => {
 });
 process.on("uncaughtException", (err) => {
   console.error("[Server] Uncaught exception:", err.message);
-});
+})
+
+// ── ClickSend email helper ──────────────────────────────────────────────────
+// ClickSend v3 email API requires:
+//   from: { email_address_id: <numeric>, name: string }
+//   to:   [{ email, name, list_id: 0 }]   (list_id:0 = non-list send)
+function buildCsEmail({ to, toName, subject, body, fromId, fromName, listId }) {
+  return {
+    to:      [{ email: to, name: toName || "Customer", list_id: listId || 0 }],
+    from:    { email_address_id: parseInt(fromId, 10) || 1, name: fromName || "Hindle" },
+    subject: subject || "(no subject)",
+    body:    body    || "",
+  };
+}
+// ──────────────────────────────────────────────────────────────────────────────
+
+;
 
 // Check optional packages for KB file extraction
 // Add to package.json: "busboy", "pdf-parse", "mammoth"
@@ -223,8 +239,8 @@ app.post("/api/auth/2fa/send", async (req, res) => {
       const fromEmail = cs.fromEmail || cs.emailFrom || cs.username;
       const fromName  = cs.fromName  || cs.emailName || "Hindle Consultants";
       const body = JSON.stringify({
-        to: [{ email: email, name: "Admin" }],
-        from: { email: fromEmail, name: fromName },
+        to: [{ email: email, name: "Admin", list_id: 0 }],
+        from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: fromName },
         subject: "Your Hindle Admin login code",
         body: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">
   <h2 style="margin:0 0 8px">Login verification code</h2>
@@ -429,7 +445,7 @@ app.post("/api/conversations/:id/email-reply", async (req, res) => {
     const r = await fetch("https://rest.clicksend.com/v3/email/send", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
-      body: JSON.stringify({ to: [{ email: to, name: "Customer" }], from: { email: fromEmail, name: fromName }, subject: subject || "Re: Your support request", body }),
+      body: JSON.stringify(buildCsEmail({ to, toName:"Customer", subject:subject||"Re: Your support request", body, fromId:cs.emailAddressId||cs.email_address_id||1, fromName, listId:0 })),
     });
     const d = await r.json();
     // Save as agent message
@@ -571,6 +587,103 @@ app.post("/api/kb/upload-file", async (req, res) => {
   req.pipe(bb);
 });
 
+
+// ─────────────────────────────────────────────
+// KB — JSON import: parse and return preview for mapper
+// POST /api/kb/parse-json  { org_id, json_text }
+// Returns: { keys, sample, items_count, suggested_mapping }
+// ─────────────────────────────────────────────
+app.post("/api/kb/parse-json", async (req, res) => {
+  const { json_text, org_id } = req.body;
+  if (!json_text) return res.status(400).json({ error: "json_text required" });
+  try {
+    const raw = JSON.parse(json_text);
+    let items = [];
+
+    // Detect shape
+    if (Array.isArray(raw)) {
+      // [{...}, {...}] — most common
+      items = raw;
+    } else if (typeof raw === "object") {
+      // {"Category": [{...}]} — nested by category
+      const keys = Object.keys(raw);
+      const firstVal = raw[keys[0]];
+      if (Array.isArray(firstVal)) {
+        // Flatten, inject category from key
+        keys.forEach(cat => {
+          const arr = Array.isArray(raw[cat]) ? raw[cat] : [];
+          arr.forEach(item => items.push({ ...item, _detected_category: cat }));
+        });
+      } else if (typeof firstVal === "string") {
+        // {"Q: ...": "A: ..."} flat key-value
+        items = Object.entries(raw).map(([k, v]) => ({ title: k, content: v }));
+      } else {
+        items = [raw]; // single object
+      }
+    }
+
+    if (!items.length) return res.status(400).json({ error: "No items found in JSON" });
+
+    // Get all unique keys across first 10 items
+    const keySet = new Set();
+    items.slice(0, 10).forEach(item => Object.keys(item).forEach(k => keySet.add(k)));
+    const keys = [...keySet];
+
+    // Auto-suggest field mapping
+    const suggest = (candidates) => keys.find(k => candidates.some(c => k.toLowerCase().includes(c))) || "";
+    const suggested = {
+      title: suggest(["title","name","question","q","heading","subject","topic"]),
+      content: suggest(["content","answer","a","body","description","text","detail","response"]),
+      category: suggest(["category","cat","group","section","type","module","_detected_category"]),
+      sub_category: suggest(["sub","subcategory","sub_category","subtopic","tag"]),
+      tertiary: suggest(["tertiary","third","level3","tier"]),
+    };
+
+    const sample = items.slice(0, 3);
+    res.json({ keys, sample, items_count: items.length, suggested, items });
+  } catch (e) {
+    res.status(400).json({ error: "Invalid JSON: " + e.message });
+  }
+});
+
+// POST /api/kb/import-mapped
+// Body: { org_id, items[], mapping: {title, content, category, sub_category, tertiary} }
+// Saves each mapped item as a kb_document row
+app.post("/api/kb/import-mapped", async (req, res) => {
+  const { org_id, items, mapping } = req.body;
+  if (!org_id || !items?.length || !mapping?.title || !mapping?.content) {
+    return res.status(400).json({ error: "org_id, items, mapping.title and mapping.content required" });
+  }
+  try {
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS tertiary TEXT`.catch(()=>{});
+
+    const limitErr = await checkKbLimit(org_id);
+    if (limitErr) return res.status(403).json(limitErr);
+
+    const saved = [];
+    for (const item of items) {
+      const name    = String(item[mapping.title]    || "").trim().slice(0, 200) || "Untitled";
+      const content = String(item[mapping.content]  || "").trim().slice(0, 80000);
+      const category     = mapping.category     ? String(item[mapping.category]     || "").trim() : null;
+      const sub_category = mapping.sub_category ? String(item[mapping.sub_category] || "").trim() : null;
+      const tertiary     = mapping.tertiary     ? String(item[mapping.tertiary]     || "").trim() : null;
+      if (!content) continue;
+      const rows = await sql`
+        INSERT INTO kb_documents (org_id, name, content, category, sub_category, tertiary, size_kb, chunks, status)
+        VALUES (${org_id}, ${name}, ${content}, ${category}, ${sub_category}, ${tertiary},
+                ${Math.round(content.length/1024)}, ${Math.ceil(content.length/500)}, 'indexed')
+        RETURNING *
+      `.catch(e => { console.error("[KB import]", e.message); return []; });
+      if (rows[0]) saved.push(rows[0]);
+    }
+    res.json({ saved: saved.length, items: saved });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Also add tertiary to GET /api/kb so conversations panel can use it
 
 // Quick diagnostic — count conversations for an org
 
@@ -728,7 +841,7 @@ Reply at: https://chatbot.hindleconsultants.com`;
         await fetch("https://rest.clicksend.com/v3/email/send", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
-          body: JSON.stringify({ to: [{ email: toEmail, name: org.name || "Admin" }], from: { email_address_id: 1, name: cs.fromName || "Hindle" }, subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>` }),
+          body: JSON.stringify({ to: [{ email: toEmail, name: org.name || "Admin", list_id: 0 }], from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: cs.fromName||cs.emailName||"Hindle" }, subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>` }),
         }).catch(()=>{});
       }
     } catch (_) {}
@@ -1100,8 +1213,8 @@ app.post("/api/admin-settings", async (req, res) => {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
         body: JSON.stringify({
-          to: [{ email: testEmail, name: "Test Recipient" }],
-          from: { email: fromEmail, name: fromName },
+          to: [{ email: testEmail, name: "Test Recipient", list_id: 0 }],
+          from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: fromName },
           subject: "Hindle — Test Email Delivery",
           body: `<p>This is a test email from Hindle Platform.<br><br>If you received this, your ClickSend email integration is working correctly.<br><br>From: ${fromName} &lt;${fromEmail}&gt;</p>`
         }),
@@ -1700,8 +1813,9 @@ app.post("/api/kb", async (req, res) => {
   }
   try {
     await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS tertiary TEXT`.catch(()=>{});
     const rows = await sql`
-      INSERT INTO kb_documents (org_id, name, category, sub_category, size_kb, chunks, content)
+      INSERT INTO kb_documents (org_id, name, category, sub_category, tertiary, size_kb, chunks, content)
       VALUES (${org_id}, ${name}, ${category}, ${sub_category}, ${size_kb}, ${chunks || 0}, ${req.body.content || null})
       RETURNING *
     `;
@@ -2449,8 +2563,8 @@ async function runTrialScheduler() {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: auth },
           body: JSON.stringify({
-            to: [{ email: org.email, name: org.name || "Tenant" }],
-            from: { email: cs.username, name: cs.smsSender || "Hindle Consultants" },
+            to: [{ email: org.email, name: org.name || "Tenant", list_id: 0 }],
+            from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: cs.emailName||cs.smsSender||"Hindle Consultants" },
             subject,
             body: htmlBody,
           }),
