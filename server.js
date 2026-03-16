@@ -1196,6 +1196,7 @@ app.post("/api/admin-settings", async (req, res) => {
 
   // ── Test SMS ──────────────────────────────────────────────────
   if (testSMS) {
+    const dbg = [];
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
       const cfg = rows.length ? rows[0].config : {};
@@ -1203,46 +1204,61 @@ app.post("/api/admin-settings", async (req, res) => {
       const username = cs.username || process.env.CLICKSEND_USERNAME;
       const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
       const sender = cs.smsSender || "HINDLE";
-      if (!username || !apiKey) return res.json({ ok: false, smsError: "ClickSend credentials not set" });
-      const body = `[TEST] Hindle SMS test from ${sender}. If you received this, SMS delivery is working correctly.`;
+      dbg.push(`credentials: username=${username?"set":"MISSING"} apiKey=${apiKey?"set":"MISSING"}`);
+      dbg.push(`sender: ${sender} | to: ${testSMS}`);
+      if (!username || !apiKey) { console.log("[TEST SMS] FAIL - missing creds"); return res.json({ ok: false, smsError: "ClickSend credentials not set", debug: dbg }); }
+      const payload = { messages: [{ source: "sdk", to: testSMS, body: `[TEST] Hindle SMS test from ${sender}.`, from: sender }] };
+      dbg.push(`payload: ${JSON.stringify(payload)}`);
+      console.log("[TEST SMS] Sending:", JSON.stringify(payload));
       const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
-        body: JSON.stringify({ messages: [{ source: "sdk", to: testSMS, body, from: sender }] }),
+        body: JSON.stringify(payload),
       });
       const d = await r.json();
-      const ok = d?.data?.messages?.[0]?.status === "SUCCESS" || r.ok;
-      return res.json({ ok, smsSent: ok, smsError: ok ? null : (d?.data?.messages?.[0]?.status || "Send failed") });
-    } catch (e) { return res.json({ ok: false, smsError: e.message }); }
+      const msgStatus = d?.data?.messages?.[0]?.status;
+      const ok = msgStatus === "SUCCESS";
+      dbg.push(`http: ${r.status} | msg_status: ${msgStatus} | response: ${JSON.stringify(d).slice(0,400)}`);
+      console.log("[TEST SMS] Response:", JSON.stringify(d));
+      return res.json({ ok, smsSent: ok, smsError: ok ? null : (msgStatus || "Send failed"), debug: dbg });
+    } catch (e) { console.error("[TEST SMS] Exception:", e.message); return res.json({ ok: false, smsError: e.message, debug: dbg }); }
   }
 
-  // ── Test Email ─────────────────────────────────────────────────
   if (testEmail) {
+    const dbg = [];
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
       const cfg = rows.length ? rows[0].config : {};
       const cs = cfg.clicksend || {};
       const username = cs.username || process.env.CLICKSEND_USERNAME;
       const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
-      const fromEmail = cs.emailFrom || username;
       const fromName = cs.emailName || "Hindle Platform";
-      if (!username || !apiKey) return res.json({ ok: false, emailError: "ClickSend credentials not set" });
+      const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
+      dbg.push(`credentials: username=${username?"set":"MISSING"} apiKey=${apiKey?"set":"MISSING"}`);
+      dbg.push(`email_address_id: ${fromId} (raw stored: "${cs.emailAddressId||cs.email_address_id||"not set"}")`);
+      dbg.push(`from_name: ${fromName} | to: ${testEmail}`);
+      if (!username || !apiKey) { console.log("[TEST EMAIL] FAIL - missing creds"); return res.json({ ok: false, emailError: "ClickSend credentials not set", debug: dbg }); }
+      if (!fromId) { console.log("[TEST EMAIL] FAIL - email_address_id is 0"); return res.json({ ok: false, emailError: "Email Address ID not set — add it in Integrations → SMS & Email Credentials", debug: dbg }); }
+      const payload = {
+        to: [{ email: testEmail, name: "Test Recipient", list_id: 0 }],
+        from: { email_address_id: fromId, name: fromName },
+        subject: "Hindle — Test Email Delivery",
+        body: `<p>Test email from Hindle.<br>email_address_id: ${fromId}<br>from_name: ${fromName}</p>`
+      };
+      dbg.push(`payload: ${JSON.stringify(payload)}`);
+      console.log("[TEST EMAIL] Sending:", JSON.stringify(payload));
       const r = await fetch("https://rest.clicksend.com/v3/email/send", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
-        body: JSON.stringify({
-          to: [{ email: testEmail, name: "Test Recipient", list_id: 0 }],
-          from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: fromName },
-          subject: "Hindle — Test Email Delivery",
-          body: `<p>This is a test email from Hindle Platform.<br><br>If you received this, your ClickSend email integration is working correctly.<br><br>From: ${fromName} &lt;${fromEmail}&gt;</p>`
-        }),
+        body: JSON.stringify(payload),
       });
       const d = await r.json();
       const ok = r.ok && d?.response_code !== "FAILED";
-      return res.json({ ok, emailSent: ok, emailError: ok ? null : (d?.response_code || "Send failed") });
-    } catch (e) { return res.json({ ok: false, emailError: e.message }); }
+      dbg.push(`http: ${r.status} | response_code: ${d?.response_code} | response: ${JSON.stringify(d).slice(0,400)}`);
+      console.log("[TEST EMAIL] Response:", JSON.stringify(d));
+      return res.json({ ok, emailSent: ok, emailError: ok ? null : (d?.response_code || d?.response_msg || "Send failed"), debug: dbg });
+    } catch (e) { console.error("[TEST EMAIL] Exception:", e.message); return res.json({ ok: false, emailError: e.message, debug: dbg }); }
   }
-
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     const existing = rows.length ? (rows[0].config || {}) : {};
