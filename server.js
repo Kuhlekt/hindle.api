@@ -1140,8 +1140,10 @@ app.post("/api/conversations", async (req, res) => {
 
 app.patch("/api/conversations/:id", async (req, res) => {
   const { status, assigned_agent_id, claimed_by_id, claimed_by_name,
-          visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location } = req.body;
+          visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location,
+          priority } = req.body;
   try {
+    await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS priority TEXT`.catch(()=>{});
     const rows = await sql`
       UPDATE conversations SET
         status            = COALESCE(${status},            status),
@@ -1153,6 +1155,7 @@ app.patch("/api/conversations/:id", async (req, res) => {
         visitor_phone     = COALESCE(${visitor_phone},     visitor_phone),
         visitor_company   = COALESCE(${visitor_company},   visitor_company),
         visitor_location  = COALESCE(${visitor_location},  visitor_location),
+        priority          = COALESCE(${priority},          priority),
         updated_at        = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
@@ -1214,17 +1217,20 @@ app.get("/api/conversations/:id/messages", async (req, res) => {
 });
 
 app.post("/api/conversations/:id/messages", async (req, res) => {
-  const { type, sender, content } = req.body;
-  if (!type || !content) return res.status(400).json({ error: "type and content required" });
+  const { type, sender, content, file_url } = req.body;
+  if (!type || (!content && !file_url)) return res.status(400).json({ error: "type and content or file_url required" });
+  // Allowed types: visitor, agent, bot, system, note
+  const validTypes = ["visitor","agent","bot","system","note"];
+  const msgType = validTypes.includes(type) ? type : "agent";
   try {
+    await sql`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT`.catch(()=>{});
     const rows = await sql`
-      INSERT INTO messages (conversation_id, type, sender, content)
-      VALUES (${req.params.id}, ${type}, ${sender}, ${content})
+      INSERT INTO messages (conversation_id, type, sender, content, file_url)
+      VALUES (${req.params.id}, ${msgType}, ${sender}, ${content||""}, ${file_url||null})
       RETURNING *
     `;
     await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${req.params.id}`;
-    // Track first agent response time (only set once, on first agent message)
-    if (type === "agent") {
+    if (msgType === "agent") {
       await sql`
         UPDATE conversations SET first_response_at = NOW()
         WHERE id = ${req.params.id} AND first_response_at IS NULL
