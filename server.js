@@ -1255,7 +1255,10 @@ app.post("/api/admin-settings", async (req, res) => {
         body: htmlBody,
       };
       dbg.push(`payload: ${JSON.stringify(payload)}`);
-      console.log("[TEST EMAIL] Sending:", JSON.stringify(payload));
+      console.log("[TEST EMAIL] === ABOUT TO CALL CLICKSEND ===");
+      console.log("[TEST EMAIL] URL: https://rest.clicksend.com/v3/email/send");
+      console.log("[TEST EMAIL] Auth: Basic", Buffer.from(username + ":" + apiKey).toString("base64").slice(0,8)+"...");
+      console.log("[TEST EMAIL] Payload:", JSON.stringify(payload));
       const r = await fetch("https://rest.clicksend.com/v3/email/send", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
@@ -1264,11 +1267,13 @@ app.post("/api/admin-settings", async (req, res) => {
       const rawText = await r.text();
       let d = {};
       try { d = JSON.parse(rawText); } catch(_) { d = { raw: rawText }; }
-      const ok = r.ok && (d?.response_code === "SUCCESS" || (r.status >= 200 && r.status < 300 && d?.response_code !== "FAILED"));
+      // Only treat as success when ClickSend explicitly says SUCCESS
+      const ok = d?.response_code === "SUCCESS";
       dbg.push(`http: ${r.status} | response_code: ${d?.response_code} | response_msg: ${d?.response_msg} | raw: ${rawText.slice(0,600)}`);
       console.log("[TEST EMAIL] HTTP Status:", r.status);
       console.log("[TEST EMAIL] Raw Response:", rawText.slice(0, 1000));
-      return res.json({ ok, emailSent: ok, emailError: ok ? null : (d?.response_code || d?.response_msg || `HTTP ${r.status}` || "Send failed"), debug: dbg });
+      const errMsg = ok ? null : (d?.response_code || d?.response_msg || `HTTP ${r.status}` || "Send failed - no SUCCESS response_code");
+      return res.json({ ok, emailSent: ok, emailError: errMsg, debug: dbg });
     } catch (e) { console.error("[TEST EMAIL] Exception:", e.message); return res.json({ ok: false, emailError: e.message, debug: dbg }); }
   }
   try {
