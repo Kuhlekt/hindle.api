@@ -5,7 +5,9 @@ const https = require("https");
 const http = require("http");
 
 // Safe fetch using built-in https/http — avoids node-fetch ESM issues
-const fetch = (url, opts = {}) => new Promise((resolve, reject) => {
+// Follows redirects (301, 302, 307, 308) up to 5 hops
+const fetch = (url, opts = {}, _redirectCount = 0) => new Promise((resolve, reject) => {
+  if (_redirectCount > 5) return reject(new Error("Too many redirects"));
   const parsed = new URL(url);
   const mod = parsed.protocol === "https:" ? https : http;
   const options = {
@@ -20,6 +22,15 @@ const fetch = (url, opts = {}) => new Promise((resolve, reject) => {
     options.headers["Content-Length"] = Buffer.byteLength(body);
   }
   const req = mod.request(options, (res) => {
+    // Follow redirects
+    if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+      const nextUrl = res.headers.location.startsWith("http")
+        ? res.headers.location
+        : `${parsed.protocol}//${parsed.hostname}${res.headers.location}`;
+      // Drain the body to free socket
+      res.resume();
+      return resolve(fetch(nextUrl, {...opts, body: [301,302].includes(res.statusCode) ? undefined : opts.body, method: [301,302].includes(res.statusCode) ? "GET" : opts.method}, _redirectCount + 1));
+    }
     const chunks = [];
     res.on("data", c => chunks.push(c));
     res.on("end", () => {
@@ -30,6 +41,7 @@ const fetch = (url, opts = {}) => new Promise((resolve, reject) => {
         statusText: res.statusMessage,
         json: () => Promise.resolve(JSON.parse(buf.toString())),
         text: () => Promise.resolve(buf.toString()),
+        buffer: () => Promise.resolve(buf),
       });
     });
   });
@@ -464,6 +476,91 @@ app.post("/api/kb/import-url", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+
+// ─────────────────────────────────────────────
+// KB — File Upload with text extraction
+// POST /api/kb/upload-file
+// Accepts multipart with field "file" + body field "org_id"
+// Extracts text from PDF/DOCX/TXT/MD/JSON/XML/CSV
+// ─────────────────────────────────────────────
+app.post("/api/kb/upload-file", async (req, res) => {
+  // Parse multipart manually using busboy
+  let busboy;
+  try { busboy = require("busboy"); } catch (_) {
+    return res.status(503).json({ error: "busboy not installed — run: npm install busboy" });
+  }
+
+  const org_id = req.headers["x-org-id"] || req.query.org_id;
+  if (!org_id) return res.status(400).json({ error: "org_id required (header X-Org-Id or query param)" });
+
+  const limitErr = await checkKbLimit(org_id).catch(() => null);
+  if (limitErr) return res.status(403).json(limitErr);
+
+  const bb = busboy({ headers: req.headers, limits: { fileSize: 20 * 1024 * 1024 } });
+  const fileBuffers = [];
+  let fileName = "upload";
+  let fileType = "";
+
+  bb.on("file", (name, file, info) => {
+    fileName = info.filename || "upload";
+    fileType = fileName.split(".").pop().toLowerCase();
+    const chunks = [];
+    file.on("data", c => chunks.push(c));
+    file.on("end", () => fileBuffers.push(Buffer.concat(chunks)));
+  });
+
+  bb.on("finish", async () => {
+    if (!fileBuffers.length) return res.status(400).json({ error: "No file received" });
+    const buf = fileBuffers[0];
+    let text = "";
+
+    try {
+      if (fileType === "pdf") {
+        try {
+          const pdfParse = require("pdf-parse");
+          const data = await pdfParse(buf);
+          text = data.text || "";
+        } catch (_) {
+          return res.status(503).json({ error: "pdf-parse not installed — run: npm install pdf-parse" });
+        }
+      } else if (fileType === "docx" || fileType === "doc") {
+        try {
+          const mammoth = require("mammoth");
+          const result = await mammoth.extractRawText({ buffer: buf });
+          text = result.value || "";
+        } catch (_) {
+          return res.status(503).json({ error: "mammoth not installed — run: npm install mammoth" });
+        }
+      } else if (["txt","md","csv","json","xml"].includes(fileType)) {
+        text = buf.toString("utf8");
+        if (fileType === "json") {
+          try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+        } else if (fileType === "xml") {
+          text = text.replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim();
+        }
+      } else {
+        return res.status(400).json({ error: `Unsupported file type: .${fileType}. Supported: pdf, docx, txt, md, csv, json, xml` });
+      }
+
+      text = text.replace(/\r\n/g, "\n").replace(/\t/g, " ").replace(/ {3,}/g, "  ").trim().slice(0, 80000);
+      if (!text) return res.status(400).json({ error: "Could not extract text from file" });
+
+      await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+      const rows = await sql`
+        INSERT INTO kb_documents (org_id, name, content, size_kb, chunks, status)
+        VALUES (${org_id}, ${fileName}, ${text}, ${Math.round(buf.length / 1024)}, ${Math.ceil(text.length / 500)}, 'indexed')
+        RETURNING *
+      `;
+      res.status(201).json(rows[0]);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  bb.on("error", e => res.status(500).json({ error: e.message }));
+  req.pipe(bb);
 });
 
 
