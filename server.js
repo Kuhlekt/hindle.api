@@ -435,6 +435,7 @@ app.post("/api/kb/import-url", async (req, res) => {
     // Fetch the page
     const pageRes = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; HindleBot/1.0)" },
+      redirect: "follow",
       signal: AbortSignal.timeout(10000),
     });
     if (!pageRes.ok) return res.status(502).json({ error: `Page returned ${pageRes.status}` });
