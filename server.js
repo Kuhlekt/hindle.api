@@ -57,6 +57,14 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("[Server] Uncaught exception:", err.message);
 });
+
+// Check optional packages for KB file extraction
+// Add to package.json: "busboy", "pdf-parse", "mammoth"
+// Then redeploy — Railway will install them automatically
+["busboy","pdf-parse","mammoth"].forEach(pkg => {
+  try { require(pkg); console.log(`[KB] ${pkg} ✓`); }
+  catch (_) { console.log(`[KB] ${pkg} not installed — PDF/DOCX upload will return 503. Run: npm install ${pkg}`); }
+});
 // Stripe — loaded dynamically so missing package never crashes the server
 let stripe = null;
 (function() {
