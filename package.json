@@ -16,7 +16,8 @@
     "stripe": "^14.0.0",
     "busboy": "^1.6.0",
     "pdf-parse": "^1.1.1",
-    "mammoth": "^1.8.0"
+    "mammoth": "^1.8.0",
+    "nodemailer": "^6.9.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

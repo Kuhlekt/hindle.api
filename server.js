@@ -56,7 +56,60 @@ process.on("unhandledRejection", (reason) => {
 });
 process.on("uncaughtException", (err) => {
   console.error("[Server] Uncaught exception:", err.message);
-});
+})
+
+// ── Email template variable substitution ─────────────────────────────────────
+function renderEmailTemplate(template, vars) {
+  return template
+    .replace(/\{name\}/g,    vars.name    || "there")
+    .replace(/\{plan\}/g,    vars.plan    || "")
+    .replace(/\{amount\}/g,  vars.amount  || "")
+    .replace(/\{days\}/g,    vars.days    || "")
+    .replace(/\{last4\}/g,   vars.last4   || "")
+    .replace(/\{expiry\}/g,  vars.expiry  || "")
+    .replace(/\{month\}/g,   vars.month   || "")
+    .replace(/\{company\}/g, vars.company || "");
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+// ── Canonical org UUID resolver ──────────────────────────────────────────────
+// Accepts: UUID (org.id), tenant_id string slug, or org email
+// Always returns the canonical UUID from organisations.id
+async function resolveOrgId(val) {
+  if (!val) return null;
+  try {
+    const rows = await sql`
+      SELECT id FROM organisations
+      WHERE id::text = ${val}
+         OR tenant_id = ${val}
+         OR LOWER(email) = LOWER(${val})
+      LIMIT 1
+    `;
+    return rows[0]?.id || null;
+  } catch (e) {
+    console.error("[resolveOrgId] error:", e.message);
+    return null;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+// ── ClickSend email helper ──────────────────────────────────────────────────
+// ClickSend v3 email API requires:
+//   from: { email_address_id: <numeric>, name: string }
+//   to:   [{ email, name, list_id: 0 }]   (list_id:0 = non-list send)
+function buildCsEmail({ to, toName, subject, body, fromId, fromName, listId }) {
+  return {
+    to:      [{ email: to, name: toName || "Customer", list_id: listId || 0 }],
+    from:    { email_address_id: parseInt(fromId, 10) || 1, name: fromName || "Hindle" },
+    subject: subject || "(no subject)",
+    body:    body    || "",
+  };
+}
+// ──────────────────────────────────────────────────────────────────────────────
+
+;
 
 // Check optional packages for KB file extraction
 // Add to package.json: "busboy", "pdf-parse", "mammoth"
@@ -83,10 +136,56 @@ let stripe = null;
 const { neon } = require("@neondatabase/serverless");
 
 const sql = neon(process.env.DATABASE_URL);
+
+
+
+// ── RLS Context Helpers ───────────────────────────────────────────────────────
+// sqlForOrg(orgId) — runs a single query with the tenant RLS context set
+// Usage: const rows = await sqlForOrg(orgId, sql`SELECT * FROM conversations`);
+//
+// For super admin (orgId = null/undefined/''), sets empty string → policies allow all rows.
+// For tenant (orgId = UUID), policies enforce org_id isolation at DB level.
+
+async function sqlForOrg(orgId, query) {
+  const ctx = orgId ? String(orgId) : '';
+  try {
+    const results = await sql.transaction([
+      sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
+      query,
+    ]);
+    return results[1]; // results[0] is set_config result
+  } catch (e) {
+    // Fallback: if transaction not supported, run query directly
+    // (RLS still applies at DB level if enabled)
+    console.error('[RLS] transaction error, falling back:', e.message);
+    return await query;
+  }
+}
+
+// sqlManyForOrg — run multiple queries in one transaction under the same RLS context
+async function sqlManyForOrg(orgId, queries) {
+  const ctx = orgId ? String(orgId) : '';
+  try {
+    const results = await sql.transaction([
+      sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
+      ...queries,
+    ]);
+    return results.slice(1); // drop set_config result
+  } catch (e) {
+    console.error('[RLS] multi-transaction error:', e.message);
+    return await Promise.all(queries.map(q => q));
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
+
+
+// Also add tertiary to GET /api/kb so conversations panel can use it
+
 
 // Stripe webhook MUST receive raw body for signature verification
 // Register this route BEFORE express.json() middleware
@@ -131,6 +230,29 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           }
         }
         console.log(`[Stripe] Activated org ${org.id} (${org.email}) on plan ${planId}`);
+        // Send payment confirmation email
+        try {
+          const [pCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+          const cs = pCfg?.config?._superConfig?.clicksend || pCfg?.config?.clicksend || {};
+          const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
+          if (cs.username && cs.apiKey && fromId && org.email) {
+            // Load email template from super config if set, else use default
+            const tpls = pCfg?.config?._superConfig?.emailTemplates || [];
+            const tpl = tpls.find(t => t.id === "payment");
+            const subject = tpl ? renderEmailTemplate(tpl.subj, { name: org.name, plan: planId }) : `✅ Payment confirmed — ${planId} plan active`;
+            const body = tpl
+              ? `<p>${renderEmailTemplate(tpl.body, { name: org.name, plan: planId, amount: session.amount_total ? (session.amount_total/100).toFixed(2) : "", last4: session.payment_method_types?.[0] || "" })}</p>`
+              : `<p>Hi ${org.name || "there"},<br><br>Your payment has been confirmed and your <strong>${planId}</strong> plan is now active.<br><br>Thank you for choosing Hindle AI.</p>`;
+            await fetch("https://rest.clicksend.com/v3/email/send", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
+              body: JSON.stringify({ to: [{ email: org.email, name: org.name || "Customer", list_id: 0 }], from: { email_address_id: fromId, name: cs.emailName || "Hindle" }, subject, body }),
+            }).catch(e => console.error("[Stripe] Payment email error:", e.message));
+            console.log(`[Stripe] Payment confirmation email sent to ${org.email}`);
+          }
+        } catch (emailErr) { console.error("[Stripe] Payment email error:", emailErr.message); }
+        // Write audit
+        await writeAudit(org.id, "payment_confirmed", `Payment confirmed — plan ${planId}`, { plan: planId, email }).catch(()=>{});
       } else {
         console.warn(`[Stripe] Webhook: could not find org for email=${email} orgId=${orgId}`);
       }
@@ -141,7 +263,21 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
   res.json({ received: true });
 });
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// ── RLS default context middleware ────────────────────────────────────────────
+// Sets app.current_org_id = '' (super admin / bypass) for every request.
+// Individual endpoints override this with sqlForOrg(orgId, ...) which wraps
+// the query in a transaction that sets the correct tenant context first.
+// This ensures RLS never hard-blocks a request due to missing context.
+app.use(async (req, res, next) => {
+  try {
+    await sql`SELECT set_config('app.current_org_id', '', true)`;
+  } catch (_) {}
+  next();
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────
 // IN-MEMORY RATE LIMITER  (per tenant, per minute)
@@ -215,7 +351,7 @@ app.post("/api/auth/2fa/send", async (req, res) => {
   // Send via ClickSend email
   try {
     const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(() => [null]);
-    const cs = cfg?.config?.clicksend || cfg?.config?._platformConfig?.clicksend || {};
+    const cs = cfg?.config?._superConfig?.clicksend || cfg?.config?.clicksend || cfg?.config?._platformConfig?.clicksend || {};
     const username = cs.username || process.env.CLICKSEND_USERNAME;
     const apiKey   = cs.apiKey   || process.env.CLICKSEND_API_KEY;
 
@@ -223,8 +359,8 @@ app.post("/api/auth/2fa/send", async (req, res) => {
       const fromEmail = cs.fromEmail || cs.emailFrom || cs.username;
       const fromName  = cs.fromName  || cs.emailName || "Hindle Consultants";
       const body = JSON.stringify({
-        to: [{ email: email, name: "Admin" }],
-        from: { email: fromEmail, name: fromName },
+        to: [{ email: email, name: "Admin", list_id: 0 }],
+        from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: fromName },
         subject: "Your Hindle Admin login code",
         body: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">
   <h2 style="margin:0 0 8px">Login verification code</h2>
@@ -241,8 +377,14 @@ app.post("/api/auth/2fa/send", async (req, res) => {
         },
         body,
       });
-      const d = await r.json();
-      console.log("[2FA] ClickSend result:", JSON.stringify(d), "→", email);
+      const rawText = await r.text();
+      let d = {};
+      try { d = JSON.parse(rawText); } catch(_) {}
+      console.log("[2FA] ClickSend HTTP:", r.status, "| response_code:", d?.response_code, "| response_msg:", d?.response_msg);
+      console.log("[2FA] Full response:", rawText.slice(0, 500));
+      if (!r.ok || d?.response_code === "FAILED") {
+        console.error("[2FA] Email delivery failed — check email_address_id and verified sender in ClickSend");
+      }
     } else {
       // No ClickSend — log code for dev (remove in prod)
       console.log(`[2FA] CODE for ${email}: ${code} (ClickSend not configured)`);
@@ -429,7 +571,7 @@ app.post("/api/conversations/:id/email-reply", async (req, res) => {
     const r = await fetch("https://rest.clicksend.com/v3/email/send", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
-      body: JSON.stringify({ to: [{ email: to, name: "Customer" }], from: { email: fromEmail, name: fromName }, subject: subject || "Re: Your support request", body }),
+      body: JSON.stringify(buildCsEmail({ to, toName:"Customer", subject:subject||"Re: Your support request", body, fromId:cs.emailAddressId||cs.email_address_id||1, fromName, listId:0 })),
     });
     const d = await r.json();
     // Save as agent message
@@ -570,6 +712,121 @@ app.post("/api/kb/upload-file", async (req, res) => {
   bb.on("error", e => res.status(500).json({ error: e.message }));
   req.pipe(bb);
 });
+
+
+// ─────────────────────────────────────────────
+// KB — JSON import: parse and return preview for mapper
+// POST /api/kb/parse-json  { org_id, json_text }
+// Returns: { keys, sample, items_count, suggested_mapping }
+// ─────────────────────────────────────────────
+// Temporary in-memory cache for parsed JSON items (cleared after 30 min)
+const _parseCache = new Map();
+const _parseCacheExpiry = new Map();
+setInterval(()=>{
+  const now = Date.now();
+  for(const [id, exp] of _parseCacheExpiry){
+    if(now > exp){ _parseCache.delete(id); _parseCacheExpiry.delete(id); }
+  }
+}, 5 * 60 * 1000);
+
+app.post("/api/kb/parse-json", async (req, res) => {
+  const { json_text, org_id } = req.body;
+  if (!json_text) return res.status(400).json({ error: "json_text required" });
+  try {
+    const raw = JSON.parse(json_text);
+    let items = [];
+
+    if (Array.isArray(raw)) {
+      items = raw;
+    } else if (typeof raw === "object") {
+      const keys = Object.keys(raw);
+      const firstVal = raw[keys[0]];
+      if (Array.isArray(firstVal)) {
+        keys.forEach(cat => {
+          const arr = Array.isArray(raw[cat]) ? raw[cat] : [];
+          arr.forEach(item => items.push({ ...item, _detected_category: cat }));
+        });
+      } else if (typeof firstVal === "string") {
+        items = Object.entries(raw).map(([k, v]) => ({ title: k, content: v }));
+      } else {
+        items = [raw];
+      }
+    }
+
+    if (!items.length) return res.status(400).json({ error: "No items found in JSON" });
+
+    const keySet = new Set();
+    items.slice(0, 20).forEach(item => Object.keys(item).forEach(k => keySet.add(k)));
+    const keys = [...keySet];
+
+    const suggest = (candidates) => keys.find(k => candidates.some(c => k.toLowerCase().includes(c))) || "";
+    const suggested = {
+      title:        suggest(["title","name","question","q","heading","subject","topic"]),
+      content:      suggest(["content","answer","a","body","description","text","detail","response"]),
+      category:     suggest(["category","cat","group","section","type","module","_detected_category"]),
+      sub_category: suggest(["sub","subcategory","sub_category","subtopic","tag"]),
+      tertiary:     suggest(["tertiary","third","level3","tier"]),
+    };
+
+    // Store in cache so import-mapped can retrieve without re-sending all items
+    const parseId = `p_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    _parseCache.set(parseId, items);
+    _parseCacheExpiry.set(parseId, Date.now() + 30 * 60 * 1000);
+
+    // Return sample + keys + parseId (not full items, to keep response small)
+    const sample = items.slice(0, 3);
+    res.json({ keys, sample, items_count: items.length, suggested, parseId,
+      // Include full items only if small (<= 100 items, < 500kb)
+      items: items.length <= 100 ? items : [] });
+  } catch (e) {
+    res.status(400).json({ error: "Invalid JSON: " + e.message });
+  }
+});
+
+// POST /api/kb/import-mapped
+// Body: { org_id, items[], mapping: {title, content, category, sub_category, tertiary} }
+// Saves each mapped item as a kb_document row
+app.post("/api/kb/import-mapped", async (req, res) => {
+  let { org_id, items, mapping, parseId } = req.body;
+  // If items not sent (large file), retrieve from cache
+  if ((!items || !items.length) && parseId && _parseCache.has(parseId)) {
+    items = _parseCache.get(parseId);
+    _parseCache.delete(parseId);
+    _parseCacheExpiry.delete(parseId);
+  }
+  if (!org_id || !items?.length || !mapping?.title || !mapping?.content) {
+    return res.status(400).json({ error: "org_id, items, mapping.title and mapping.content required" });
+  }
+  try {
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS tertiary TEXT`.catch(()=>{});
+
+    const limitErr = await checkKbLimit(org_id);
+    if (limitErr) return res.status(403).json(limitErr);
+
+    const saved = [];
+    for (const item of items) {
+      const name    = String(item[mapping.title]    || "").trim().slice(0, 200) || "Untitled";
+      const content = String(item[mapping.content]  || "").trim().slice(0, 80000);
+      const category     = mapping.category     ? String(item[mapping.category]     || "").trim() : null;
+      const sub_category = mapping.sub_category ? String(item[mapping.sub_category] || "").trim() : null;
+      const tertiary     = mapping.tertiary     ? String(item[mapping.tertiary]     || "").trim() : null;
+      if (!content) continue;
+      const rows = await sql`
+        INSERT INTO kb_documents (org_id, name, content, category, sub_category, tertiary, size_kb, chunks, status)
+        VALUES (${org_id}, ${name}, ${content}, ${category}, ${sub_category}, ${tertiary},
+                ${Math.round(content.length/1024)}, ${Math.ceil(content.length/500)}, 'indexed')
+        RETURNING *
+      `.catch(e => { console.error("[KB import]", e.message); return []; });
+      if (rows[0]) saved.push(rows[0]);
+    }
+    res.json({ saved: saved.length, items: saved });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Also add tertiary to GET /api/kb so conversations panel can use it
 
 
 // Quick diagnostic — count conversations for an org
@@ -728,7 +985,7 @@ Reply at: https://chatbot.hindleconsultants.com`;
         await fetch("https://rest.clicksend.com/v3/email/send", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
-          body: JSON.stringify({ to: [{ email: toEmail, name: org.name || "Admin" }], from: { email_address_id: 1, name: cs.fromName || "Hindle" }, subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>` }),
+          body: JSON.stringify({ to: [{ email: toEmail, name: org.name || "Admin", list_id: 0 }], from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: cs.fromName||cs.emailName||"Hindle" }, subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>` }),
         }).catch(()=>{});
       }
     } catch (_) {}
@@ -774,13 +1031,14 @@ app.post("/api/conversations/:id/csat", async (req, res) => {
 app.get("/api/analytics/:orgId", async (req, res) => {
   const { orgId } = req.params;
   const { days = "30" } = req.query;
+  const canonicalAnalyticsId = await resolveOrgId(orgId).catch(() => orgId);
   try {
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_rating INT`.catch(() => {});
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS first_response_at TIMESTAMPTZ`.catch(() => {});
     const since = new Date(Date.now() - Number(days) * 86400000).toISOString();
     const csatRows = await sql`
       SELECT csat_rating, COUNT(*)::int as n FROM conversations
-      WHERE org_id::text = ${orgId} AND csat_rating IS NOT NULL AND created_at >= ${since}
+      WHERE org_id = ${canonicalAnalyticsId} AND csat_rating IS NOT NULL AND created_at >= ${since}
       GROUP BY csat_rating
     `;
     const csatTotal = csatRows.reduce((s, r) => s + r.n, 0);
@@ -802,7 +1060,7 @@ app.get("/api/analytics/:orgId", async (req, res) => {
              SUM(CASE WHEN csat_rating = 1 THEN 1 ELSE 0 END)::int as csat_pos,
              SUM(CASE WHEN csat_rating IS NOT NULL THEN 1 ELSE 0 END)::int as csat_total
       FROM conversations
-      WHERE org_id::text = ${orgId} AND created_at >= ${since}
+      WHERE org_id = ${canonicalAnalyticsId} AND created_at >= ${since}
       GROUP BY DATE(created_at) ORDER BY day ASC
     `.catch(() => []);
     res.json({ csatScore, csatTotal, csatPositive, avgFrt, medFrt, frtCount: frtValues.length, dailyRows });
@@ -818,9 +1076,9 @@ app.get("/api/onboarding/:orgId", async (req, res) => {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${orgId} LIMIT 1`.catch(() => [null]);
     const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`.catch(() => [null]);
-    const [convRow] = await sql`SELECT COUNT(*)::int as n FROM conversations WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
-    const [agentRow] = await sql`SELECT COUNT(*)::int as n FROM agents WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
-    const [kbRow] = await sql`SELECT COUNT(*)::int as n FROM kb_documents WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
+    const [convRow] = await sqlForOrg(orgId, sql`SELECT COUNT(*)::int as n FROM conversations WHERE org_id::text = ${orgId}`).catch(() => [{n:0}]);
+    const [agentRow] = await sqlForOrg(orgId, sql`SELECT COUNT(*)::int as n FROM agents WHERE org_id::text = ${orgId}`).catch(() => [{n:0}]);
+    const [kbRow] = await sqlForOrg(orgId, sql`SELECT COUNT(*)::int as n FROM kb_documents WHERE org_id::text = ${orgId}`).catch(() => [{n:0}]);
     const c = cfg?.config || {};
     const brand = c.brand || {};
     const steps = [
@@ -1065,53 +1323,80 @@ app.post("/api/admin-settings", async (req, res) => {
 
   // ── Test SMS ──────────────────────────────────────────────────
   if (testSMS) {
+    const dbg = [];
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
       const cfg = rows.length ? rows[0].config : {};
-      const cs = cfg.clicksend || {};
+      const cs = cfg._superConfig?.clicksend || cfg.clicksend || {};
+      dbg.push(`config_source: ${cfg._superConfig?.clicksend ? "_superConfig.clicksend" : cfg.clicksend ? "clicksend" : "none"}`);
       const username = cs.username || process.env.CLICKSEND_USERNAME;
       const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
       const sender = cs.smsSender || "HINDLE";
-      if (!username || !apiKey) return res.json({ ok: false, smsError: "ClickSend credentials not set" });
-      const body = `[TEST] Hindle SMS test from ${sender}. If you received this, SMS delivery is working correctly.`;
+      dbg.push(`credentials: username=${username?"set":"MISSING"} apiKey=${apiKey?"set":"MISSING"}`);
+      dbg.push(`sender: ${sender} | to: ${testSMS}`);
+      if (!username || !apiKey) { console.log("[TEST SMS] FAIL - missing creds"); return res.json({ ok: false, smsError: "ClickSend credentials not set", debug: dbg }); }
+      const payload = { messages: [{ source: "sdk", to: testSMS, body: `[TEST] Hindle SMS test from ${sender}.`, from: sender }] };
+      dbg.push(`payload: ${JSON.stringify(payload)}`);
+      console.log("[TEST SMS] Sending:", JSON.stringify(payload));
       const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
-        body: JSON.stringify({ messages: [{ source: "sdk", to: testSMS, body, from: sender }] }),
+        body: JSON.stringify(payload),
       });
       const d = await r.json();
-      const ok = d?.data?.messages?.[0]?.status === "SUCCESS" || r.ok;
-      return res.json({ ok, smsSent: ok, smsError: ok ? null : (d?.data?.messages?.[0]?.status || "Send failed") });
-    } catch (e) { return res.json({ ok: false, smsError: e.message }); }
+      const msgStatus = d?.data?.messages?.[0]?.status;
+      const ok = msgStatus === "SUCCESS";
+      dbg.push(`http: ${r.status} | msg_status: ${msgStatus} | response: ${JSON.stringify(d).slice(0,400)}`);
+      console.log("[TEST SMS] Response:", JSON.stringify(d));
+      return res.json({ ok, smsSent: ok, smsError: ok ? null : (msgStatus || "Send failed"), debug: dbg });
+    } catch (e) { console.error("[TEST SMS] Exception:", e.message); return res.json({ ok: false, smsError: e.message, debug: dbg }); }
   }
 
-  // ── Test Email ─────────────────────────────────────────────────
   if (testEmail) {
+    const dbg = [];
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
       const cfg = rows.length ? rows[0].config : {};
-      const cs = cfg.clicksend || {};
+      const cs = cfg._superConfig?.clicksend || cfg.clicksend || {};
+      dbg.push(`config_source: ${cfg._superConfig?.clicksend ? "_superConfig.clicksend" : cfg.clicksend ? "clicksend" : "none"}`);
       const username = cs.username || process.env.CLICKSEND_USERNAME;
       const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
-      const fromEmail = cs.emailFrom || username;
       const fromName = cs.emailName || "Hindle Platform";
-      if (!username || !apiKey) return res.json({ ok: false, emailError: "ClickSend credentials not set" });
+      const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
+      dbg.push(`credentials: username=${username?"set":"MISSING"} apiKey=${apiKey?"set":"MISSING"}`);
+      dbg.push(`email_address_id: ${fromId} (raw stored: "${cs.emailAddressId||cs.email_address_id||"not set"}")`);
+      dbg.push(`from_name: ${fromName} | to: ${testEmail}`);
+      if (!username || !apiKey) { console.log("[TEST EMAIL] FAIL - missing creds"); return res.json({ ok: false, emailError: "ClickSend credentials not set", debug: dbg }); }
+      if (!fromId) { console.log("[TEST EMAIL] FAIL - email_address_id is 0"); return res.json({ ok: false, emailError: "Email Address ID not set — add it in Integrations → SMS & Email Credentials", debug: dbg }); }
+      const htmlBody = `<p>Test email from Hindle.<br>email_address_id: ${fromId}<br>from_name: ${fromName}<br>Sent: ${new Date().toISOString()}</p>`;
+      const payload = {
+        to: [{ email: testEmail, name: "Test Recipient", list_id: 0 }],
+        from: { email_address_id: fromId, name: fromName },
+        subject: "Hindle — Test Email Delivery",
+        body: htmlBody,
+      };
+      dbg.push(`payload: ${JSON.stringify(payload)}`);
+      console.log("[TEST EMAIL] === ABOUT TO CALL CLICKSEND ===");
+      console.log("[TEST EMAIL] URL: https://rest.clicksend.com/v3/email/send");
+      console.log("[TEST EMAIL] Auth: Basic", Buffer.from(username + ":" + apiKey).toString("base64").slice(0,8)+"...");
+      console.log("[TEST EMAIL] Payload:", JSON.stringify(payload));
       const r = await fetch("https://rest.clicksend.com/v3/email/send", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
-        body: JSON.stringify({
-          to: [{ email: testEmail, name: "Test Recipient" }],
-          from: { email: fromEmail, name: fromName },
-          subject: "Hindle — Test Email Delivery",
-          body: `<p>This is a test email from Hindle Platform.<br><br>If you received this, your ClickSend email integration is working correctly.<br><br>From: ${fromName} &lt;${fromEmail}&gt;</p>`
-        }),
+        body: JSON.stringify(payload),
       });
-      const d = await r.json();
-      const ok = r.ok && d?.response_code !== "FAILED";
-      return res.json({ ok, emailSent: ok, emailError: ok ? null : (d?.response_code || "Send failed") });
-    } catch (e) { return res.json({ ok: false, emailError: e.message }); }
+      const rawText = await r.text();
+      let d = {};
+      try { d = JSON.parse(rawText); } catch(_) { d = { raw: rawText }; }
+      // Only treat as success when ClickSend explicitly says SUCCESS
+      const ok = d?.response_code === "SUCCESS";
+      dbg.push(`http: ${r.status} | response_code: ${d?.response_code} | response_msg: ${d?.response_msg} | raw: ${rawText.slice(0,600)}`);
+      console.log("[TEST EMAIL] HTTP Status:", r.status);
+      console.log("[TEST EMAIL] Raw Response:", rawText.slice(0, 1000));
+      const errMsg = ok ? null : (d?.response_code || d?.response_msg || `HTTP ${r.status}` || "Send failed - no SUCCESS response_code");
+      return res.json({ ok, emailSent: ok, emailError: errMsg, debug: dbg });
+    } catch (e) { console.error("[TEST EMAIL] Exception:", e.message); return res.json({ ok: false, emailError: e.message, debug: dbg }); }
   }
-
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     const existing = rows.length ? (rows[0].config || {}) : {};
@@ -1201,7 +1486,31 @@ app.post("/api/tenants", async (req, res) => {
       VALUES (${name}, ${email}, ${plan})
       RETURNING *
     `;
-    res.status(201).json(rows[0]);
+    const org = rows[0];
+    res.status(201).json(org);
+    // Send welcome email (fire-and-forget)
+    try {
+      const [pCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+      const cs = pCfg?.config?._superConfig?.clicksend || pCfg?.config?.clicksend || {};
+      const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
+      if (cs.username && cs.apiKey && fromId) {
+        const tpls = pCfg?.config?._superConfig?.emailTemplates || [];
+        const tpl = tpls.find(t => t.id === "welcome");
+        const vars = { name: name || "there", plan, company: name };
+        const subj = tpl ? renderEmailTemplate(tpl.subj, vars) : "Welcome to Hindle! 🎉";
+        const body = tpl
+          ? `<p>${renderEmailTemplate(tpl.body, vars)}</p>`
+          : `<p>Hi ${name || "there"},<br><br>Your Hindle AI account is ready. Log in at <a href="https://chatbot.hindleconsultants.com">chatbot.hindleconsultants.com</a> to get started.<br><br>Your plan: <strong>${plan}</strong></p>`;
+        await fetch("https://rest.clicksend.com/v3/email/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
+          body: JSON.stringify({ to: [{ email, name: name || "Tenant", list_id: 0 }], from: { email_address_id: fromId, name: cs.emailName || "Hindle" }, subject: subj, body }),
+        }).catch(e => console.error("[Tenants] Welcome email error:", e.message));
+        console.log(`[Tenants] Welcome email sent to ${email}`);
+      }
+    } catch (e) { console.error("[Tenants] Welcome email error:", e.message); }
+    // Audit
+    await writeAudit(org.id, "tenant_created", `Tenant account created — plan ${plan}`, { name, email, plan }).catch(()=>{});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1220,7 +1529,11 @@ app.patch("/api/tenants/:id", async (req, res) => {
       RETURNING *
     `;
     if (!rows.length) return res.status(404).json({ error: "Not found" });
-    res.json(rows[0]);
+    // Audit significant changes
+    const updated = rows[0];
+    if (status) await writeAudit(req.params.id, `tenant_${status}`, `Tenant status changed to ${status}`, { status }).catch(()=>{});
+    if (plan)   await writeAudit(req.params.id, "plan_changed", `Plan changed to ${plan}`, { plan }).catch(()=>{});
+    res.json(updated);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1228,7 +1541,9 @@ app.patch("/api/tenants/:id", async (req, res) => {
 
 app.delete("/api/tenants/:id", async (req, res) => {
   try {
+    const [org] = await sql`SELECT name, email FROM organisations WHERE id = ${req.params.id} LIMIT 1`.catch(()=>[null]);
     await sql`DELETE FROM organisations WHERE id = ${req.params.id}`;
+    await writeAudit(req.params.id, "tenant_deleted", `Tenant deleted: ${org?.name||"unknown"} (${org?.email||""})`, { name: org?.name, email: org?.email }).catch(()=>{});
     res.json({ deleted: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1242,8 +1557,8 @@ app.get("/api/agents", async (req, res) => {
   try {
     const { org_id } = req.query;
     const rows = org_id
-      ? await sql`SELECT * FROM agents WHERE org_id = ${org_id} ORDER BY name`
-      : await sql`SELECT * FROM agents ORDER BY name`;
+      ? await sqlForOrg(org_id, sql`SELECT * FROM agents WHERE org_id = ${org_id} ORDER BY name`)
+      : await sqlForOrg(null, sql`SELECT * FROM agents ORDER BY name`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1422,31 +1737,28 @@ app.post("/api/invite-agent", async (req, res) => {
 app.get("/api/conversations", async (req, res) => {
   try {
     const { org_id, status } = req.query;
+    console.log(`[Conversations GET] org_id="${org_id||"none"}" status="${status||"none"}"`);
+    
+    // Always resolve to canonical UUID — handles slug, UUID, or email
+    let canonicalOrgId = org_id ? await resolveOrgId(org_id) : null;
+    console.log(`[Conversations GET] resolved="${canonicalOrgId||"none"}"`);
+    
     let rows;
-    if (org_id && status) {
-      rows = await sql`
-        SELECT c.*, a.name as agent_name FROM conversations c
-        LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE (c.org_id::text = ${org_id} OR c.org_id::text = (SELECT id::text FROM organisations WHERE id::text = ${org_id} OR tenant_id = ${org_id} LIMIT 1))
-          AND c.status = ${status}
-        ORDER BY c.updated_at DESC
-      `;
-    } else if (org_id) {
-      rows = await sql`
-        SELECT c.*, a.name as agent_name FROM conversations c
-        LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE c.org_id::text = ${org_id}
-           OR c.org_id::text = (SELECT id::text FROM organisations WHERE id::text = ${org_id} OR tenant_id = ${org_id} LIMIT 1)
-        ORDER BY c.updated_at DESC
-      `;
+    if (canonicalOrgId && status) {
+      [rows] = await sqlManyForOrg(canonicalOrgId, [
+        sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.org_id = ${canonicalOrgId} AND c.status = ${status} ORDER BY c.updated_at DESC`
+      ]);
+    } else if (canonicalOrgId) {
+      [rows] = await sqlManyForOrg(canonicalOrgId, [
+        sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.org_id = ${canonicalOrgId} ORDER BY c.updated_at DESC`
+      ]);
     } else {
-      rows = await sql`
-        SELECT c.*, a.name as agent_name FROM conversations c
-        LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        ORDER BY c.updated_at DESC
-        LIMIT 500
-      `;
+      // Super admin — empty context = see all
+      [rows] = await sqlManyForOrg(null, [
+        sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id ORDER BY c.updated_at DESC LIMIT 500`
+      ]);
     }
+    console.log(`[Conversations GET] returning ${rows?.length||0} rows for resolved="${canonicalOrgId||"none"}"`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1455,11 +1767,8 @@ app.get("/api/conversations", async (req, res) => {
 
 app.get("/api/conversations/:id", async (req, res) => {
   try {
-    const rows = await sql`
-      SELECT c.*, a.name as agent_name FROM conversations c
-      LEFT JOIN agents a ON c.assigned_agent_id = a.id
-      WHERE c.id = ${req.params.id}
-    `;
+    // Use null orgId = super admin context; endpoint validates ownership via id
+    const rows = await sqlForOrg(null, sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.id = ${req.params.id}`);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
@@ -1470,15 +1779,9 @@ app.get("/api/conversations/:id", async (req, res) => {
 app.post("/api/conversations", async (req, res) => {
   const { org_id, tenant_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status } = req.body;
   // Resolve org_id: widget sends tenant_id (= organisations.id UUID), dashboard sends org_id
-  let resolvedOrgId = org_id || null;
-  if (!resolvedOrgId && tenant_id) {
-    // tenant_id IS the org UUID — verify it exists
-    try {
-      const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenant_id} OR tenant_id = ${tenant_id} LIMIT 1`;
-      if (orgs.length) resolvedOrgId = orgs[0].id;
-    } catch (_) {}
-    if (!resolvedOrgId) resolvedOrgId = tenant_id;
-  }
+  let resolvedOrgId = await resolveOrgId(org_id || tenant_id);
+  // If still nothing, use the raw value as fallback (will fail gracefully)
+  if (!resolvedOrgId && (org_id || tenant_id)) resolvedOrgId = org_id || tenant_id;
   // Plan enforcement — only block if we can resolve the org
   if (resolvedOrgId) {
     const limitErr = await checkConvoLimit(resolvedOrgId);
@@ -1490,12 +1793,33 @@ app.post("/api/conversations", async (req, res) => {
     try {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
       if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
-        const geoR = await fetch(`https://ipapi.co/${ip}/json/`);
-        if (geoR.ok) {
-          const geo = await geoR.json();
-          if (geo.city || geo.country_name) {
-            resolvedLocation = [geo.city, geo.region, geo.country_name].filter(Boolean).join(", ");
+        // Try ip-api.com first (generous free tier, no auth needed)
+        let geoResolved = false;
+        try {
+          const geoR = await fetch(`http://ip-api.com/json/${ip}?fields=status,city,regionName,country`);
+          if (geoR.ok) {
+            const geo = await geoR.json();
+            if (geo.status === "success" && (geo.city || geo.country)) {
+              resolvedLocation = [geo.city, geo.regionName, geo.country].filter(Boolean).join(", ");
+              geoResolved = true;
+              console.log(`[Conversations POST] geo (ip-api): "${resolvedLocation}" ip="${ip}"`);
+            }
           }
+        } catch (_) {}
+        // Fallback to ipapi.co
+        if (!geoResolved) {
+          try {
+            const geoR2 = await fetch(`https://ipapi.co/${ip}/json/`);
+            if (geoR2.ok) {
+              const geo2 = await geoR2.json();
+              if (geo2.city || geo2.country_name) {
+                resolvedLocation = [geo2.city, geo2.region, geo2.country_name].filter(Boolean).join(", ");
+                console.log(`[Conversations POST] geo (ipapi.co): "${resolvedLocation}" ip="${ip}"`);
+              } else {
+                console.log(`[Conversations POST] geo: no result from either provider ip="${ip}"`);
+              }
+            }
+          } catch (_) {}
         }
       }
     } catch (_) {}
@@ -1537,7 +1861,9 @@ app.patch("/api/conversations/:id", async (req, res) => {
           priority } = req.body;
   try {
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS priority TEXT`.catch(()=>{});
-    const rows = await sql`
+    // Get org for this conversation to set RLS context
+    const [convOrg] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(()=>[null]);
+    const rows = await sqlForOrg(convOrg?.org_id, sql`
       UPDATE conversations SET
         status            = COALESCE(${status},            status),
         assigned_agent_id = COALESCE(${assigned_agent_id}, assigned_agent_id),
@@ -1552,7 +1878,7 @@ app.patch("/api/conversations/:id", async (req, res) => {
         updated_at        = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
-    `;
+    `);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
@@ -1586,7 +1912,8 @@ app.patch("/api/conversations/:id", async (req, res) => {
 
 app.delete("/api/conversations/:id", async (req, res) => {
   try {
-    await sql`DELETE FROM conversations WHERE id = ${req.params.id}`;
+    const [dOrg] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(()=>[null]);
+    await sqlForOrg(dOrg?.org_id, sql`DELETE FROM conversations WHERE id = ${req.params.id}`);
     res.json({ deleted: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1598,11 +1925,10 @@ app.delete("/api/conversations/:id", async (req, res) => {
 // ─────────────────────────────────────────────
 app.get("/api/conversations/:id/messages", async (req, res) => {
   try {
-    const rows = await sql`
-      SELECT * FROM messages
-      WHERE conversation_id = ${req.params.id}
-      ORDER BY created_at ASC
-    `;
+    // Fetch the conversation's org_id first so RLS context is correct
+    const [conv] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(() => [null]);
+    const orgId = conv?.org_id || null;
+    const rows = await sqlForOrg(orgId, sql`SELECT * FROM messages WHERE conversation_id = ${req.params.id} ORDER BY created_at ASC`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1641,9 +1967,10 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
 app.get("/api/alert-log", async (req, res) => {
   try {
     const { org_id } = req.query;
-    const rows = org_id
-      ? await sql`SELECT * FROM alert_log WHERE org_id = ${org_id} ORDER BY created_at DESC`
-      : await sql`SELECT * FROM alert_log ORDER BY created_at DESC`;
+    const canonicalId = org_id ? await resolveOrgId(org_id) : null;
+    const rows = canonicalId
+      ? await sqlForOrg(canonicalId, sql`SELECT * FROM alert_log WHERE org_id = ${canonicalId} ORDER BY created_at DESC`)
+      : await sqlForOrg(null, sql`SELECT * FROM alert_log ORDER BY created_at DESC`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1683,7 +2010,9 @@ app.get("/api/kb", async (req, res) => {
   try {
     const { org_id } = req.query;
     if (!org_id) return res.status(400).json({ error: "org_id required" });
-    const rows = await sql`SELECT * FROM kb_documents WHERE org_id = ${org_id} ORDER BY created_at DESC`;
+    const canonicalId = await resolveOrgId(org_id);
+    if (!canonicalId) return res.status(404).json({ error: "Organisation not found" });
+    const [rows] = await sqlManyForOrg(canonicalId, [sql`SELECT * FROM kb_documents WHERE org_id = ${canonicalId} ORDER BY created_at DESC`]); // sqlManyForOrg already sets RLS context
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1700,8 +2029,9 @@ app.post("/api/kb", async (req, res) => {
   }
   try {
     await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS tertiary TEXT`.catch(()=>{});
     const rows = await sql`
-      INSERT INTO kb_documents (org_id, name, category, sub_category, size_kb, chunks, content)
+      INSERT INTO kb_documents (org_id, name, category, sub_category, tertiary, size_kb, chunks, content)
       VALUES (${org_id}, ${name}, ${category}, ${sub_category}, ${size_kb}, ${chunks || 0}, ${req.body.content || null})
       RETURNING *
     `;
@@ -1712,21 +2042,23 @@ app.post("/api/kb", async (req, res) => {
 });
 
 app.patch("/api/kb/:id", async (req, res) => {
-  const { name, category, sub_category, chunks, status, org_id, content } = req.body;
+  const { name, category, sub_category, tertiary, chunks, status, org_id, content } = req.body;
   try {
     if (org_id) {
       const check = await sql`SELECT id FROM kb_documents WHERE id = ${req.params.id} AND org_id = ${org_id} LIMIT 1`;
       if (!check.length) return res.status(403).json({ error: "Not authorised" });
     }
     await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS tertiary TEXT`.catch(()=>{});
     const rows = await sql`
       UPDATE kb_documents SET
-        name         = COALESCE(${name},         name),
-        category     = COALESCE(${category},     category),
-        sub_category = COALESCE(${sub_category}, sub_category),
+        name         = CASE WHEN ${name}         IS NOT NULL THEN ${name}         ELSE name END,
+        category     = CASE WHEN ${category}     IS NOT NULL THEN NULLIF(${category},'')     ELSE category END,
+        sub_category = CASE WHEN ${sub_category} IS NOT NULL THEN NULLIF(${sub_category},'') ELSE sub_category END,
+        tertiary     = CASE WHEN ${tertiary}     IS NOT NULL THEN NULLIF(${tertiary},'')     ELSE tertiary END,
         chunks       = COALESCE(${chunks},       chunks),
         status       = COALESCE(${status},       status),
-        content      = COALESCE(${content},      content),
+        content      = CASE WHEN ${content}      IS NOT NULL THEN ${content}      ELSE content END,
         updated_at   = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
@@ -1890,9 +2222,13 @@ app.post("/api/handoff", async (req, res) => {
     visitorName,
     visitorPhone,
     visitorCompany,
+    visitorLocation: widgetLocation,
     page,
+    url,
     history,
   } = req.body;
+
+  console.log(`[Handoff] ▶ tenantId="${tenantId}" existingConvId="${existingConvId||"none"}" visitor="${visitorName||visitorEmail||"anon"}"`);
 
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
 
@@ -1935,11 +2271,46 @@ app.post("/api/handoff", async (req, res) => {
   const visitorLabel = visitorName || visitorEmail || "A visitor";
 
   // ── Resolve org UUID ──────────────────────────────────────────────────
-  let resolvedOrgId = null;
-  try {
-    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
-    if (orgs.length) resolvedOrgId = orgs[0].id;
-  } catch (e) {}
+  let resolvedOrgId = await resolveOrgId(tenantId);
+  console.log(`[Handoff] org lookup → tenantId="${tenantId}" resolvedOrgId="${resolvedOrgId||"NOT FOUND"}"`);
+  if (!resolvedOrgId) {
+    console.error(`[Handoff] CRITICAL: cannot resolve org for tenantId="${tenantId}" — conv will NOT be created`);
+  }
+
+  // ── Resolve visitor location ─────────────────────────────────────────
+  let resolvedLocation = widgetLocation || null;
+  if (!resolvedLocation) {
+    try {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
+      if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
+        // Try ip-api.com first (generous free tier)
+        let geoOk = false;
+        try {
+          const geoR = await fetch(`http://ip-api.com/json/${ip}?fields=status,city,regionName,country`);
+          if (geoR.ok) {
+            const geo = await geoR.json();
+            if (geo.status === "success" && (geo.city || geo.country)) {
+              resolvedLocation = [geo.city, geo.regionName, geo.country].filter(Boolean).join(", ");
+              geoOk = true;
+              console.log(`[Handoff] geo (ip-api): "${resolvedLocation}" ip="${ip}"`);
+            }
+          }
+        } catch (_) {}
+        if (!geoOk) {
+          try {
+            const geoR2 = await fetch(`https://ipapi.co/${ip}/json/`);
+            if (geoR2.ok) {
+              const geo2 = await geoR2.json();
+              if (geo2.city || geo2.country_name) {
+                resolvedLocation = [geo2.city, geo2.region, geo2.country_name].filter(Boolean).join(", ");
+                console.log(`[Handoff] geo (ipapi.co): "${resolvedLocation}" ip="${ip}"`);
+              }
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
 
   // ── Load agents from DB ───────────────────────────────────────────────
   let agentsList = [];
@@ -1954,15 +2325,29 @@ app.post("/api/handoff", async (req, res) => {
   try {
     if (!conversationId && resolvedOrgId) {
       const convRows = await sql`
-        INSERT INTO conversations (org_id, visitor_name, visitor_email, page, status)
-        VALUES (${resolvedOrgId}, ${visitorLabel}, ${visitorEmail || null}, ${page || "/"}, 'handoff')
-        RETURNING id
+        INSERT INTO conversations (org_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status)
+        VALUES (${resolvedOrgId}, ${visitorLabel}, ${visitorEmail || null}, ${visitorPhone || null}, ${visitorCompany || null}, ${resolvedLocation || null}, ${page || "/"}, ${("Handoff: " + (visitorLabel || "visitor")).slice(0,80)}, 'handoff')
+        RETURNING *
       `;
       conversationId = convRows[0]?.id;
+      console.log(`[Handoff] created conv id="${conversationId}" org="${resolvedOrgId}" loc="${resolvedLocation||"none"}"`)
     } else if (conversationId) {
-      await sql`UPDATE conversations SET status = 'handoff', updated_at = NOW() WHERE id = ${conversationId}`;
+      await sql`
+        UPDATE conversations SET
+          status           = 'handoff',
+          visitor_name     = COALESCE(NULLIF(${visitorLabel},''), visitor_name),
+          visitor_email    = COALESCE(${visitorEmail||null}, visitor_email),
+          visitor_phone    = COALESCE(${visitorPhone||null}, visitor_phone),
+          visitor_company  = COALESCE(${visitorCompany||null}, visitor_company),
+          visitor_location = COALESCE(${resolvedLocation||null}, visitor_location),
+          updated_at       = NOW()
+        WHERE id = ${conversationId}
+      `;
+      console.log(`[Handoff] updated conv id="${conversationId}" status=handoff loc="${resolvedLocation||"none"}"`)
+    } else {
+      console.log(`[Handoff] WARNING: no conversationId and no resolvedOrgId — conv not created!`);
     }
-  } catch (e) {}
+  } catch (e) { console.error("[Handoff] conv upsert error:", e.message); }
 
   // ── Build magic link ──────────────────────────────────────────────────
   const handoffToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -2449,8 +2834,8 @@ async function runTrialScheduler() {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: auth },
           body: JSON.stringify({
-            to: [{ email: org.email, name: org.name || "Tenant" }],
-            from: { email: cs.username, name: cs.smsSender || "Hindle Consultants" },
+            to: [{ email: org.email, name: org.name || "Tenant", list_id: 0 }],
+            from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: cs.emailName||cs.smsSender||"Hindle Consultants" },
             subject,
             body: htmlBody,
           }),
