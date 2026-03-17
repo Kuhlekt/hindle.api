@@ -1704,16 +1704,21 @@ app.post("/api/agents", async (req, res) => {
 });
 
 app.patch("/api/agents/:id", async (req, res) => {
-  const { name, email, mobile, role, status, sms_alerts } = req.body;
+  const { name, email, mobile, role, status, sms_alerts, restrict_to_mine } = req.body;
   try {
+    // Auto-add restrict_to_mine column if not exists
+    await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS restrict_to_mine BOOLEAN DEFAULT false`.catch(()=>{});
     const rows = await sql`
       UPDATE agents SET
-        name       = COALESCE(${name},       name),
-        email      = COALESCE(${email},      email),
-        mobile     = COALESCE(${mobile},     mobile),
-        role       = COALESCE(${role},       role),
-        status     = COALESCE(${status},     status),
-        sms_alerts = COALESCE(${sms_alerts}, sms_alerts)
+        name             = COALESCE(${name},       name),
+        email            = COALESCE(${email},      email),
+        mobile           = COALESCE(${mobile},     mobile),
+        role             = COALESCE(${role},       role),
+        status           = COALESCE(${status},     status),
+        sms_alerts       = COALESCE(${sms_alerts}, sms_alerts),
+        restrict_to_mine = CASE WHEN ${restrict_to_mine !== undefined ? restrict_to_mine : null} IS NOT NULL
+                                THEN ${restrict_to_mine !== undefined ? restrict_to_mine : null}
+                                ELSE restrict_to_mine END
       WHERE id = ${req.params.id}
       RETURNING *
     `;
