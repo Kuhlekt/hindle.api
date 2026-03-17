@@ -310,6 +310,16 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       }
       if (org) {
         await sql`UPDATE organisations SET status = 'paid', plan = ${planId || org.plan}, updated_at = NOW() WHERE id = ${org.id}`;
+        // Snapshot plan at time of payment
+        try {
+          const [sCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+          const sSc = sCfg?.config?._superConfig || {};
+          const sApl = sSc.planLimits || null;
+          const sPlan = planId || org.plan;
+          const sPlanBase = (sApl && sApl[sPlan]) || PLAN_LIMITS[sPlan] || PLAN_LIMITS.free;
+          const sSnap = { plan: sPlan, snapped_at: new Date().toISOString(), limits: { ...sPlanBase }, features: sSc.planFeatures ? (sSc.planFeatures[sPlan] || []) : [] };
+          await sql`UPDATE organisations SET plan_snapshot = ${JSON.stringify(sSnap)} WHERE id = ${org.id}`.catch(()=>{});
+        } catch (_) {}
         if (promoCode) {
           const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
           if (cfg?.config?._superConfig?.promoCodes) {
@@ -879,6 +889,25 @@ app.post("/api/kb/import-mapped", async (req, res) => {
 });
 
 // Also add tertiary to GET /api/kb so conversations panel can use it
+
+
+// ── Tenant plan snapshot endpoint ─────────────────────────────────────────────
+// Returns the plan snapshot locked at signup time for a given org
+app.get("/api/plan-snapshot/:orgId", async (req, res) => {
+  try {
+    const orgId = await resolveOrgId(req.params.orgId).catch(() => req.params.orgId);
+    const [org] = await sql`SELECT plan, plan_snapshot, custom_limits FROM organisations WHERE id = ${orgId} LIMIT 1`.catch(()=>[null]);
+    if (!org) return res.status(404).json({ error: "Not found" });
+    // If no snapshot yet, build one from current platform config
+    if (!org.plan_snapshot) {
+      const apl = await getAdminPlanLimits();
+      const planBase = (apl && apl[org.plan]) || PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
+      return res.json({ plan: org.plan, limits: planBase, features: [], snapped_at: null, is_live: true });
+    }
+    res.json({ ...org.plan_snapshot, is_live: false });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 
 // ── SMTP Test endpoint ────────────────────────────────────────────────────────
@@ -1487,7 +1516,9 @@ app.post("/api/admin-settings", async (req, res) => {
       ...(profile         ? { _adminProfile:   profile       } : {}),
       ...(platform        ? { _platformConfig: platform      } : {}),
       ...(github          ? { _githubConfig:   github        } : {}),
-      ...(superConfig     ? { _superConfig:    superConfig   } : {}),
+      // Deep-merge _superConfig so partial saves (e.g. planFeatures only) 
+      // don't wipe clicksend, planLimits, prices etc.
+      ...(superConfig ? { _superConfig: { ...(existing._superConfig||{}), ...superConfig } } : {}),
       ...(adminPassword   ? { _adminPassword:  adminPassword } : {}),
       ...(adminAccounts   ? { _adminAccounts:  adminAccounts } : {}),
     };
@@ -1569,6 +1600,21 @@ app.post("/api/tenants", async (req, res) => {
       RETURNING *
     `;
     const org = rows[0];
+    // Snapshot current plan features+limits at time of creation
+    try {
+      const [platCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+      const sc = platCfg?.config?._superConfig || {};
+      const apl = sc.planLimits || null;
+      const planBase = (apl && apl[plan]) || PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+      const planFeatures = sc.planFeatures || null;
+      const snapshot = {
+        plan,
+        snapped_at: new Date().toISOString(),
+        limits: { ...planBase },
+        features: planFeatures ? (planFeatures[plan] || []) : [],
+      };
+      await sql`UPDATE organisations SET plan_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${org.id}`.catch(()=>{});
+    } catch (_) {}
     res.status(201).json(org);
     // Send welcome email (fire-and-forget)
     try {
@@ -2694,6 +2740,7 @@ function getEffectiveLimits(org, adminPlanLimits) {
   try{
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS account_notes TEXT`;
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS custom_limits JSONB DEFAULT '{}'`;
+    await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS plan_snapshot JSONB DEFAULT NULL`;
   }catch(_){}
 })();
 
@@ -2771,6 +2818,7 @@ app.get("/api/tenants/:id/usage", async (req, res) => {
       plan, limits,
       plan_limits: planLimits, // base plan limits (no custom overrides) for display
       custom_limits: org.custom_limits || {},
+      plan_snapshot: org.plan_snapshot || null,
       account_notes: org.account_notes || "",
       usage: {
         agents: agentCount?.count || 0,
@@ -2798,6 +2846,15 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
         return r;
       });
       await writeAudit(org.id, "plan_changed", `Plan changed to ${plan}${note?": "+note:""}`, { from: org.plan, to: plan });
+      // Snapshot plan limits+features at time of change
+      try {
+        const [snCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+        const snSc = snCfg?.config?._superConfig || {};
+        const snApl = snSc.planLimits || null;
+        const snBase = (snApl && snApl[plan]) || PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+        const snSnap = { plan, snapped_at: new Date().toISOString(), limits: { ...snBase }, features: snSc.planFeatures ? (snSc.planFeatures[plan] || []) : [], changed_by: "admin", note: note||"" };
+        await sql`UPDATE organisations SET plan_snapshot = ${JSON.stringify(snSnap)} WHERE id = ${org.id}`.catch(()=>{});
+      } catch(_) {}
     } else if (action === "extend_trial") {
       const days = parseInt(trialDays) || 7;
       [updated] = await sql`UPDATE organisations SET trial_day = GREATEST(0, COALESCE(trial_day,0) - ${days}), status = 'trial' WHERE id = ${org.id} RETURNING *`.catch(async()=>{
@@ -2841,6 +2898,20 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
           return sql`UPDATE organisations SET account_notes = ${req.body.notes || null} WHERE id = ${org.id} RETURNING *`;
         });
       await writeAudit(org.id, "notes_updated", "Account notes updated by admin", {});
+    } else if (action === "snapshot_plan") {
+      // Manually snapshot current plan limits+features for this tenant
+      const apl = await getAdminPlanLimits();
+      const planBase = (apl && apl[org.plan]) || PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
+      const [platCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+      const sc = platCfg?.config?._superConfig || {};
+      const snapshot = {
+        plan: org.plan,
+        snapped_at: new Date().toISOString(),
+        limits: { ...planBase },
+        features: sc.planFeatures ? (sc.planFeatures[org.plan] || []) : [],
+      };
+      [updated] = await sql`UPDATE organisations SET plan_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${org.id} RETURNING *`;
+      await writeAudit(org.id, "plan_snapshotted", `Plan snapshot taken for ${org.plan}`, { plan: org.plan, limits: planBase });
     } else {
       return res.status(400).json({ error: "Unknown action" });
     }
