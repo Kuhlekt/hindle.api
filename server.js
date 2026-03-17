@@ -1516,9 +1516,10 @@ app.post("/api/admin-settings", async (req, res) => {
       ...(profile         ? { _adminProfile:   profile       } : {}),
       ...(platform        ? { _platformConfig: platform      } : {}),
       ...(github          ? { _githubConfig:   github        } : {}),
-      // Deep-merge _superConfig so partial saves (e.g. planFeatures only) 
-      // don't wipe clicksend, planLimits, prices etc.
+      // Deep-merge _superConfig so partial saves don't wipe other keys
       ...(superConfig ? { _superConfig: { ...(existing._superConfig||{}), ...superConfig } } : {}),
+      // Mirror clicksend to top-level for backward-compat with tenant-config path
+      ...(superConfig?.clicksend ? { clicksend: { ...(existing.clicksend||{}), ...superConfig.clicksend } } : {}),
       ...(adminPassword   ? { _adminPassword:  adminPassword } : {}),
       ...(adminAccounts   ? { _adminAccounts:  adminAccounts } : {}),
     };
