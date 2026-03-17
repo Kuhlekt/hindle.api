@@ -1779,7 +1779,12 @@ app.post("/api/conversations", async (req, res) => {
           const geo = await geoR.json();
           if (geo.city || geo.country_name) {
             resolvedLocation = [geo.city, geo.region, geo.country_name].filter(Boolean).join(", ");
+            console.log(`[Conversations POST] geo: "${resolvedLocation}" ip="${ip}"`);
+          } else {
+            console.log(`[Conversations POST] geo: no city/country for ip="${ip}" response=${JSON.stringify(geo).slice(0,200)}`);
           }
+        } else {
+          console.log(`[Conversations POST] geo: ipapi returned ${geoR.status} for ip="${ip}"`);
         }
       }
     } catch (_) {}
@@ -2175,7 +2180,9 @@ app.post("/api/handoff", async (req, res) => {
     visitorName,
     visitorPhone,
     visitorCompany,
+    visitorLocation: widgetLocation,
     page,
+    url,
     history,
   } = req.body;
 
@@ -2228,6 +2235,24 @@ app.post("/api/handoff", async (req, res) => {
     console.error(`[Handoff] CRITICAL: cannot resolve org for tenantId="${tenantId}" — conv will NOT be created`);
   }
 
+  // ── Resolve visitor location ─────────────────────────────────────────
+  let resolvedLocation = widgetLocation || null;
+  if (!resolvedLocation) {
+    try {
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
+      if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
+        const geoR = await fetch(`https://ipapi.co/${ip}/json/`);
+        if (geoR.ok) {
+          const geo = await geoR.json();
+          if (geo.city || geo.country_name) {
+            resolvedLocation = [geo.city, geo.region, geo.country_name].filter(Boolean).join(", ");
+            console.log(`[Handoff] geo resolved: "${resolvedLocation}" for ip="${ip}"`);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
   // ── Load agents from DB ───────────────────────────────────────────────
   let agentsList = [];
   try {
@@ -2241,15 +2266,25 @@ app.post("/api/handoff", async (req, res) => {
   try {
     if (!conversationId && resolvedOrgId) {
       const convRows = await sql`
-        INSERT INTO conversations (org_id, visitor_name, visitor_email, page, status)
-        VALUES (${resolvedOrgId}, ${visitorLabel}, ${visitorEmail || null}, ${page || "/"}, 'handoff')
-        RETURNING id
+        INSERT INTO conversations (org_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status)
+        VALUES (${resolvedOrgId}, ${visitorLabel}, ${visitorEmail || null}, ${visitorPhone || null}, ${visitorCompany || null}, ${resolvedLocation || null}, ${page || "/"}, ${("Handoff: " + (visitorLabel || "visitor")).slice(0,80)}, 'handoff')
+        RETURNING *
       `;
       conversationId = convRows[0]?.id;
-      console.log(`[Handoff] created new conv id="${conversationId}" org_id="${resolvedOrgId}"`);
+      console.log(`[Handoff] created conv id="${conversationId}" org="${resolvedOrgId}" loc="${resolvedLocation||"none"}"`)
     } else if (conversationId) {
-      await sql`UPDATE conversations SET status = 'handoff', updated_at = NOW() WHERE id = ${conversationId}`;
-      console.log(`[Handoff] updated existing conv id="${conversationId}" → status=handoff`);
+      await sql`
+        UPDATE conversations SET
+          status           = 'handoff',
+          visitor_name     = COALESCE(NULLIF(${visitorLabel},''), visitor_name),
+          visitor_email    = COALESCE(${visitorEmail||null}, visitor_email),
+          visitor_phone    = COALESCE(${visitorPhone||null}, visitor_phone),
+          visitor_company  = COALESCE(${visitorCompany||null}, visitor_company),
+          visitor_location = COALESCE(${resolvedLocation||null}, visitor_location),
+          updated_at       = NOW()
+        WHERE id = ${conversationId}
+      `;
+      console.log(`[Handoff] updated conv id="${conversationId}" status=handoff loc="${resolvedLocation||"none"}"`)
     } else {
       console.log(`[Handoff] WARNING: no conversationId and no resolvedOrgId — conv not created!`);
     }
