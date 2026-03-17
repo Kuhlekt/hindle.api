@@ -1774,17 +1774,33 @@ app.post("/api/conversations", async (req, res) => {
     try {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
       if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
-        const geoR = await fetch(`https://ipapi.co/${ip}/json/`);
-        if (geoR.ok) {
-          const geo = await geoR.json();
-          if (geo.city || geo.country_name) {
-            resolvedLocation = [geo.city, geo.region, geo.country_name].filter(Boolean).join(", ");
-            console.log(`[Conversations POST] geo: "${resolvedLocation}" ip="${ip}"`);
-          } else {
-            console.log(`[Conversations POST] geo: no city/country for ip="${ip}" response=${JSON.stringify(geo).slice(0,200)}`);
+        // Try ip-api.com first (generous free tier, no auth needed)
+        let geoResolved = false;
+        try {
+          const geoR = await fetch(`http://ip-api.com/json/${ip}?fields=status,city,regionName,country`);
+          if (geoR.ok) {
+            const geo = await geoR.json();
+            if (geo.status === "success" && (geo.city || geo.country)) {
+              resolvedLocation = [geo.city, geo.regionName, geo.country].filter(Boolean).join(", ");
+              geoResolved = true;
+              console.log(`[Conversations POST] geo (ip-api): "${resolvedLocation}" ip="${ip}"`);
+            }
           }
-        } else {
-          console.log(`[Conversations POST] geo: ipapi returned ${geoR.status} for ip="${ip}"`);
+        } catch (_) {}
+        // Fallback to ipapi.co
+        if (!geoResolved) {
+          try {
+            const geoR2 = await fetch(`https://ipapi.co/${ip}/json/`);
+            if (geoR2.ok) {
+              const geo2 = await geoR2.json();
+              if (geo2.city || geo2.country_name) {
+                resolvedLocation = [geo2.city, geo2.region, geo2.country_name].filter(Boolean).join(", ");
+                console.log(`[Conversations POST] geo (ipapi.co): "${resolvedLocation}" ip="${ip}"`);
+              } else {
+                console.log(`[Conversations POST] geo: no result from either provider ip="${ip}"`);
+              }
+            }
+          } catch (_) {}
         }
       }
     } catch (_) {}
@@ -2241,13 +2257,30 @@ app.post("/api/handoff", async (req, res) => {
     try {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
       if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
-        const geoR = await fetch(`https://ipapi.co/${ip}/json/`);
-        if (geoR.ok) {
-          const geo = await geoR.json();
-          if (geo.city || geo.country_name) {
-            resolvedLocation = [geo.city, geo.region, geo.country_name].filter(Boolean).join(", ");
-            console.log(`[Handoff] geo resolved: "${resolvedLocation}" for ip="${ip}"`);
+        // Try ip-api.com first (generous free tier)
+        let geoOk = false;
+        try {
+          const geoR = await fetch(`http://ip-api.com/json/${ip}?fields=status,city,regionName,country`);
+          if (geoR.ok) {
+            const geo = await geoR.json();
+            if (geo.status === "success" && (geo.city || geo.country)) {
+              resolvedLocation = [geo.city, geo.regionName, geo.country].filter(Boolean).join(", ");
+              geoOk = true;
+              console.log(`[Handoff] geo (ip-api): "${resolvedLocation}" ip="${ip}"`);
+            }
           }
+        } catch (_) {}
+        if (!geoOk) {
+          try {
+            const geoR2 = await fetch(`https://ipapi.co/${ip}/json/`);
+            if (geoR2.ok) {
+              const geo2 = await geoR2.json();
+              if (geo2.city || geo2.country_name) {
+                resolvedLocation = [geo2.city, geo2.region, geo2.country_name].filter(Boolean).join(", ");
+                console.log(`[Handoff] geo (ipapi.co): "${resolvedLocation}" ip="${ip}"`);
+              }
+            }
+          } catch (_) {}
         }
       }
     } catch (_) {}
