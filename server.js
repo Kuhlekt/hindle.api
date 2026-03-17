@@ -73,6 +73,97 @@ function renderEmailTemplate(template, vars) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 
+// ── Universal email sender ─────────────────────────────────────────────────────
+// Tries tenant SMTP first, falls back to platform ClickSend.
+// smtpCfg: { host, port, secure, user, pass, fromEmail, fromName }
+// csCfg:   { username, apiKey, emailAddressId, emailName }
+async function sendEmail({ to, toName, subject, body, smtpCfg, csCfg }) {
+  // ── Path 1: Tenant SMTP via nodemailer ──────────────────────────────────────
+  if (smtpCfg?.host && smtpCfg?.user && smtpCfg?.pass) {
+    let nodemailer;
+    try { nodemailer = require("nodemailer"); } catch (_) {
+      console.warn("[Email] nodemailer not installed — run: npm install nodemailer");
+    }
+    if (nodemailer) {
+      try {
+        const transporter = nodemailer.createTransport({
+          host:   smtpCfg.host,
+          port:   parseInt(smtpCfg.port || 587, 10),
+          secure: smtpCfg.secure === true || smtpCfg.port == 465,
+          auth:   { user: smtpCfg.user, pass: smtpCfg.pass },
+          tls:    { rejectUnauthorized: false }, // allow self-signed for on-prem servers
+        });
+        await transporter.sendMail({
+          from:    `"${smtpCfg.fromName || "Support"}" <${smtpCfg.fromEmail || smtpCfg.user}>`,
+          to:      toName ? `"${toName}" <${to}>` : to,
+          subject,
+          html:    body,
+        });
+        console.log(`[Email] SMTP sent to ${to} via ${smtpCfg.host}`);
+        return { ok: true, provider: "smtp" };
+      } catch (e) {
+        console.error(`[Email] SMTP failed (${smtpCfg.host}):`, e.message);
+        // Fall through to ClickSend
+      }
+    }
+  }
+
+  // ── Path 2: Platform ClickSend fallback ─────────────────────────────────────
+  if (csCfg?.username && csCfg?.apiKey) {
+    const fromId = parseInt(csCfg.emailAddressId || csCfg.email_address_id || 0, 10);
+    if (!fromId) {
+      console.warn("[Email] ClickSend fallback skipped — emailAddressId not set");
+      return { ok: false, error: "No SMTP config and ClickSend emailAddressId not set" };
+    }
+    try {
+      const r = await fetch("https://rest.clicksend.com/v3/email/send", {
+        method: "POST",
+        headers: {
+          "Content-Type":  "application/json",
+          "Authorization": "Basic " + Buffer.from(csCfg.username + ":" + csCfg.apiKey).toString("base64"),
+        },
+        body: JSON.stringify({
+          to:      [{ email: to, name: toName || "Recipient", list_id: 0 }],
+          from:    { email_address_id: fromId, name: csCfg.emailName || "Hindle" },
+          subject,
+          body,
+        }),
+      });
+      const rawText = await r.text();
+      let d = {};
+      try { d = JSON.parse(rawText); } catch (_) {}
+      const ok = d?.response_code === "SUCCESS";
+      console.log(`[Email] ClickSend ${ok?"sent":"failed"} to ${to}: ${d?.response_code}`);
+      return { ok, provider: "clicksend", response: d };
+    } catch (e) {
+      console.error("[Email] ClickSend error:", e.message);
+      return { ok: false, error: e.message };
+    }
+  }
+
+  return { ok: false, error: "No email provider configured (no SMTP, no ClickSend)" };
+}
+
+// Helper: load email config for a given org (tenant SMTP + platform ClickSend fallback)
+async function loadEmailConfig(orgId) {
+  let smtpCfg  = null;
+  let csCfg    = null;
+  try {
+    // Tenant SMTP config
+    if (orgId) {
+      const [tenantRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`.catch(()=>[null]);
+      smtpCfg = tenantRow?.config?.smtp || null;
+    }
+    // Platform ClickSend (always loaded as fallback)
+    const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+    const platCs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
+    if (platCs.username) csCfg = platCs;
+  } catch (e) { console.error("[loadEmailConfig]", e.message); }
+  return { smtpCfg, csCfg };
+}
+// ──────────────────────────────────────────────────────────────────────────────
+
+
 // ── Canonical org UUID resolver ──────────────────────────────────────────────
 // Accepts: UUID (org.id), tenant_id string slug, or org email
 // Always returns the canonical UUID from organisations.id
@@ -114,7 +205,7 @@ function buildCsEmail({ to, toName, subject, body, fromId, fromName, listId }) {
 // Check optional packages for KB file extraction
 // Add to package.json: "busboy", "pdf-parse", "mammoth"
 // Then redeploy — Railway will install them automatically
-["busboy","pdf-parse","mammoth"].forEach(pkg => {
+["busboy","pdf-parse","mammoth","nodemailer"].forEach(pkg => {
   try { require(pkg); console.log(`[KB] ${pkg} ✓`); }
   catch (_) { console.log(`[KB] ${pkg} not installed — PDF/DOCX upload will return 503. Run: npm install ${pkg}`); }
 });
@@ -243,12 +334,8 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
             const body = tpl
               ? `<p>${renderEmailTemplate(tpl.body, { name: org.name, plan: planId, amount: session.amount_total ? (session.amount_total/100).toFixed(2) : "", last4: session.payment_method_types?.[0] || "" })}</p>`
               : `<p>Hi ${org.name || "there"},<br><br>Your payment has been confirmed and your <strong>${planId}</strong> plan is now active.<br><br>Thank you for choosing Hindle AI.</p>`;
-            await fetch("https://rest.clicksend.com/v3/email/send", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
-              body: JSON.stringify({ to: [{ email: org.email, name: org.name || "Customer", list_id: 0 }], from: { email_address_id: fromId, name: cs.emailName || "Hindle" }, subject, body }),
-            }).catch(e => console.error("[Stripe] Payment email error:", e.message));
-            console.log(`[Stripe] Payment confirmation email sent to ${org.email}`);
+            await sendEmail({ to: org.email, toName: org.name||"Customer", subject, body, smtpCfg: null, csCfg: cs })
+              .catch(e => console.error("[Stripe] Payment email error:", e.message));            console.log(`[Stripe] Payment confirmation email sent to ${org.email}`);
           }
         } catch (emailErr) { console.error("[Stripe] Payment email error:", emailErr.message); }
         // Write audit
@@ -355,39 +442,17 @@ app.post("/api/auth/2fa/send", async (req, res) => {
     const username = cs.username || process.env.CLICKSEND_USERNAME;
     const apiKey   = cs.apiKey   || process.env.CLICKSEND_API_KEY;
 
-    if (username && apiKey) {
-      const fromEmail = cs.fromEmail || cs.emailFrom || cs.username;
-      const fromName  = cs.fromName  || cs.emailName || "Hindle Consultants";
-      const body = JSON.stringify({
-        to: [{ email: email, name: "Admin", list_id: 0 }],
-        from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: fromName },
-        subject: "Your Hindle Admin login code",
-        body: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">
+    // Load org's SMTP config if available, fall back to platform ClickSend
+    const { smtpCfg: tfaSmtp, csCfg: tfaCs } = await loadEmailConfig(null); // 2FA = platform level
+    const tfaBody = `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">
   <h2 style="margin:0 0 8px">Login verification code</h2>
   <p style="color:#64748b;margin:0 0 20px">Enter this code to complete your sign in:</p>
   <div style="background:#f1f5f9;border-radius:8px;padding:20px;text-align:center;font-size:36px;font-weight:800;letter-spacing:8px;color:#1e293b">${code}</div>
   <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">This code expires in 10 minutes. If you did not request this, change your password immediately.</p>
-</div>`,
-      });
-      const r = await fetch("https://rest.clicksend.com/v3/email/send", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64"),
-        },
-        body,
-      });
-      const rawText = await r.text();
-      let d = {};
-      try { d = JSON.parse(rawText); } catch(_) {}
-      console.log("[2FA] ClickSend HTTP:", r.status, "| response_code:", d?.response_code, "| response_msg:", d?.response_msg);
-      console.log("[2FA] Full response:", rawText.slice(0, 500));
-      if (!r.ok || d?.response_code === "FAILED") {
-        console.error("[2FA] Email delivery failed — check email_address_id and verified sender in ClickSend");
-      }
-    } else {
-      // No ClickSend — log code for dev (remove in prod)
-      console.log(`[2FA] CODE for ${email}: ${code} (ClickSend not configured)`);
+</div>`;
+    const tfaResult = await sendEmail({ to: email, toName: "Admin", subject: "Your Hindle Admin login code", body: tfaBody, smtpCfg: tfaSmtp, csCfg: tfaCs });
+    if (!tfaResult.ok) {
+      console.log(`[2FA] CODE for ${email}: ${code} (email failed: ${tfaResult.error||"unknown"})`);
     }
   } catch (e) {
     console.error("[2FA] Email error:", e.message);
@@ -557,26 +622,13 @@ app.post("/api/conversations/:id/email-reply", async (req, res) => {
   const { to, subject, body, agentName } = req.body;
   if (!to || !body) return res.status(400).json({ error: "to and body required" });
   try {
-    // Get org ClickSend config
     const [conv] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`;
     if (!conv) return res.status(404).json({ error: "Conversation not found" });
-    const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${conv.org_id} LIMIT 1`.catch(()=>[null]);
-    const [platCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
-    const cs = cfg?.config?.clicksend || platCfg?.config?.clicksend || {};
-    const username = cs.username || process.env.CLICKSEND_USERNAME;
-    const apiKey = cs.apiKey || process.env.CLICKSEND_API_KEY;
-    const fromEmail = cs.emailFrom || cs.emailFrom || cs.username;
-    const fromName = cs.emailName || agentName || "Support Team";
-    if (!username || !apiKey) return res.status(503).json({ error: "Email not configured" });
-    const r = await fetch("https://rest.clicksend.com/v3/email/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(username + ":" + apiKey).toString("base64") },
-      body: JSON.stringify(buildCsEmail({ to, toName:"Customer", subject:subject||"Re: Your support request", body, fromId:cs.emailAddressId||cs.email_address_id||1, fromName, listId:0 })),
-    });
-    const d = await r.json();
-    // Save as agent message
-    await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${req.params.id}, 'agent', ${agentName||'Agent'}, ${"[Email sent to " + to + "]: " + body.replace(/<[^>]+>/g,"").slice(0,200)})`;
-    res.json({ ok: true, result: d?.response_code });
+    const { smtpCfg, csCfg } = await loadEmailConfig(conv.org_id);
+    const result = await sendEmail({ to, toName: "Customer", subject: subject || "Re: Your support request", body, smtpCfg, csCfg });
+    if (!result.ok) return res.status(503).json({ error: result.error || "Email send failed" });
+    await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${req.params.id}, 'agent', ${agentName||'Agent'}, ${("[Email sent to " + to + "]: " + body.replace(/<[^>]+>/g,"").slice(0,200))})`;
+    res.json({ ok: true, provider: result.provider });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -829,6 +881,39 @@ app.post("/api/kb/import-mapped", async (req, res) => {
 // Also add tertiary to GET /api/kb so conversations panel can use it
 
 
+// ── SMTP Test endpoint ────────────────────────────────────────────────────────
+app.post("/api/test-smtp", async (req, res) => {
+  const { orgId, smtp, to } = req.body;
+  if (!smtp?.host || !smtp?.user || !smtp?.pass) return res.json({ ok: false, error: "Host, user and password required" });
+  if (!to) return res.json({ ok: false, error: "to address required" });
+  let nodemailer;
+  try { nodemailer = require("nodemailer"); } catch (_) {
+    return res.json({ ok: false, error: "nodemailer not installed — run: npm install nodemailer" });
+  }
+  try {
+    const transporter = nodemailer.createTransport({
+      host:   smtp.host,
+      port:   parseInt(smtp.port || 587, 10),
+      secure: smtp.secure === true || smtp.port == 465,
+      auth:   { user: smtp.user, pass: smtp.pass },
+      tls:    { rejectUnauthorized: false },
+    });
+    await transporter.verify();
+    await transporter.sendMail({
+      from:    `"${smtp.fromName || "Hindle Test"}" <${smtp.fromEmail || smtp.user}>`,
+      to,
+      subject: "Hindle SMTP Test — Connection Verified",
+      html:    `<p>SMTP connection verified successfully.<br><br>Host: <strong>${smtp.host}:${smtp.port}</strong><br>From: <strong>${smtp.fromEmail || smtp.user}</strong></p>`,
+    });
+    res.json({ ok: true, message: `Email sent to ${to} via ${smtp.host}` });
+  } catch (e) {
+    console.error("[SMTP Test] Error:", e.message);
+    res.json({ ok: false, error: e.message });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 // Quick diagnostic — count conversations for an org
 
 // ─────────────────────────────────────────────
@@ -982,11 +1067,8 @@ app.post("/api/offline-message", async (req, res) => {
 Page: ${page || "/"}
 
 Reply at: https://chatbot.hindleconsultants.com`;
-        await fetch("https://rest.clicksend.com/v3/email/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
-          body: JSON.stringify({ to: [{ email: toEmail, name: org.name || "Admin", list_id: 0 }], from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: cs.fromName||cs.emailName||"Hindle" }, subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>` }),
-        }).catch(()=>{});
+        const { smtpCfg: offSmtp, csCfg: offCs } = await loadEmailConfig(org.id).catch(()=>({smtpCfg:null,csCfg:cs}));
+        await sendEmail({ to: toEmail, toName: org.name||"Admin", subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>`, smtpCfg: offSmtp, csCfg: offCs }).catch(()=>{});
       }
     } catch (_) {}
 
@@ -1501,11 +1583,8 @@ app.post("/api/tenants", async (req, res) => {
         const body = tpl
           ? `<p>${renderEmailTemplate(tpl.body, vars)}</p>`
           : `<p>Hi ${name || "there"},<br><br>Your Hindle AI account is ready. Log in at <a href="https://chatbot.hindleconsultants.com">chatbot.hindleconsultants.com</a> to get started.<br><br>Your plan: <strong>${plan}</strong></p>`;
-        await fetch("https://rest.clicksend.com/v3/email/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
-          body: JSON.stringify({ to: [{ email, name: name || "Tenant", list_id: 0 }], from: { email_address_id: fromId, name: cs.emailName || "Hindle" }, subject: subj, body }),
-        }).catch(e => console.error("[Tenants] Welcome email error:", e.message));
+        await sendEmail({ to: email, toName: name||"Tenant", subject: subj, body, smtpCfg: null, csCfg: cs })
+          .catch(e => console.error("[Tenants] Welcome email error:", e.message));
         console.log(`[Tenants] Welcome email sent to ${email}`);
       }
     } catch (e) { console.error("[Tenants] Welcome email error:", e.message); }
@@ -2830,19 +2909,9 @@ async function runTrialScheduler() {
 </div>`;
 
       try {
-        const r = await fetch("https://rest.clicksend.com/v3/email/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: auth },
-          body: JSON.stringify({
-            to: [{ email: org.email, name: org.name || "Tenant", list_id: 0 }],
-            from: { email_address_id: parseInt(cs.emailAddressId||cs.email_address_id||1,10), name: cs.emailName||cs.smsSender||"Hindle Consultants" },
-            subject,
-            body: htmlBody,
-          }),
-          signal: AbortSignal.timeout(10000),
-        });
-        const d = await r.json();
-        const sent = d?.response_code === "SUCCESS" || r.ok;
+        const { smtpCfg: trSmtp, csCfg: trCs } = await loadEmailConfig(org.id).catch(()=>({smtpCfg:null,csCfg:cs}));
+        const trResult = await sendEmail({ to: org.email, toName: org.name||"Tenant", subject, body: htmlBody, smtpCfg: trSmtp, csCfg: trCs });
+        const sent = trResult.ok;
 
         // Mark this day as reminded
         const newReminded = [...reminded, day];
