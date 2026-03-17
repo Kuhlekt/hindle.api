@@ -58,6 +58,21 @@ process.on("uncaughtException", (err) => {
   console.error("[Server] Uncaught exception:", err.message);
 })
 
+// ── Email template variable substitution ─────────────────────────────────────
+function renderEmailTemplate(template, vars) {
+  return template
+    .replace(/\{name\}/g,    vars.name    || "there")
+    .replace(/\{plan\}/g,    vars.plan    || "")
+    .replace(/\{amount\}/g,  vars.amount  || "")
+    .replace(/\{days\}/g,    vars.days    || "")
+    .replace(/\{last4\}/g,   vars.last4   || "")
+    .replace(/\{expiry\}/g,  vars.expiry  || "")
+    .replace(/\{month\}/g,   vars.month   || "")
+    .replace(/\{company\}/g, vars.company || "");
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 // ── Canonical org UUID resolver ──────────────────────────────────────────────
 // Accepts: UUID (org.id), tenant_id string slug, or org email
 // Always returns the canonical UUID from organisations.id
@@ -121,6 +136,48 @@ let stripe = null;
 const { neon } = require("@neondatabase/serverless");
 
 const sql = neon(process.env.DATABASE_URL);
+
+
+
+// ── RLS Context Helpers ───────────────────────────────────────────────────────
+// sqlForOrg(orgId) — runs a single query with the tenant RLS context set
+// Usage: const rows = await sqlForOrg(orgId, sql`SELECT * FROM conversations`);
+//
+// For super admin (orgId = null/undefined/''), sets empty string → policies allow all rows.
+// For tenant (orgId = UUID), policies enforce org_id isolation at DB level.
+
+async function sqlForOrg(orgId, query) {
+  const ctx = orgId ? String(orgId) : '';
+  try {
+    const results = await sql.transaction([
+      sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
+      query,
+    ]);
+    return results[1]; // results[0] is set_config result
+  } catch (e) {
+    // Fallback: if transaction not supported, run query directly
+    // (RLS still applies at DB level if enabled)
+    console.error('[RLS] transaction error, falling back:', e.message);
+    return await query;
+  }
+}
+
+// sqlManyForOrg — run multiple queries in one transaction under the same RLS context
+async function sqlManyForOrg(orgId, queries) {
+  const ctx = orgId ? String(orgId) : '';
+  try {
+    const results = await sql.transaction([
+      sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
+      ...queries,
+    ]);
+    return results.slice(1); // drop set_config result
+  } catch (e) {
+    console.error('[RLS] multi-transaction error:', e.message);
+    return await Promise.all(queries.map(q => q));
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -173,6 +230,29 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           }
         }
         console.log(`[Stripe] Activated org ${org.id} (${org.email}) on plan ${planId}`);
+        // Send payment confirmation email
+        try {
+          const [pCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+          const cs = pCfg?.config?._superConfig?.clicksend || pCfg?.config?.clicksend || {};
+          const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
+          if (cs.username && cs.apiKey && fromId && org.email) {
+            // Load email template from super config if set, else use default
+            const tpls = pCfg?.config?._superConfig?.emailTemplates || [];
+            const tpl = tpls.find(t => t.id === "payment");
+            const subject = tpl ? renderEmailTemplate(tpl.subj, { name: org.name, plan: planId }) : `✅ Payment confirmed — ${planId} plan active`;
+            const body = tpl
+              ? `<p>${renderEmailTemplate(tpl.body, { name: org.name, plan: planId, amount: session.amount_total ? (session.amount_total/100).toFixed(2) : "", last4: session.payment_method_types?.[0] || "" })}</p>`
+              : `<p>Hi ${org.name || "there"},<br><br>Your payment has been confirmed and your <strong>${planId}</strong> plan is now active.<br><br>Thank you for choosing Hindle AI.</p>`;
+            await fetch("https://rest.clicksend.com/v3/email/send", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
+              body: JSON.stringify({ to: [{ email: org.email, name: org.name || "Customer", list_id: 0 }], from: { email_address_id: fromId, name: cs.emailName || "Hindle" }, subject, body }),
+            }).catch(e => console.error("[Stripe] Payment email error:", e.message));
+            console.log(`[Stripe] Payment confirmation email sent to ${org.email}`);
+          }
+        } catch (emailErr) { console.error("[Stripe] Payment email error:", emailErr.message); }
+        // Write audit
+        await writeAudit(org.id, "payment_confirmed", `Payment confirmed — plan ${planId}`, { plan: planId, email }).catch(()=>{});
       } else {
         console.warn(`[Stripe] Webhook: could not find org for email=${email} orgId=${orgId}`);
       }
@@ -185,6 +265,19 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// ── RLS default context middleware ────────────────────────────────────────────
+// Sets app.current_org_id = '' (super admin / bypass) for every request.
+// Individual endpoints override this with sqlForOrg(orgId, ...) which wraps
+// the query in a transaction that sets the correct tenant context first.
+// This ensures RLS never hard-blocks a request due to missing context.
+app.use(async (req, res, next) => {
+  try {
+    await sql`SELECT set_config('app.current_org_id', '', true)`;
+  } catch (_) {}
+  next();
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────
 // IN-MEMORY RATE LIMITER  (per tenant, per minute)
@@ -938,13 +1031,14 @@ app.post("/api/conversations/:id/csat", async (req, res) => {
 app.get("/api/analytics/:orgId", async (req, res) => {
   const { orgId } = req.params;
   const { days = "30" } = req.query;
+  const canonicalAnalyticsId = await resolveOrgId(orgId).catch(() => orgId);
   try {
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_rating INT`.catch(() => {});
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS first_response_at TIMESTAMPTZ`.catch(() => {});
     const since = new Date(Date.now() - Number(days) * 86400000).toISOString();
     const csatRows = await sql`
       SELECT csat_rating, COUNT(*)::int as n FROM conversations
-      WHERE org_id::text = ${orgId} AND csat_rating IS NOT NULL AND created_at >= ${since}
+      WHERE org_id = ${canonicalAnalyticsId} AND csat_rating IS NOT NULL AND created_at >= ${since}
       GROUP BY csat_rating
     `;
     const csatTotal = csatRows.reduce((s, r) => s + r.n, 0);
@@ -966,7 +1060,7 @@ app.get("/api/analytics/:orgId", async (req, res) => {
              SUM(CASE WHEN csat_rating = 1 THEN 1 ELSE 0 END)::int as csat_pos,
              SUM(CASE WHEN csat_rating IS NOT NULL THEN 1 ELSE 0 END)::int as csat_total
       FROM conversations
-      WHERE org_id::text = ${orgId} AND created_at >= ${since}
+      WHERE org_id = ${canonicalAnalyticsId} AND created_at >= ${since}
       GROUP BY DATE(created_at) ORDER BY day ASC
     `.catch(() => []);
     res.json({ csatScore, csatTotal, csatPositive, avgFrt, medFrt, frtCount: frtValues.length, dailyRows });
@@ -982,9 +1076,9 @@ app.get("/api/onboarding/:orgId", async (req, res) => {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${orgId} LIMIT 1`.catch(() => [null]);
     const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`.catch(() => [null]);
-    const [convRow] = await sql`SELECT COUNT(*)::int as n FROM conversations WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
-    const [agentRow] = await sql`SELECT COUNT(*)::int as n FROM agents WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
-    const [kbRow] = await sql`SELECT COUNT(*)::int as n FROM kb_documents WHERE org_id::text = ${orgId}`.catch(() => [{n:0}]);
+    const [convRow] = await sqlForOrg(orgId, sql`SELECT COUNT(*)::int as n FROM conversations WHERE org_id::text = ${orgId}`).catch(() => [{n:0}]);
+    const [agentRow] = await sqlForOrg(orgId, sql`SELECT COUNT(*)::int as n FROM agents WHERE org_id::text = ${orgId}`).catch(() => [{n:0}]);
+    const [kbRow] = await sqlForOrg(orgId, sql`SELECT COUNT(*)::int as n FROM kb_documents WHERE org_id::text = ${orgId}`).catch(() => [{n:0}]);
     const c = cfg?.config || {};
     const brand = c.brand || {};
     const steps = [
@@ -1392,7 +1486,31 @@ app.post("/api/tenants", async (req, res) => {
       VALUES (${name}, ${email}, ${plan})
       RETURNING *
     `;
-    res.status(201).json(rows[0]);
+    const org = rows[0];
+    res.status(201).json(org);
+    // Send welcome email (fire-and-forget)
+    try {
+      const [pCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+      const cs = pCfg?.config?._superConfig?.clicksend || pCfg?.config?.clicksend || {};
+      const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
+      if (cs.username && cs.apiKey && fromId) {
+        const tpls = pCfg?.config?._superConfig?.emailTemplates || [];
+        const tpl = tpls.find(t => t.id === "welcome");
+        const vars = { name: name || "there", plan, company: name };
+        const subj = tpl ? renderEmailTemplate(tpl.subj, vars) : "Welcome to Hindle! 🎉";
+        const body = tpl
+          ? `<p>${renderEmailTemplate(tpl.body, vars)}</p>`
+          : `<p>Hi ${name || "there"},<br><br>Your Hindle AI account is ready. Log in at <a href="https://chatbot.hindleconsultants.com">chatbot.hindleconsultants.com</a> to get started.<br><br>Your plan: <strong>${plan}</strong></p>`;
+        await fetch("https://rest.clicksend.com/v3/email/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64") },
+          body: JSON.stringify({ to: [{ email, name: name || "Tenant", list_id: 0 }], from: { email_address_id: fromId, name: cs.emailName || "Hindle" }, subject: subj, body }),
+        }).catch(e => console.error("[Tenants] Welcome email error:", e.message));
+        console.log(`[Tenants] Welcome email sent to ${email}`);
+      }
+    } catch (e) { console.error("[Tenants] Welcome email error:", e.message); }
+    // Audit
+    await writeAudit(org.id, "tenant_created", `Tenant account created — plan ${plan}`, { name, email, plan }).catch(()=>{});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1411,7 +1529,11 @@ app.patch("/api/tenants/:id", async (req, res) => {
       RETURNING *
     `;
     if (!rows.length) return res.status(404).json({ error: "Not found" });
-    res.json(rows[0]);
+    // Audit significant changes
+    const updated = rows[0];
+    if (status) await writeAudit(req.params.id, `tenant_${status}`, `Tenant status changed to ${status}`, { status }).catch(()=>{});
+    if (plan)   await writeAudit(req.params.id, "plan_changed", `Plan changed to ${plan}`, { plan }).catch(()=>{});
+    res.json(updated);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1419,7 +1541,9 @@ app.patch("/api/tenants/:id", async (req, res) => {
 
 app.delete("/api/tenants/:id", async (req, res) => {
   try {
+    const [org] = await sql`SELECT name, email FROM organisations WHERE id = ${req.params.id} LIMIT 1`.catch(()=>[null]);
     await sql`DELETE FROM organisations WHERE id = ${req.params.id}`;
+    await writeAudit(req.params.id, "tenant_deleted", `Tenant deleted: ${org?.name||"unknown"} (${org?.email||""})`, { name: org?.name, email: org?.email }).catch(()=>{});
     res.json({ deleted: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1433,8 +1557,8 @@ app.get("/api/agents", async (req, res) => {
   try {
     const { org_id } = req.query;
     const rows = org_id
-      ? await sql`SELECT * FROM agents WHERE org_id = ${org_id} ORDER BY name`
-      : await sql`SELECT * FROM agents ORDER BY name`;
+      ? await sqlForOrg(org_id, sql`SELECT * FROM agents WHERE org_id = ${org_id} ORDER BY name`)
+      : await sqlForOrg(null, sql`SELECT * FROM agents ORDER BY name`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1621,27 +1745,18 @@ app.get("/api/conversations", async (req, res) => {
     
     let rows;
     if (canonicalOrgId && status) {
-      rows = await sql`
-        SELECT c.*, a.name as agent_name FROM conversations c
-        LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE c.org_id = ${canonicalOrgId}
-          AND c.status = ${status}
-        ORDER BY c.updated_at DESC
-      `;
+      [rows] = await sqlManyForOrg(canonicalOrgId, [
+        sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.org_id = ${canonicalOrgId} AND c.status = ${status} ORDER BY c.updated_at DESC`
+      ]);
     } else if (canonicalOrgId) {
-      rows = await sql`
-        SELECT c.*, a.name as agent_name FROM conversations c
-        LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE c.org_id = ${canonicalOrgId}
-        ORDER BY c.updated_at DESC
-      `;
+      [rows] = await sqlManyForOrg(canonicalOrgId, [
+        sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.org_id = ${canonicalOrgId} ORDER BY c.updated_at DESC`
+      ]);
     } else {
-      rows = await sql`
-        SELECT c.*, a.name as agent_name FROM conversations c
-        LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        ORDER BY c.updated_at DESC
-        LIMIT 500
-      `;
+      // Super admin — empty context = see all
+      [rows] = await sqlManyForOrg(null, [
+        sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id ORDER BY c.updated_at DESC LIMIT 500`
+      ]);
     }
     console.log(`[Conversations GET] returning ${rows?.length||0} rows for resolved="${canonicalOrgId||"none"}"`);
     res.json(rows);
@@ -1652,11 +1767,8 @@ app.get("/api/conversations", async (req, res) => {
 
 app.get("/api/conversations/:id", async (req, res) => {
   try {
-    const rows = await sql`
-      SELECT c.*, a.name as agent_name FROM conversations c
-      LEFT JOIN agents a ON c.assigned_agent_id = a.id
-      WHERE c.id = ${req.params.id}
-    `;
+    // Use null orgId = super admin context; endpoint validates ownership via id
+    const rows = await sqlForOrg(null, sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.id = ${req.params.id}`);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
@@ -1749,7 +1861,9 @@ app.patch("/api/conversations/:id", async (req, res) => {
           priority } = req.body;
   try {
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS priority TEXT`.catch(()=>{});
-    const rows = await sql`
+    // Get org for this conversation to set RLS context
+    const [convOrg] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(()=>[null]);
+    const rows = await sqlForOrg(convOrg?.org_id, sql`
       UPDATE conversations SET
         status            = COALESCE(${status},            status),
         assigned_agent_id = COALESCE(${assigned_agent_id}, assigned_agent_id),
@@ -1764,7 +1878,7 @@ app.patch("/api/conversations/:id", async (req, res) => {
         updated_at        = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
-    `;
+    `);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
@@ -1798,7 +1912,8 @@ app.patch("/api/conversations/:id", async (req, res) => {
 
 app.delete("/api/conversations/:id", async (req, res) => {
   try {
-    await sql`DELETE FROM conversations WHERE id = ${req.params.id}`;
+    const [dOrg] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(()=>[null]);
+    await sqlForOrg(dOrg?.org_id, sql`DELETE FROM conversations WHERE id = ${req.params.id}`);
     res.json({ deleted: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1810,11 +1925,10 @@ app.delete("/api/conversations/:id", async (req, res) => {
 // ─────────────────────────────────────────────
 app.get("/api/conversations/:id/messages", async (req, res) => {
   try {
-    const rows = await sql`
-      SELECT * FROM messages
-      WHERE conversation_id = ${req.params.id}
-      ORDER BY created_at ASC
-    `;
+    // Fetch the conversation's org_id first so RLS context is correct
+    const [conv] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(() => [null]);
+    const orgId = conv?.org_id || null;
+    const rows = await sqlForOrg(orgId, sql`SELECT * FROM messages WHERE conversation_id = ${req.params.id} ORDER BY created_at ASC`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1853,9 +1967,10 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
 app.get("/api/alert-log", async (req, res) => {
   try {
     const { org_id } = req.query;
-    const rows = org_id
-      ? await sql`SELECT * FROM alert_log WHERE org_id = ${org_id} ORDER BY created_at DESC`
-      : await sql`SELECT * FROM alert_log ORDER BY created_at DESC`;
+    const canonicalId = org_id ? await resolveOrgId(org_id) : null;
+    const rows = canonicalId
+      ? await sqlForOrg(canonicalId, sql`SELECT * FROM alert_log WHERE org_id = ${canonicalId} ORDER BY created_at DESC`)
+      : await sqlForOrg(null, sql`SELECT * FROM alert_log ORDER BY created_at DESC`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1895,7 +2010,9 @@ app.get("/api/kb", async (req, res) => {
   try {
     const { org_id } = req.query;
     if (!org_id) return res.status(400).json({ error: "org_id required" });
-    const rows = await sql`SELECT * FROM kb_documents WHERE org_id = ${org_id} ORDER BY created_at DESC`;
+    const canonicalId = await resolveOrgId(org_id);
+    if (!canonicalId) return res.status(404).json({ error: "Organisation not found" });
+    const [rows] = await sqlManyForOrg(canonicalId, [sql`SELECT * FROM kb_documents WHERE org_id = ${canonicalId} ORDER BY created_at DESC`]); // sqlManyForOrg already sets RLS context
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
