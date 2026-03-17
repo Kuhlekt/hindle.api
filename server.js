@@ -58,6 +58,28 @@ process.on("uncaughtException", (err) => {
   console.error("[Server] Uncaught exception:", err.message);
 })
 
+// ── Canonical org UUID resolver ──────────────────────────────────────────────
+// Accepts: UUID (org.id), tenant_id string slug, or org email
+// Always returns the canonical UUID from organisations.id
+async function resolveOrgId(val) {
+  if (!val) return null;
+  try {
+    const rows = await sql`
+      SELECT id FROM organisations
+      WHERE id::text = ${val}
+         OR tenant_id = ${val}
+         OR LOWER(email) = LOWER(${val})
+      LIMIT 1
+    `;
+    return rows[0]?.id || null;
+  } catch (e) {
+    console.error("[resolveOrgId] error:", e.message);
+    return null;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 // ── ClickSend email helper ──────────────────────────────────────────────────
 // ClickSend v3 email API requires:
 //   from: { email_address_id: <numeric>, name: string }
@@ -106,6 +128,27 @@ app.use(cors());
 
 
 // Also add tertiary to GET /api/kb so conversations panel can use it
+
+// ── HANDOFF DIAGNOSTIC ─────────────────────────────────────────────────────
+// GET /api/debug/org?tenant=<any_value>
+app.get("/api/debug/org", async (req, res) => {
+  const val = req.query.tenant || req.query.org_id || "";
+  const result = { queried: val, steps: [] };
+  try {
+    const resolved = await resolveOrgId(val);
+    result.resolvedOrgId = resolved;
+    result.steps.push(`resolveOrgId("${val}") = "${resolved||"null"}"`);
+    if (resolved) {
+      const convs = await sql`SELECT id, status, visitor_name, updated_at FROM conversations WHERE org_id = ${resolved} ORDER BY updated_at DESC LIMIT 10`;
+      result.recent_conversations = convs;
+      result.steps.push(`Found ${convs.length} conversations for org`);
+      const handoffs = convs.filter(c => c.status === 'handoff');
+      result.steps.push(`Handoff status conversations: ${handoffs.length}`);
+    }
+  } catch(e) { result.error = e.message; }
+  res.json(result);
+});
+
 
 // ── CLICKSEND EMAIL DIAGNOSTIC — remove after debugging ──────────────────────
 // GET /api/debug/email?to=you@example.com
@@ -1663,21 +1706,26 @@ app.post("/api/invite-agent", async (req, res) => {
 app.get("/api/conversations", async (req, res) => {
   try {
     const { org_id, status } = req.query;
+    console.log(`[Conversations GET] org_id="${org_id||"none"}" status="${status||"none"}"`);
+    
+    // Always resolve to canonical UUID — handles slug, UUID, or email
+    let canonicalOrgId = org_id ? await resolveOrgId(org_id) : null;
+    console.log(`[Conversations GET] resolved="${canonicalOrgId||"none"}"`);
+    
     let rows;
-    if (org_id && status) {
+    if (canonicalOrgId && status) {
       rows = await sql`
         SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE (c.org_id::text = ${org_id} OR c.org_id::text = (SELECT id::text FROM organisations WHERE id::text = ${org_id} OR tenant_id = ${org_id} LIMIT 1))
+        WHERE c.org_id = ${canonicalOrgId}
           AND c.status = ${status}
         ORDER BY c.updated_at DESC
       `;
-    } else if (org_id) {
+    } else if (canonicalOrgId) {
       rows = await sql`
         SELECT c.*, a.name as agent_name FROM conversations c
         LEFT JOIN agents a ON c.assigned_agent_id = a.id
-        WHERE c.org_id::text = ${org_id}
-           OR c.org_id::text = (SELECT id::text FROM organisations WHERE id::text = ${org_id} OR tenant_id = ${org_id} LIMIT 1)
+        WHERE c.org_id = ${canonicalOrgId}
         ORDER BY c.updated_at DESC
       `;
     } else {
@@ -1688,6 +1736,7 @@ app.get("/api/conversations", async (req, res) => {
         LIMIT 500
       `;
     }
+    console.log(`[Conversations GET] returning ${rows?.length||0} rows for resolved="${canonicalOrgId||"none"}"`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1711,15 +1760,9 @@ app.get("/api/conversations/:id", async (req, res) => {
 app.post("/api/conversations", async (req, res) => {
   const { org_id, tenant_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status } = req.body;
   // Resolve org_id: widget sends tenant_id (= organisations.id UUID), dashboard sends org_id
-  let resolvedOrgId = org_id || null;
-  if (!resolvedOrgId && tenant_id) {
-    // tenant_id IS the org UUID — verify it exists
-    try {
-      const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenant_id} OR tenant_id = ${tenant_id} LIMIT 1`;
-      if (orgs.length) resolvedOrgId = orgs[0].id;
-    } catch (_) {}
-    if (!resolvedOrgId) resolvedOrgId = tenant_id;
-  }
+  let resolvedOrgId = await resolveOrgId(org_id || tenant_id);
+  // If still nothing, use the raw value as fallback (will fail gracefully)
+  if (!resolvedOrgId && (org_id || tenant_id)) resolvedOrgId = org_id || tenant_id;
   // Plan enforcement — only block if we can resolve the org
   if (resolvedOrgId) {
     const limitErr = await checkConvoLimit(resolvedOrgId);
@@ -2136,6 +2179,8 @@ app.post("/api/handoff", async (req, res) => {
     history,
   } = req.body;
 
+  console.log(`[Handoff] ▶ tenantId="${tenantId}" existingConvId="${existingConvId||"none"}" visitor="${visitorName||visitorEmail||"anon"}"`);
+
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
 
   // ── Load tenant config (with platform fallback for ClickSend creds) ──
@@ -2177,11 +2222,11 @@ app.post("/api/handoff", async (req, res) => {
   const visitorLabel = visitorName || visitorEmail || "A visitor";
 
   // ── Resolve org UUID ──────────────────────────────────────────────────
-  let resolvedOrgId = null;
-  try {
-    const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} OR id::text = ${tenantId} LIMIT 1`;
-    if (orgs.length) resolvedOrgId = orgs[0].id;
-  } catch (e) {}
+  let resolvedOrgId = await resolveOrgId(tenantId);
+  console.log(`[Handoff] org lookup → tenantId="${tenantId}" resolvedOrgId="${resolvedOrgId||"NOT FOUND"}"`);
+  if (!resolvedOrgId) {
+    console.error(`[Handoff] CRITICAL: cannot resolve org for tenantId="${tenantId}" — conv will NOT be created`);
+  }
 
   // ── Load agents from DB ───────────────────────────────────────────────
   let agentsList = [];
@@ -2201,10 +2246,14 @@ app.post("/api/handoff", async (req, res) => {
         RETURNING id
       `;
       conversationId = convRows[0]?.id;
+      console.log(`[Handoff] created new conv id="${conversationId}" org_id="${resolvedOrgId}"`);
     } else if (conversationId) {
       await sql`UPDATE conversations SET status = 'handoff', updated_at = NOW() WHERE id = ${conversationId}`;
+      console.log(`[Handoff] updated existing conv id="${conversationId}" → status=handoff`);
+    } else {
+      console.log(`[Handoff] WARNING: no conversationId and no resolvedOrgId — conv not created!`);
     }
-  } catch (e) {}
+  } catch (e) { console.error("[Handoff] conv upsert error:", e.message); }
 
   // ── Build magic link ──────────────────────────────────────────────────
   const handoffToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
