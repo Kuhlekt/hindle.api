@@ -129,99 +129,6 @@ app.use(cors());
 
 // Also add tertiary to GET /api/kb so conversations panel can use it
 
-// ── HANDOFF DIAGNOSTIC ─────────────────────────────────────────────────────
-// GET /api/debug/org?tenant=<any_value>
-app.get("/api/debug/org", async (req, res) => {
-  const val = req.query.tenant || req.query.org_id || "";
-  const result = { queried: val, steps: [] };
-  try {
-    const resolved = await resolveOrgId(val);
-    result.resolvedOrgId = resolved;
-    result.steps.push(`resolveOrgId("${val}") = "${resolved||"null"}"`);
-    if (resolved) {
-      const convs = await sql`SELECT id, status, visitor_name, updated_at FROM conversations WHERE org_id = ${resolved} ORDER BY updated_at DESC LIMIT 10`;
-      result.recent_conversations = convs;
-      result.steps.push(`Found ${convs.length} conversations for org`);
-      const handoffs = convs.filter(c => c.status === 'handoff');
-      result.steps.push(`Handoff status conversations: ${handoffs.length}`);
-    }
-  } catch(e) { result.error = e.message; }
-  res.json(result);
-});
-
-
-// ── CLICKSEND EMAIL DIAGNOSTIC — remove after debugging ──────────────────────
-// GET /api/debug/email?to=you@example.com
-app.get("/api/debug/email", async (req, res) => {
-  const to = req.query.to;
-  const result = { steps: [] };
-  try {
-    // Step 1: Read from DB
-    result.steps.push("Step 1: Reading platform config from DB");
-    const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
-    const raw_config = rows.length ? rows[0].config : null;
-    result.steps.push(`DB rows found: ${rows.length}`);
-    result.steps.push(`Config keys: ${raw_config ? Object.keys(raw_config).join(", ") : "null"}`);
-
-    // Step 2: Extract clicksend
-    const cs_super = raw_config?._superConfig?.clicksend || null;
-    const cs_top   = raw_config?.clicksend || null;
-    result.steps.push(`_superConfig.clicksend: ${cs_super ? JSON.stringify(Object.keys(cs_super)) : "null"}`);
-    result.steps.push(`clicksend (top): ${cs_top ? JSON.stringify(Object.keys(cs_top)) : "null"}`);
-
-    const cs = cs_super || cs_top || {};
-    result.steps.push(`Using cs keys: ${JSON.stringify(Object.keys(cs))}`);
-    result.steps.push(`username: ${cs.username ? cs.username.slice(0,4)+"..." : "MISSING"}`);
-    result.steps.push(`apiKey: ${cs.apiKey ? cs.apiKey.slice(0,4)+"..." : "MISSING"}`);
-    result.steps.push(`emailAddressId: ${cs.emailAddressId || cs.email_address_id || "MISSING"}`);
-    result.steps.push(`emailName: ${cs.emailName || "not set"}`);
-
-    const username = cs.username;
-    const apiKey = cs.apiKey;
-    const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
-    const fromName = cs.emailName || "Hindle";
-
-    if (!username || !apiKey) { result.steps.push("ABORT: missing credentials"); return res.json(result); }
-    if (!fromId) { result.steps.push("ABORT: emailAddressId is 0 or missing"); return res.json(result); }
-    if (!to) { result.steps.push("ABORT: no to= param in URL"); return res.json(result); }
-
-    // Step 3: Build payload
-    const payload = {
-      to: [{ email: to, name: "Debug Test", list_id: 0 }],
-      from: { email_address_id: fromId, name: fromName },
-      subject: "Hindle Debug Test " + new Date().toISOString(),
-      body: "<p>Debug email. fromId=" + fromId + " fromName=" + fromName + "</p>"
-    };
-    result.steps.push("Step 3: Payload = " + JSON.stringify(payload));
-    result.payload = payload;
-
-    // Step 4: Fire at ClickSend
-    result.steps.push("Step 4: Calling ClickSend...");
-    const authHeader = "Basic " + Buffer.from(username + ":" + apiKey).toString("base64");
-    result.steps.push("Auth header prefix: " + authHeader.slice(0,12) + "...");
-
-    const r = await fetch("https://rest.clicksend.com/v3/email/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": authHeader },
-      body: JSON.stringify(payload),
-    });
-
-    result.steps.push("HTTP Status: " + r.status + " " + r.statusText);
-    const rawText = await r.text();
-    result.steps.push("Raw response: " + rawText.slice(0, 800));
-    result.http_status = r.status;
-    result.raw_response = rawText;
-
-    try { result.parsed_response = JSON.parse(rawText); } catch(_) {}
-
-  } catch (e) {
-    result.steps.push("EXCEPTION: " + e.message);
-    result.exception = e.message;
-  }
-  console.log("[DEBUG EMAIL]", JSON.stringify(result, null, 2));
-  res.json(result);
-});
-
 
 // Stripe webhook MUST receive raw body for signature verification
 // Register this route BEFORE express.json() middleware
@@ -2018,21 +1925,23 @@ app.post("/api/kb", async (req, res) => {
 });
 
 app.patch("/api/kb/:id", async (req, res) => {
-  const { name, category, sub_category, chunks, status, org_id, content } = req.body;
+  const { name, category, sub_category, tertiary, chunks, status, org_id, content } = req.body;
   try {
     if (org_id) {
       const check = await sql`SELECT id FROM kb_documents WHERE id = ${req.params.id} AND org_id = ${org_id} LIMIT 1`;
       if (!check.length) return res.status(403).json({ error: "Not authorised" });
     }
     await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
+    await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS tertiary TEXT`.catch(()=>{});
     const rows = await sql`
       UPDATE kb_documents SET
-        name         = COALESCE(${name},         name),
-        category     = COALESCE(${category},     category),
-        sub_category = COALESCE(${sub_category}, sub_category),
+        name         = CASE WHEN ${name}         IS NOT NULL THEN ${name}         ELSE name END,
+        category     = CASE WHEN ${category}     IS NOT NULL THEN NULLIF(${category},'')     ELSE category END,
+        sub_category = CASE WHEN ${sub_category} IS NOT NULL THEN NULLIF(${sub_category},'') ELSE sub_category END,
+        tertiary     = CASE WHEN ${tertiary}     IS NOT NULL THEN NULLIF(${tertiary},'')     ELSE tertiary END,
         chunks       = COALESCE(${chunks},       chunks),
         status       = COALESCE(${status},       status),
-        content      = COALESCE(${content},      content),
+        content      = CASE WHEN ${content}      IS NOT NULL THEN ${content}      ELSE content END,
         updated_at   = NOW()
       WHERE id = ${req.params.id}
       RETURNING *
