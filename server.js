@@ -4,6 +4,10 @@ const cors = require("cors");
 const https = require("https");
 const http = require("http");
 
+const COOKIE_DOMAIN = process.env.NODE_ENV === 'production'
+  ? '.hindleconsultants.com'
+  : undefined
+
 // Safe fetch using built-in https/http — avoids node-fetch ESM issues
 // Follows redirects (301, 302, 307, 308) up to 5 hops
 const fetch = (url, opts = {}, _redirectCount = 0) => new Promise((resolve, reject) => {
