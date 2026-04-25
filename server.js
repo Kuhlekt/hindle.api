@@ -1,18 +1,11 @@
-// b260324b — targeted fixes only:
-// 1. runTrialScheduler reads trialDays + reminderDays from platform config
-// 2. Trial reminder SMS added alongside email
-// All other code is unchanged from Ian's 2952-line original.
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const https = require("https");
 const http = require("http");
 
-const COOKIE_DOMAIN = process.env.NODE_ENV === 'production'
-  ? '.hindleconsultants.com'
-  : undefined
-
 // Safe fetch using built-in https/http — avoids node-fetch ESM issues
+// Follows redirects (301, 302, 307, 308) up to 5 hops
 const fetch = (url, opts = {}, _redirectCount = 0) => new Promise((resolve, reject) => {
   if (_redirectCount > 5) return reject(new Error("Too many redirects"));
   const parsed = new URL(url);
@@ -29,10 +22,12 @@ const fetch = (url, opts = {}, _redirectCount = 0) => new Promise((resolve, reje
     options.headers["Content-Length"] = Buffer.byteLength(body);
   }
   const req = mod.request(options, (res) => {
+    // Follow redirects
     if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
       const nextUrl = res.headers.location.startsWith("http")
         ? res.headers.location
         : `${parsed.protocol}//${parsed.hostname}${res.headers.location}`;
+      // Drain the body to free socket
       res.resume();
       return resolve(fetch(nextUrl, {...opts, body: [301,302].includes(res.statusCode) ? undefined : opts.body, method: [301,302].includes(res.statusCode) ? "GET" : opts.method}, _redirectCount + 1));
     }
@@ -55,6 +50,7 @@ const fetch = (url, opts = {}, _redirectCount = 0) => new Promise((resolve, reje
   req.end();
 });
 
+// Prevent unhandled rejections from crashing the server
 process.on("unhandledRejection", (reason) => {
   console.error("[Server] Unhandled rejection:", reason?.message || reason);
 });
@@ -62,6 +58,7 @@ process.on("uncaughtException", (err) => {
   console.error("[Server] Uncaught exception:", err.message);
 })
 
+// ── Email template variable substitution ─────────────────────────────────────
 function renderEmailTemplate(template, vars) {
   return template
     .replace(/\{name\}/g,    vars.name    || "there")
@@ -73,8 +70,15 @@ function renderEmailTemplate(template, vars) {
     .replace(/\{month\}/g,   vars.month   || "")
     .replace(/\{company\}/g, vars.company || "");
 }
+// ─────────────────────────────────────────────────────────────────────────────
 
+
+// ── Universal email sender ─────────────────────────────────────────────────────
+// Tries tenant SMTP first, falls back to platform ClickSend.
+// smtpCfg: { host, port, secure, user, pass, fromEmail, fromName }
+// csCfg:   { username, apiKey, emailAddressId, emailName }
 async function sendEmail({ to, toName, subject, body, smtpCfg, csCfg }) {
+  // ── Path 1: Tenant SMTP via nodemailer ──────────────────────────────────────
   if (smtpCfg?.host && smtpCfg?.user && smtpCfg?.pass) {
     let nodemailer;
     try { nodemailer = require("nodemailer"); } catch (_) {
@@ -87,7 +91,7 @@ async function sendEmail({ to, toName, subject, body, smtpCfg, csCfg }) {
           port:   parseInt(smtpCfg.port || 587, 10),
           secure: smtpCfg.secure === true || smtpCfg.port == 465,
           auth:   { user: smtpCfg.user, pass: smtpCfg.pass },
-          tls:    { rejectUnauthorized: false },
+          tls:    { rejectUnauthorized: false }, // allow self-signed for on-prem servers
         });
         await transporter.sendMail({
           from:    `"${smtpCfg.fromName || "Support"}" <${smtpCfg.fromEmail || smtpCfg.user}>`,
@@ -99,10 +103,12 @@ async function sendEmail({ to, toName, subject, body, smtpCfg, csCfg }) {
         return { ok: true, provider: "smtp" };
       } catch (e) {
         console.error(`[Email] SMTP failed (${smtpCfg.host}):`, e.message);
+        // Fall through to ClickSend
       }
     }
   }
 
+  // ── Path 2: Platform ClickSend fallback ─────────────────────────────────────
   if (csCfg?.username && csCfg?.apiKey) {
     const fromId = parseInt(csCfg.emailAddressId || csCfg.email_address_id || 0, 10);
     if (!fromId) {
@@ -138,21 +144,29 @@ async function sendEmail({ to, toName, subject, body, smtpCfg, csCfg }) {
   return { ok: false, error: "No email provider configured (no SMTP, no ClickSend)" };
 }
 
+// Helper: load email config for a given org (tenant SMTP + platform ClickSend fallback)
 async function loadEmailConfig(orgId) {
   let smtpCfg  = null;
   let csCfg    = null;
   try {
+    // Tenant SMTP config
     if (orgId) {
       const [tenantRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`.catch(()=>[null]);
       smtpCfg = tenantRow?.config?.smtp || null;
     }
+    // Platform ClickSend (always loaded as fallback)
     const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
     const platCs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
     if (platCs.username) csCfg = platCs;
   } catch (e) { console.error("[loadEmailConfig]", e.message); }
   return { smtpCfg, csCfg };
 }
+// ──────────────────────────────────────────────────────────────────────────────
 
+
+// ── Canonical org UUID resolver ──────────────────────────────────────────────
+// Accepts: UUID (org.id), tenant_id string slug, or org email
+// Always returns the canonical UUID from organisations.id
 async function resolveOrgId(val) {
   if (!val) return null;
   try {
@@ -169,7 +183,13 @@ async function resolveOrgId(val) {
     return null;
   }
 }
+// ─────────────────────────────────────────────────────────────────────────────
 
+
+// ── ClickSend email helper ──────────────────────────────────────────────────
+// ClickSend v3 email API requires:
+//   from: { email_address_id: <numeric>, name: string }
+//   to:   [{ email, name, list_id: 0 }]   (list_id:0 = non-list send)
 function buildCsEmail({ to, toName, subject, body, fromId, fromName, listId }) {
   return {
     to:      [{ email: to, name: toName || "Customer", list_id: listId || 0 }],
@@ -178,12 +198,18 @@ function buildCsEmail({ to, toName, subject, body, fromId, fromName, listId }) {
     body:    body    || "",
   };
 }
+// ──────────────────────────────────────────────────────────────────────────────
 
+;
+
+// Check optional packages for KB file extraction
+// Add to package.json: "busboy", "pdf-parse", "mammoth"
+// Then redeploy — Railway will install them automatically
 ["busboy","pdf-parse","mammoth","nodemailer"].forEach(pkg => {
   try { require(pkg); console.log(`[KB] ${pkg} ✓`); }
   catch (_) { console.log(`[KB] ${pkg} not installed — PDF/DOCX upload will return 503. Run: npm install ${pkg}`); }
 });
-
+// Stripe — loaded dynamically so missing package never crashes the server
 let stripe = null;
 (function() {
   try {
@@ -202,6 +228,15 @@ const { neon } = require("@neondatabase/serverless");
 
 const sql = neon(process.env.DATABASE_URL);
 
+
+
+// ── RLS Context Helpers ───────────────────────────────────────────────────────
+// sqlForOrg(orgId) — runs a single query with the tenant RLS context set
+// Usage: const rows = await sqlForOrg(orgId, sql`SELECT * FROM conversations`);
+//
+// For super admin (orgId = null/undefined/''), sets empty string → policies allow all rows.
+// For tenant (orgId = UUID), policies enforce org_id isolation at DB level.
+
 async function sqlForOrg(orgId, query) {
   const ctx = orgId ? String(orgId) : '';
   try {
@@ -209,13 +244,16 @@ async function sqlForOrg(orgId, query) {
       sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
       query,
     ]);
-    return results[1];
+    return results[1]; // results[0] is set_config result
   } catch (e) {
+    // Fallback: if transaction not supported, run query directly
+    // (RLS still applies at DB level if enabled)
     console.error('[RLS] transaction error, falling back:', e.message);
     return await query;
   }
 }
 
+// sqlManyForOrg — run multiple queries in one transaction under the same RLS context
 async function sqlManyForOrg(orgId, queries) {
   const ctx = orgId ? String(orgId) : '';
   try {
@@ -223,18 +261,25 @@ async function sqlManyForOrg(orgId, queries) {
       sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
       ...queries,
     ]);
-    return results.slice(1);
+    return results.slice(1); // drop set_config result
   } catch (e) {
     console.error('[RLS] multi-transaction error:', e.message);
     return await Promise.all(queries.map(q => q));
   }
 }
+// ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
+
+// Also add tertiary to GET /api/kb so conversations panel can use it
+
+
+// Stripe webhook MUST receive raw body for signature verification
+// Register this route BEFORE express.json() middleware
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Stripe not configured" });
   const sig = req.headers["stripe-signature"];
@@ -265,6 +310,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       }
       if (org) {
         await sql`UPDATE organisations SET status = 'paid', plan = ${planId || org.plan}, updated_at = NOW() WHERE id = ${org.id}`;
+        // Snapshot plan at time of payment
         try {
           const [sCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
           const sSc = sCfg?.config?._superConfig || {};
@@ -285,11 +331,13 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           }
         }
         console.log(`[Stripe] Activated org ${org.id} (${org.email}) on plan ${planId}`);
+        // Send payment confirmation email
         try {
           const [pCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
           const cs = pCfg?.config?._superConfig?.clicksend || pCfg?.config?.clicksend || {};
           const fromId = parseInt(cs.emailAddressId || cs.email_address_id || 0, 10);
           if (cs.username && cs.apiKey && fromId && org.email) {
+            // Load email template from super config if set, else use default
             const tpls = pCfg?.config?._superConfig?.emailTemplates || [];
             const tpl = tpls.find(t => t.id === "payment");
             const subject = tpl ? renderEmailTemplate(tpl.subj, { name: org.name, plan: planId }) : `✅ Payment confirmed — ${planId} plan active`;
@@ -297,10 +345,10 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
               ? `<p>${renderEmailTemplate(tpl.body, { name: org.name, plan: planId, amount: session.amount_total ? (session.amount_total/100).toFixed(2) : "", last4: session.payment_method_types?.[0] || "" })}</p>`
               : `<p>Hi ${org.name || "there"},<br><br>Your payment has been confirmed and your <strong>${planId}</strong> plan is now active.<br><br>Thank you for choosing Hindle AI.</p>`;
             await sendEmail({ to: org.email, toName: org.name||"Customer", subject, body, smtpCfg: null, csCfg: cs })
-              .catch(e => console.error("[Stripe] Payment email error:", e.message));
-            console.log(`[Stripe] Payment confirmation email sent to ${org.email}`);
+              .catch(e => console.error("[Stripe] Payment email error:", e.message));            console.log(`[Stripe] Payment confirmation email sent to ${org.email}`);
           }
         } catch (emailErr) { console.error("[Stripe] Payment email error:", emailErr.message); }
+        // Write audit
         await writeAudit(org.id, "payment_confirmed", `Payment confirmed — plan ${planId}`, { plan: planId, email }).catch(()=>{});
       } else {
         console.warn(`[Stripe] Webhook: could not find org for email=${email} orgId=${orgId}`);
@@ -315,14 +363,23 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
+// ── RLS default context middleware ────────────────────────────────────────────
+// Sets app.current_org_id = '' (super admin / bypass) for every request.
+// Individual endpoints override this with sqlForOrg(orgId, ...) which wraps
+// the query in a transaction that sets the correct tenant context first.
+// This ensures RLS never hard-blocks a request due to missing context.
 app.use(async (req, res, next) => {
   try {
     await sql`SELECT set_config('app.current_org_id', '', true)`;
   } catch (_) {}
   next();
 });
+// ─────────────────────────────────────────────────────────────────────────────
 
-const rateBuckets = new Map();
+// ─────────────────────────────────────────────
+// IN-MEMORY RATE LIMITER  (per tenant, per minute)
+// ─────────────────────────────────────────────
+const rateBuckets = new Map(); // tenantId → { count, resetAt }
 function checkRateLimit(tenantId, limit = 30) {
   const now = Date.now();
   let bucket = rateBuckets.get(tenantId);
@@ -334,6 +391,7 @@ function checkRateLimit(tenantId, limit = 30) {
   if (bucket.count > limit) return false;
   return true;
 }
+// Clean up old buckets every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of rateBuckets.entries()) {
@@ -341,7 +399,10 @@ setInterval(() => {
   }
 }, 300000);
 
-const typingState = new Map();
+// ─────────────────────────────────────────────
+// TYPING INDICATORS  (in-memory, TTL 5s)
+// ─────────────────────────────────────────────
+const typingState = new Map(); // conversationId → { agent: bool, visitor: bool, ts: number }
 function setTyping(convId, role, val) {
   const cur = typingState.get(convId) || { agent: false, visitor: false };
   cur[role] = val;
@@ -351,31 +412,48 @@ function setTyping(convId, role, val) {
 function getTyping(convId) {
   const s = typingState.get(convId);
   if (!s) return { agent: false, visitor: false };
+  // Auto-expire after 5s inactivity
   if (Date.now() - s.ts > 5000) { typingState.delete(convId); return { agent: false, visitor: false }; }
   return s;
 }
 
+
+// ─────────────────────────────────────────────
+// HEALTH
+// ─────────────────────────────────────────────
 app.get("/api/health", async (req, res) => {
   try {
     const result = await sql`SELECT version()`;
-    res.json({ status: "ok", db: result[0].version, build: "b260324b" });
+    res.json({ status: "ok", db: result[0].version });
   } catch (e) {
     res.status(500).json({ status: "error", message: e.message });
   }
 });
 
-const twoFaCodes = new Map();
+// ─────────────────────────────────────────────
+// SUPER ADMIN 2FA
+// POST /api/auth/2fa/send   — generate code, email it
+// POST /api/auth/2fa/verify — verify code
+// ─────────────────────────────────────────────
+const twoFaCodes = new Map(); // email → { code, expiresAt, attempts }
 
 app.post("/api/auth/2fa/send", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "email required" });
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  const expiresAt = Date.now() + 10 * 60 * 1000;
+
+  const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
   twoFaCodes.set(email.toLowerCase(), { code, expiresAt, attempts: 0 });
+
+  // Send via ClickSend email
   try {
     const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(() => [null]);
     const cs = cfg?.config?._superConfig?.clicksend || cfg?.config?.clicksend || cfg?.config?._platformConfig?.clicksend || {};
-    const { smtpCfg: tfaSmtp, csCfg: tfaCs } = await loadEmailConfig(null);
+    const username = cs.username || process.env.CLICKSEND_USERNAME;
+    const apiKey   = cs.apiKey   || process.env.CLICKSEND_API_KEY;
+
+    // Load org's SMTP config if available, fall back to platform ClickSend
+    const { smtpCfg: tfaSmtp, csCfg: tfaCs } = await loadEmailConfig(null); // 2FA = platform level
     const tfaBody = `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px">
   <h2 style="margin:0 0 8px">Login verification code</h2>
   <p style="color:#64748b;margin:0 0 20px">Enter this code to complete your sign in:</p>
@@ -389,12 +467,14 @@ app.post("/api/auth/2fa/send", async (req, res) => {
   } catch (e) {
     console.error("[2FA] Email error:", e.message);
   }
+
   res.json({ ok: true, expires: expiresAt });
 });
 
 app.post("/api/auth/2fa/verify", (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ error: "email and code required" });
+
   const entry = twoFaCodes.get(email.toLowerCase());
   if (!entry) return res.status(400).json({ error: "No code found — request a new one" });
   if (Date.now() > entry.expiresAt) {
@@ -409,10 +489,19 @@ app.post("/api/auth/2fa/verify", (req, res) => {
   if (code.trim() !== entry.code) {
     return res.status(400).json({ error: `Incorrect code (${5 - entry.attempts} attempts remaining)` });
   }
+
   twoFaCodes.delete(email.toLowerCase());
   res.json({ ok: true });
 });
 
+
+// ─────────────────────────────────────────────
+// AI AGENT TOOLS
+// ─────────────────────────────────────────────
+
+// POST /api/ai/suggest-replies
+// Body: { conversationId, messages[] }
+// Returns: { suggestions: string[] }
 app.post("/api/ai/suggest-replies", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(503).json({ error: "AI not configured" });
@@ -440,6 +529,9 @@ app.post("/api/ai/suggest-replies", async (req, res) => {
   }
 });
 
+// POST /api/ai/summarise
+// Body: { conversationId }
+// Returns: { summary: string }
 app.post("/api/ai/summarise", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(503).json({ error: "AI not configured" });
@@ -464,6 +556,9 @@ app.post("/api/ai/summarise", async (req, res) => {
   }
 });
 
+// POST /api/ai/sentiment
+// Body: { text: string }
+// Returns: { sentiment: "positive"|"neutral"|"negative"|"frustrated", score: number }
 app.post("/api/ai/sentiment", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(503).json({ sentiment: "neutral", score: 0.5 });
@@ -488,6 +583,8 @@ app.post("/api/ai/sentiment", async (req, res) => {
   }
 });
 
+
+// GET /api/analytics/:orgId/export?days=30&format=csv
 app.get("/api/analytics/:orgId/export", async (req, res) => {
   const { orgId } = req.params;
   const days = parseInt(req.query.days) || 30;
@@ -518,6 +615,8 @@ app.get("/api/analytics/:orgId/export", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/conversations/:id/snooze
+// Body: { until: ISO datetime }
 app.post("/api/conversations/:id/snooze", async (req, res) => {
   const { until } = req.body;
   try {
@@ -527,6 +626,8 @@ app.post("/api/conversations/:id/snooze", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/conversations/:id/email-reply
+// Body: { to, subject, body, agentName }
 app.post("/api/conversations/:id/email-reply", async (req, res) => {
   const { to, subject, body, agentName } = req.body;
   if (!to || !body) return res.status(400).json({ error: "to and body required" });
@@ -541,6 +642,11 @@ app.post("/api/conversations/:id/email-reply", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ─────────────────────────────────────────────
+// KB — URL Import: fetch page text server-side
+// POST /api/kb/import-url  { org_id, url }
+// ─────────────────────────────────────────────
 app.post("/api/kb/import-url", async (req, res) => {
   const { org_id, url } = req.body;
   if (!org_id || !url) return res.status(400).json({ error: "org_id and url required" });
@@ -549,6 +655,8 @@ app.post("/api/kb/import-url", async (req, res) => {
   try {
     const limitErr = await checkKbLimit(org_id);
     if (limitErr) return res.status(403).json(limitErr);
+
+    // Fetch the page
     const pageRes = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; HindleBot/1.0)" },
       redirect: "follow",
@@ -556,6 +664,8 @@ app.post("/api/kb/import-url", async (req, res) => {
     });
     if (!pageRes.ok) return res.status(502).json({ error: `Page returned ${pageRes.status}` });
     const html = await pageRes.text();
+
+    // Strip HTML tags, collapse whitespace
     const text = html
       .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
       .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
@@ -563,9 +673,11 @@ app.post("/api/kb/import-url", async (req, res) => {
       .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
       .replace(/\s{2,}/g, " ")
       .trim()
-      .slice(0, 50000);
+      .slice(0, 50000); // cap at 50k chars
+
     const slug = url.split("/").filter(Boolean).pop() || "page";
     const name = slug.slice(0, 80) + " (imported)";
+
     await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
     const rows = await sql`
       INSERT INTO kb_documents (org_id, name, content, size_kb, chunks, status)
@@ -578,19 +690,31 @@ app.post("/api/kb/import-url", async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────
+// KB — File Upload with text extraction
+// POST /api/kb/upload-file
+// Accepts multipart with field "file" + body field "org_id"
+// Extracts text from PDF/DOCX/TXT/MD/JSON/XML/CSV
+// ─────────────────────────────────────────────
 app.post("/api/kb/upload-file", async (req, res) => {
+  // Parse multipart manually using busboy
   let busboy;
   try { busboy = require("busboy"); } catch (_) {
     return res.status(503).json({ error: "busboy not installed — run: npm install busboy" });
   }
+
   const org_id = req.headers["x-org-id"] || req.query.org_id;
   if (!org_id) return res.status(400).json({ error: "org_id required (header X-Org-Id or query param)" });
+
   const limitErr = await checkKbLimit(org_id).catch(() => null);
   if (limitErr) return res.status(403).json(limitErr);
+
   const bb = busboy({ headers: req.headers, limits: { fileSize: 20 * 1024 * 1024 } });
   const fileBuffers = [];
   let fileName = "upload";
   let fileType = "";
+
   bb.on("file", (name, file, info) => {
     fileName = info.filename || "upload";
     fileType = fileName.split(".").pop().toLowerCase();
@@ -598,10 +722,12 @@ app.post("/api/kb/upload-file", async (req, res) => {
     file.on("data", c => chunks.push(c));
     file.on("end", () => fileBuffers.push(Buffer.concat(chunks)));
   });
+
   bb.on("finish", async () => {
     if (!fileBuffers.length) return res.status(400).json({ error: "No file received" });
     const buf = fileBuffers[0];
     let text = "";
+
     try {
       if (fileType === "pdf") {
         try {
@@ -629,8 +755,10 @@ app.post("/api/kb/upload-file", async (req, res) => {
       } else {
         return res.status(400).json({ error: `Unsupported file type: .${fileType}. Supported: pdf, docx, txt, md, csv, json, xml` });
       }
+
       text = text.replace(/\r\n/g, "\n").replace(/\t/g, " ").replace(/ {3,}/g, "  ").trim().slice(0, 80000);
       if (!text) return res.status(400).json({ error: "Could not extract text from file" });
+
       await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
       const rows = await sql`
         INSERT INTO kb_documents (org_id, name, content, size_kb, chunks, status)
@@ -642,10 +770,18 @@ app.post("/api/kb/upload-file", async (req, res) => {
       res.status(500).json({ error: e.message });
     }
   });
+
   bb.on("error", e => res.status(500).json({ error: e.message }));
   req.pipe(bb);
 });
 
+
+// ─────────────────────────────────────────────
+// KB — JSON import: parse and return preview for mapper
+// POST /api/kb/parse-json  { org_id, json_text }
+// Returns: { keys, sample, items_count, suggested_mapping }
+// ─────────────────────────────────────────────
+// Temporary in-memory cache for parsed JSON items (cleared after 30 min)
 const _parseCache = new Map();
 const _parseCacheExpiry = new Map();
 setInterval(()=>{
@@ -661,6 +797,7 @@ app.post("/api/kb/parse-json", async (req, res) => {
   try {
     const raw = JSON.parse(json_text);
     let items = [];
+
     if (Array.isArray(raw)) {
       items = raw;
     } else if (typeof raw === "object") {
@@ -677,10 +814,13 @@ app.post("/api/kb/parse-json", async (req, res) => {
         items = [raw];
       }
     }
+
     if (!items.length) return res.status(400).json({ error: "No items found in JSON" });
+
     const keySet = new Set();
     items.slice(0, 20).forEach(item => Object.keys(item).forEach(k => keySet.add(k)));
     const keys = [...keySet];
+
     const suggest = (candidates) => keys.find(k => candidates.some(c => k.toLowerCase().includes(c))) || "";
     const suggested = {
       title:        suggest(["title","name","question","q","heading","subject","topic"]),
@@ -689,19 +829,28 @@ app.post("/api/kb/parse-json", async (req, res) => {
       sub_category: suggest(["sub","subcategory","sub_category","subtopic","tag"]),
       tertiary:     suggest(["tertiary","third","level3","tier"]),
     };
+
+    // Store in cache so import-mapped can retrieve without re-sending all items
     const parseId = `p_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
     _parseCache.set(parseId, items);
     _parseCacheExpiry.set(parseId, Date.now() + 30 * 60 * 1000);
+
+    // Return sample + keys + parseId (not full items, to keep response small)
     const sample = items.slice(0, 3);
     res.json({ keys, sample, items_count: items.length, suggested, parseId,
+      // Include full items only if small (<= 100 items, < 500kb)
       items: items.length <= 100 ? items : [] });
   } catch (e) {
     res.status(400).json({ error: "Invalid JSON: " + e.message });
   }
 });
 
+// POST /api/kb/import-mapped
+// Body: { org_id, items[], mapping: {title, content, category, sub_category, tertiary} }
+// Saves each mapped item as a kb_document row
 app.post("/api/kb/import-mapped", async (req, res) => {
   let { org_id, items, mapping, parseId } = req.body;
+  // If items not sent (large file), retrieve from cache
   if ((!items || !items.length) && parseId && _parseCache.has(parseId)) {
     items = _parseCache.get(parseId);
     _parseCache.delete(parseId);
@@ -713,8 +862,10 @@ app.post("/api/kb/import-mapped", async (req, res) => {
   try {
     await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS content TEXT`.catch(()=>{});
     await sql`ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS tertiary TEXT`.catch(()=>{});
+
     const limitErr = await checkKbLimit(org_id);
     if (limitErr) return res.status(403).json(limitErr);
+
     const saved = [];
     for (const item of items) {
       const name    = String(item[mapping.title]    || "").trim().slice(0, 200) || "Untitled";
@@ -737,11 +888,17 @@ app.post("/api/kb/import-mapped", async (req, res) => {
   }
 });
 
+// Also add tertiary to GET /api/kb so conversations panel can use it
+
+
+// ── Tenant plan snapshot endpoint ─────────────────────────────────────────────
+// Returns the plan snapshot locked at signup time for a given org
 app.get("/api/plan-snapshot/:orgId", async (req, res) => {
   try {
     const orgId = await resolveOrgId(req.params.orgId).catch(() => req.params.orgId);
     const [org] = await sql`SELECT plan, plan_snapshot, custom_limits FROM organisations WHERE id = ${orgId} LIMIT 1`.catch(()=>[null]);
     if (!org) return res.status(404).json({ error: "Not found" });
+    // If no snapshot yet, build one from current platform config
     if (!org.plan_snapshot) {
       const apl = await getAdminPlanLimits();
       const planBase = (apl && apl[org.plan]) || PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
@@ -750,7 +907,10 @@ app.get("/api/plan-snapshot/:orgId", async (req, res) => {
     res.json({ ...org.plan_snapshot, is_live: false });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// ─────────────────────────────────────────────────────────────────────────────
 
+
+// ── SMTP Test endpoint ────────────────────────────────────────────────────────
 app.post("/api/test-smtp", async (req, res) => {
   const { orgId, smtp, to } = req.body;
   if (!smtp?.host || !smtp?.user || !smtp?.pass) return res.json({ ok: false, error: "Host, user and password required" });
@@ -780,12 +940,25 @@ app.post("/api/test-smtp", async (req, res) => {
     res.json({ ok: false, error: e.message });
   }
 });
+// ─────────────────────────────────────────────────────────────────────────────
 
+
+// Quick diagnostic — count conversations for an org
+
+// ─────────────────────────────────────────────
+// STRIPE — Checkout Session + Webhook
+// ─────────────────────────────────────────────
+
+// POST /api/stripe/checkout
+// Body: { planId, billing, email, orgId?, promoCode? }
+// Returns: { url } (redirect to Stripe Checkout)
 app.post("/api/stripe/checkout", async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Payments not configured. STRIPE_SECRET_KEY missing." });
   const { planId, billing, email, orgId, promoCode, successUrl, cancelUrl } = req.body;
   if (!planId || !email) return res.status(400).json({ error: "planId and email required" });
+
   try {
+    // Get pricing from admin config
     const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
     const sc = cfg?.config?._superConfig || {};
     const planPrices = { starter: sc.plans?.starter?.usd || 49, professional: sc.plans?.professional?.usd || 149 };
@@ -793,8 +966,10 @@ app.post("/api/stripe/checkout", async (req, res) => {
     const isAnnual = billing === "annual";
     const annualPct = sc.annualDiscountPct || 20;
     const unitAmount = isAnnual
-      ? Math.round(monthlyUsd * (1 - annualPct / 100) * 12 * 100)
-      : Math.round(monthlyUsd * 100);
+      ? Math.round(monthlyUsd * (1 - annualPct / 100) * 12 * 100) // annual total in cents
+      : Math.round(monthlyUsd * 100); // monthly in cents
+
+    // Apply promo code discount if valid
     let discounts = [];
     if (promoCode && sc.promoCodes) {
       const promo = sc.promoCodes.find(p =>
@@ -804,6 +979,7 @@ app.post("/api/stripe/checkout", async (req, res) => {
         (p.plans || []).includes(planId)
       );
       if (promo) {
+        // Create or retrieve Stripe coupon
         const couponId = `HINDLE_${promo.code}`;
         try {
           await stripe.coupons.retrieve(couponId);
@@ -813,6 +989,7 @@ app.post("/api/stripe/checkout", async (req, res) => {
         discounts = [{ coupon: couponId }];
       }
     }
+
     const session = await stripe.checkout.sessions.create({
       mode: isAnnual ? "payment" : "subscription",
       payment_method_types: ["card"],
@@ -833,6 +1010,7 @@ app.post("/api/stripe/checkout", async (req, res) => {
       success_url: (successUrl || "https://chatbot.hindleconsultants.com") + "?payment=success&session_id={CHECKOUT_SESSION_ID}&plan=" + planId,
       cancel_url: cancelUrl || "https://chatbot.hindleconsultants.com?payment=cancelled",
     });
+
     res.json({ url: session.url, sessionId: session.id });
   } catch (e) {
     console.error("[Stripe] Checkout error:", e.message);
@@ -840,6 +1018,10 @@ app.post("/api/stripe/checkout", async (req, res) => {
   }
 });
 
+// Webhook handled above (before express.json middleware)
+
+// GET /api/stripe/status?session_id=xxx
+// Frontend polls this after redirect to confirm payment activated
 app.get("/api/stripe/status", async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Stripe not configured" });
   const { session_id } = req.query;
@@ -868,31 +1050,57 @@ app.get("/api/diag/convos", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// TYPING INDICATORS
+// POST /api/typing  { conversationId, role, typing }
+// GET  /api/typing/:conversationId
+// ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+// OFFLINE MESSAGE CAPTURE
+// POST /api/offline-message
+// Visitor leaves message when no agents available
+// ─────────────────────────────────────────────
 app.post("/api/offline-message", async (req, res) => {
   const { tenantId, name, email, message, page } = req.body;
   if (!tenantId || !message) return res.status(400).json({ error: "tenantId and message required" });
   try {
+    // Resolve org
     const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${tenantId} OR tenant_id = ${tenantId} LIMIT 1`;
     if (!org) return res.status(404).json({ error: "Tenant not found" });
     const orgId = org.id;
+
+    // Store as a conversation with status 'offline_msg'
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS offline_message BOOLEAN DEFAULT FALSE`.catch(()=>{});
     const [conv] = await sql`
       INSERT INTO conversations (org_id, visitor_name, visitor_email, page, subject, status)
       VALUES (${orgId}, ${name || "Website Visitor"}, ${email || null}, ${page || "/"}, ${"Offline message"}, ${"open"})
       RETURNING *
     `;
-    await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${conv.id}, ${"visitor"}, ${name || "Visitor"}, ${message})`;
+    await sql`
+      INSERT INTO messages (conversation_id, type, sender, content)
+      VALUES (${conv.id}, ${"visitor"}, ${name || "Visitor"}, ${message})
+    `;
     await sql`UPDATE conversations SET offline_message = TRUE WHERE id = ${conv.id}`.catch(()=>{});
+
+    // Send email notification if ClickSend configured
     try {
       const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`;
       const cs = cfg?.config?.clicksend || {};
       if (cs.username && cs.apiKey && (cs.notifEmail || org.email)) {
         const toEmail = cs.notifEmail || org.email;
-        const emailBody = `New offline message from ${name || "visitor"} (${email || "no email"}):\n\n"${message}"\n\nPage: ${page || "/"}\n\nReply at: https://chatbot.hindleconsultants.com`;
+        const emailBody = `New offline message from ${name || "visitor"} (${email || "no email"}):
+
+"${message}"
+
+Page: ${page || "/"}
+
+Reply at: https://chatbot.hindleconsultants.com`;
         const { smtpCfg: offSmtp, csCfg: offCs } = await loadEmailConfig(org.id).catch(()=>({smtpCfg:null,csCfg:cs}));
         await sendEmail({ to: toEmail, toName: org.name||"Admin", subject: `New offline message — ${name || "Visitor"}`, body: `<pre style="font-family:sans-serif">${emailBody}</pre>`, smtpCfg: offSmtp, csCfg: offCs }).catch(()=>{});
       }
     } catch (_) {}
+
     res.json({ ok: true, conversationId: conv.id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -907,6 +1115,10 @@ app.get("/api/typing/:conversationId", (req, res) => {
   res.json(getTyping(req.params.conversationId));
 });
 
+// ─────────────────────────────────────────────
+// CSAT  — store rating on conversation
+// POST /api/conversations/:id/csat  { rating: 1|0, comment? }
+// ─────────────────────────────────────────────
 app.post("/api/conversations/:id/csat", async (req, res) => {
   const { rating, comment } = req.body;
   if (rating === undefined) return res.status(400).json({ error: "rating required" });
@@ -914,11 +1126,19 @@ app.post("/api/conversations/:id/csat", async (req, res) => {
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_rating INT`.catch(() => {});
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_comment TEXT`.catch(() => {});
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS csat_at TIMESTAMPTZ`.catch(() => {});
-    await sql`UPDATE conversations SET csat_rating = ${rating}, csat_comment = ${comment || null}, csat_at = NOW(), updated_at = NOW() WHERE id = ${req.params.id}`;
+    await sql`
+      UPDATE conversations
+      SET csat_rating = ${rating}, csat_comment = ${comment || null}, csat_at = NOW(), updated_at = NOW()
+      WHERE id = ${req.params.id}
+    `;
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────
+// ANALYTICS  — first response time + CSAT summary
+// GET /api/analytics/:orgId?days=30
+// ─────────────────────────────────────────────
 app.get("/api/analytics/:orgId", async (req, res) => {
   const { orgId } = req.params;
   const { days = "30" } = req.query;
@@ -958,6 +1178,10 @@ app.get("/api/analytics/:orgId", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────
+// ONBOARDING CHECKLIST
+// GET /api/onboarding/:orgId
+// ─────────────────────────────────────────────
 app.get("/api/onboarding/:orgId", async (req, res) => {
   const { orgId } = req.params;
   try {
@@ -983,29 +1207,47 @@ app.get("/api/onboarding/:orgId", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ─────────────────────────────────────────────
+// AI CHAT  — routes messages through Claude
+// POST /api/chat
+// Body: { tenantId, system, messages: [{role, content}] }
+// ─────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
   const { system, messages, tenantId, conversationId, handoffCommands, handoffInactivityTimeout, additionalInstructions } = req.body;
+
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages array required" });
   }
+
+  // Rate limit: 30 AI calls per tenant per minute
   if (tenantId && !checkRateLimit(tenantId, 30)) {
     return res.status(429).json({ error: "Rate limit exceeded. Please wait a moment before sending another message.", rate_limited: true });
   }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set on server" });
+
+  // ── Handoff silence ─────────────────────────────────────────
+  // When a conversation is in handoff the bot stays silent.
+  // It only speaks if the visitor sends a recognised listening command.
   if (conversationId) {
     try {
       const [conv] = await sql`SELECT status, updated_at FROM conversations WHERE id = ${conversationId}`;
       if (conv && (conv.status === "handoff" || conv.status === "claimed")) {
+        // Check last AGENT message time — if no agent reply within silenceSecs, let bot back in
         const [lastAgentMsg] = await sql`
           SELECT created_at FROM messages
           WHERE conversation_id = ${conversationId} AND type IN ('agent','note')
           ORDER BY created_at DESC LIMIT 1
         `.catch(() => [null]);
+
         const silenceSecs = (handoffInactivityTimeout && handoffInactivityTimeout > 0) ? handoffInactivityTimeout : 120;
+
+        // If agent has responded recently, stay silent
         const agentMsgAge = lastAgentMsg
           ? (Date.now() - new Date(lastAgentMsg.created_at).getTime()) / 1000
-          : silenceSecs + 1;
+          : silenceSecs + 1; // no agent message ever → let bot respond
+
         if (agentMsgAge <= silenceSecs) {
           const lastMsg = [...messages].reverse().find(m => m.role === "visitor" || m.role === "user");
           const text = (lastMsg?.content || lastMsg?.text || "").trim().toLowerCase();
@@ -1037,20 +1279,32 @@ app.post("/api/chat", async (req, res) => {
           } catch (_) {}
           return res.json({ reply: cmdReply, handoff_active: true, command_matched: true });
         }
+        // else: >60s inactivity — fall through to normal AI response
       }
     } catch (_) {}
   }
+
+  // ── Normal AI response ──────────────────────────────────────
   try {
+    // Build confidence-aware system prompt
     const { confidenceThreshold = 0.6, sessionHistory } = req.body;
+
+    // ── Fetch KB documents from database and inject into system prompt ──
     let kbContext = "";
     if (tenantId) {
       try {
+        // Resolve org UUID from tenantId
         const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenantId} OR tenant_id = ${tenantId} LIMIT 1`;
         const orgId = orgs.length ? orgs[0].id : tenantId;
+        // Load KB docs that have content (manual/text entries)
         const kbDocs = await sql`
           SELECT name, content FROM kb_documents
-          WHERE org_id = ${orgId} AND status = 'indexed' AND content IS NOT NULL AND content != ''
-          ORDER BY created_at DESC LIMIT 40
+          WHERE org_id = ${orgId}
+            AND status = 'indexed'
+            AND content IS NOT NULL
+            AND content != ''
+          ORDER BY created_at DESC
+          LIMIT 40
         `;
         if (kbDocs.length > 0) {
           kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following information to answer questions. Only use information from this knowledge base when it is relevant. If the answer is not in the knowledge base, say so honestly.\n\n" +
@@ -1058,13 +1312,17 @@ app.post("/api/chat", async (req, res) => {
         }
       } catch (_) {}
     }
+
     const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
       kbContext +
       (additionalInstructions ? "\n\nAdditional instructions:\n" + additionalInstructions : "") +
       "\n\nIMPORTANT: After your answer, on a new line write exactly: CONFIDENCE:[0.0-1.0] where the number reflects how confident you are in your answer (1.0 = certain, 0.5 = unsure, 0.0 = no idea). If confidence is below 0.6, end with: SUGGEST_HUMAN:true";
+
+    // Include session history for conversation memory (last 6 turns from prior sessions)
     const fullMessages = sessionHistory && Array.isArray(sessionHistory)
       ? [...sessionHistory.slice(-6), ...messages]
       : messages;
+
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
@@ -1080,31 +1338,46 @@ app.post("/api/chat", async (req, res) => {
     }
     const data = await response.json();
     let rawReply = data.content?.[0]?.text || "";
+
+    // Parse confidence score and suggestion flag
     const confMatch = rawReply.match(/CONFIDENCE:\s*([\d.]+)/);
     const confidence = confMatch ? parseFloat(confMatch[1]) : 1.0;
     const suggestHuman = rawReply.includes("SUGGEST_HUMAN:true") || confidence < confidenceThreshold;
+
+    // Strip the confidence annotation from the reply
     const reply = rawReply
       .replace(/\nCONFIDENCE:[\d.]+/g, "")
       .replace(/\nSUGGEST_HUMAN:(true|false)/g, "")
       .trim();
+
     if (conversationId) {
       try {
         await sql`INSERT INTO messages (conversation_id, type, sender, content) VALUES (${conversationId}, 'bot', 'AI', ${reply})`;
         await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${conversationId}`;
       } catch (_) {}
     }
+
     res.json({ reply, confidence, suggest_human: suggestHuman });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+
+// ─────────────────────────────────────────────
+// TENANT CONFIG  — stores chatbot config so widget.js can fetch it
+// POST /api/tenant-config        { tenantId, ...config }
+// GET  /api/tenant-config/:id
+// ─────────────────────────────────────────────
+
 app.post("/api/tenant-config", async (req, res) => {
   const { tenantId, ...config } = req.body;
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
   try {
+    // Look up org to get the canonical UUID
     const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
     const orgId = orgs.length ? orgs[0].id : tenantId;
+    // Deep-merge with existing config
     const existing = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`;
     const merged = existing.length ? { ...existing[0].config, ...config } : config;
     await sql`
@@ -1131,6 +1404,12 @@ app.get("/api/tenant-config/:tenantId", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// ADMIN SETTINGS — super admin profile + platform config + github config
+// Stored under tenant_id = 'platform' in tenant_configs
+// GET  /api/admin-settings
+// POST /api/admin-settings  { profile, platform, github }
+// ─────────────────────────────────────────────
 app.get("/api/admin-settings", async (req, res) => {
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
@@ -1153,6 +1432,7 @@ app.get("/api/admin-settings", async (req, res) => {
 app.post("/api/admin-settings", async (req, res) => {
   const { profile, platform, github, superConfig, adminPassword, adminAccounts, adminPasswordFor, testSMS, testEmail } = req.body;
 
+  // ── Test SMS ──────────────────────────────────────────────────
   if (testSMS) {
     const dbg = [];
     try {
@@ -1207,6 +1487,9 @@ app.post("/api/admin-settings", async (req, res) => {
         body: htmlBody,
       };
       dbg.push(`payload: ${JSON.stringify(payload)}`);
+      console.log("[TEST EMAIL] === ABOUT TO CALL CLICKSEND ===");
+      console.log("[TEST EMAIL] URL: https://rest.clicksend.com/v3/email/send");
+      console.log("[TEST EMAIL] Auth: Basic", Buffer.from(username + ":" + apiKey).toString("base64").slice(0,8)+"...");
       console.log("[TEST EMAIL] Payload:", JSON.stringify(payload));
       const r = await fetch("https://rest.clicksend.com/v3/email/send", {
         method: "POST",
@@ -1216,6 +1499,7 @@ app.post("/api/admin-settings", async (req, res) => {
       const rawText = await r.text();
       let d = {};
       try { d = JSON.parse(rawText); } catch(_) { d = { raw: rawText }; }
+      // Only treat as success when ClickSend explicitly says SUCCESS
       const ok = d?.response_code === "SUCCESS";
       dbg.push(`http: ${r.status} | response_code: ${d?.response_code} | response_msg: ${d?.response_msg} | raw: ${rawText.slice(0,600)}`);
       console.log("[TEST EMAIL] HTTP Status:", r.status);
@@ -1224,7 +1508,6 @@ app.post("/api/admin-settings", async (req, res) => {
       return res.json({ ok, emailSent: ok, emailError: errMsg, debug: dbg });
     } catch (e) { console.error("[TEST EMAIL] Exception:", e.message); return res.json({ ok: false, emailError: e.message, debug: dbg }); }
   }
-
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     const existing = rows.length ? (rows[0].config || {}) : {};
@@ -1233,11 +1516,14 @@ app.post("/api/admin-settings", async (req, res) => {
       ...(profile         ? { _adminProfile:   profile       } : {}),
       ...(platform        ? { _platformConfig: platform      } : {}),
       ...(github          ? { _githubConfig:   github        } : {}),
+      // Deep-merge _superConfig so partial saves don't wipe other keys
       ...(superConfig ? { _superConfig: { ...(existing._superConfig||{}), ...superConfig } } : {}),
+      // Mirror clicksend to top-level for backward-compat with tenant-config path
       ...(superConfig?.clicksend ? { clicksend: { ...(existing.clicksend||{}), ...superConfig.clicksend } } : {}),
       ...(adminPassword   ? { _adminPassword:  adminPassword } : {}),
       ...(adminAccounts   ? { _adminAccounts:  adminAccounts } : {}),
     };
+    // Per-account password: store as _adminPasswords[email]
     if (adminPasswordFor?.email && adminPasswordFor?.password) {
       const passwords = { ...(existing._adminPasswords || {}), [adminPasswordFor.email]: adminPasswordFor.password };
       merged._adminPasswords = passwords;
@@ -1253,6 +1539,10 @@ app.post("/api/admin-settings", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// FETCH URL  — server-side fetch for KB URL import (avoids CORS)
+// POST /api/fetch-url   { url }
+// ─────────────────────────────────────────────
 app.post("/api/fetch-url", async (req, res) => {
   const { url } = req.body;
   if (!url || (!url.startsWith("http://") && !url.startsWith("https://"))) {
@@ -1265,6 +1555,7 @@ app.post("/api/fetch-url", async (req, res) => {
     });
     if (!r.ok) return res.status(502).json({ error: `Remote returned ${r.status}` });
     const html = await r.text();
+    // Strip HTML tags to extract readable text
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
@@ -1278,6 +1569,9 @@ app.post("/api/fetch-url", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// ORGANISATIONS (TENANTS)
+// ─────────────────────────────────────────────
 app.get("/api/tenants", async (req, res) => {
   try {
     const rows = await sql`SELECT * FROM organisations ORDER BY created_at DESC`;
@@ -1301,17 +1595,29 @@ app.post("/api/tenants", async (req, res) => {
   const { name, email, plan = "free" } = req.body;
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
   try {
-    const rows = await sql`INSERT INTO organisations (name, email, plan) VALUES (${name}, ${email}, ${plan}) RETURNING *`;
+    const rows = await sql`
+      INSERT INTO organisations (name, email, plan)
+      VALUES (${name}, ${email}, ${plan})
+      RETURNING *
+    `;
     const org = rows[0];
+    // Snapshot current plan features+limits at time of creation
     try {
       const [platCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
       const sc = platCfg?.config?._superConfig || {};
       const apl = sc.planLimits || null;
       const planBase = (apl && apl[plan]) || PLAN_LIMITS[plan] || PLAN_LIMITS.free;
-      const snapshot = { plan, snapped_at: new Date().toISOString(), limits: { ...planBase }, features: sc.planFeatures ? (sc.planFeatures[plan] || []) : [] };
+      const planFeatures = sc.planFeatures || null;
+      const snapshot = {
+        plan,
+        snapped_at: new Date().toISOString(),
+        limits: { ...planBase },
+        features: planFeatures ? (planFeatures[plan] || []) : [],
+      };
       await sql`UPDATE organisations SET plan_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${org.id}`.catch(()=>{});
     } catch (_) {}
     res.status(201).json(org);
+    // Send welcome email (fire-and-forget)
     try {
       const [pCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
       const cs = pCfg?.config?._superConfig?.clicksend || pCfg?.config?.clicksend || {};
@@ -1329,6 +1635,7 @@ app.post("/api/tenants", async (req, res) => {
         console.log(`[Tenants] Welcome email sent to ${email}`);
       }
     } catch (e) { console.error("[Tenants] Welcome email error:", e.message); }
+    // Audit
     await writeAudit(org.id, "tenant_created", `Tenant account created — plan ${plan}`, { name, email, plan }).catch(()=>{});
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1348,6 +1655,7 @@ app.patch("/api/tenants/:id", async (req, res) => {
       RETURNING *
     `;
     if (!rows.length) return res.status(404).json({ error: "Not found" });
+    // Audit significant changes
     const updated = rows[0];
     if (status) await writeAudit(req.params.id, `tenant_${status}`, `Tenant status changed to ${status}`, { status }).catch(()=>{});
     if (plan)   await writeAudit(req.params.id, "plan_changed", `Plan changed to ${plan}`, { plan }).catch(()=>{});
@@ -1368,6 +1676,9 @@ app.delete("/api/tenants/:id", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// AGENTS
+// ─────────────────────────────────────────────
 app.get("/api/agents", async (req, res) => {
   try {
     const { org_id } = req.query;
@@ -1393,6 +1704,7 @@ app.get("/api/agents/:id", async (req, res) => {
 app.post("/api/agents", async (req, res) => {
   const { org_id, name, email, mobile, role = "agent", sms_alerts = true } = req.body;
   if (!name || !email) return res.status(400).json({ error: "name and email required" });
+  // Plan enforcement
   if (org_id) {
     const limitErr = await checkAgentLimit(org_id);
     if (limitErr) return res.status(403).json(limitErr);
@@ -1407,10 +1719,12 @@ app.post("/api/agents", async (req, res) => {
     res.status(201).json(rows[0]);
   } catch (e) {
     const msg = e.message || "";
+    // Duplicate email — return existing agent so invite can still send credentials
     if (msg.includes("duplicate") || msg.includes("unique") || msg.includes("already exists")) {
       try {
         const existing = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email}) LIMIT 1`;
         if (existing.length) {
+          // Update org_id if it was missing
           if (!existing[0].org_id && org_id) {
             await sql`UPDATE agents SET org_id = ${org_id} WHERE id = ${existing[0].id}`;
           }
@@ -1419,6 +1733,7 @@ app.post("/api/agents", async (req, res) => {
       } catch (_) {}
       return res.status(409).json({ error: "An agent with that email already exists." });
     }
+    // Missing columns — auto-migrate and retry
     if (msg.includes("column") || msg.includes("does not exist")) {
       try {
         await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS sms_alerts BOOLEAN DEFAULT true`;
@@ -1438,7 +1753,9 @@ app.post("/api/agents", async (req, res) => {
 app.patch("/api/agents/:id", async (req, res) => {
   const { name, email, mobile, role, status, sms_alerts, restrict_to_mine } = req.body;
   try {
+    // Auto-add columns that may not exist yet
     await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS restrict_to_mine BOOLEAN DEFAULT false`.catch(()=>{});
+    // Build update — only set fields that were actually sent
     const rtm = restrict_to_mine !== undefined && restrict_to_mine !== null ? Boolean(restrict_to_mine) : null;
     const rows = await sql`
       UPDATE agents SET
@@ -1468,6 +1785,7 @@ app.delete("/api/agents/:id", async (req, res) => {
   }
 });
 
+// POST /api/agents/:id/password
 app.post("/api/agents/:id/password", async (req, res) => {
   const { password } = req.body;
   if (!password || !password.trim()) return res.status(400).json({ error: "password required" });
@@ -1479,36 +1797,56 @@ app.post("/api/agents/:id/password", async (req, res) => {
   }
 });
 
+// POST /api/invite-agent — create login credentials and notify agent via SMS
 app.post("/api/invite-agent", async (req, res) => {
   const { tenantId, name, email, mobile } = req.body;
   if (!email) return res.status(400).json({ error: "email required" });
   try {
+    // Generate a readable temp password
     const adjectives = ["Blue","Fast","Bright","Clear","Bold","Swift","Sharp","Clean"];
     const nouns      = ["Eagle","River","Storm","Cloud","Stone","Ridge","Flame","Coast"];
-    const tempPassword = adjectives[Math.floor(Math.random()*adjectives.length)] + nouns[Math.floor(Math.random()*nouns.length)] + Math.floor(Math.random()*900+100);
-    await sql`UPDATE agents SET password_hash = ${tempPassword}, must_change_password = true WHERE LOWER(email) = LOWER(${email})`;
+    const tempPassword =
+      adjectives[Math.floor(Math.random()*adjectives.length)] +
+      nouns[Math.floor(Math.random()*nouns.length)] +
+      Math.floor(Math.random()*900+100);
+
+    // Set the password on the agent record so they can log in immediately
+    await sql`
+      UPDATE agents
+      SET password_hash = ${tempPassword}, must_change_password = true
+      WHERE LOWER(email) = LOWER(${email})
+    `;
+
+    // If no mobile, return password for manual sharing
     if (!mobile) {
       return res.json({ ok: false, passwordSet: true, tempPassword, sendErr: "No mobile number provided" });
     }
+
+    // Load ClickSend creds (tenant first, then platform fallback)
     let cs = {};
     for (const tid of [tenantId, "platform"]) {
       if (!tid) continue;
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tid} LIMIT 1`;
       if (rows.length && rows[0].config?.clicksend?.username) { cs = rows[0].config.clicksend; break; }
     }
+
     if (!cs.username || !cs.apiKey) {
       return res.json({ ok: false, passwordSet: true, tempPassword, sendErr: "ClickSend not configured" });
     }
+
     const loginUrl = "https://chatbot.hindleconsultants.com";
     const smsBody  = `Hi ${name || "there"}, you're invited to Hindle AI. Login: ${loginUrl} Email: ${email} Password: ${tempPassword} (change after first login)`;
     const auth     = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
+
     let sent = false;
     let sendErr = null;
     try {
       const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: auth },
-        body: JSON.stringify({ messages: [{ source: "sdk", to: mobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: smsBody, schedule: 0 }] }),
+        body: JSON.stringify({
+          messages: [{ source: "sdk", to: mobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: smsBody, schedule: 0 }],
+        }),
         signal: AbortSignal.timeout(10000),
       });
       const d = await r.json();
@@ -1517,18 +1855,25 @@ app.post("/api/invite-agent", async (req, res) => {
     } catch (fetchErr) {
       sendErr = fetchErr.message;
     }
+
     res.json({ ok: sent, passwordSet: true, tempPassword, sendErr });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+// ─────────────────────────────────────────────
+// CONVERSATIONS
+// ─────────────────────────────────────────────
 app.get("/api/conversations", async (req, res) => {
   try {
     const { org_id, status } = req.query;
     console.log(`[Conversations GET] org_id="${org_id||"none"}" status="${status||"none"}"`);
+    
+    // Always resolve to canonical UUID — handles slug, UUID, or email
     let canonicalOrgId = org_id ? await resolveOrgId(org_id) : null;
     console.log(`[Conversations GET] resolved="${canonicalOrgId||"none"}"`);
+    
     let rows;
     if (canonicalOrgId && status) {
       [rows] = await sqlManyForOrg(canonicalOrgId, [
@@ -1539,6 +1884,7 @@ app.get("/api/conversations", async (req, res) => {
         sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.org_id = ${canonicalOrgId} ORDER BY c.updated_at DESC`
       ]);
     } else {
+      // Super admin — empty context = see all
       [rows] = await sqlManyForOrg(null, [
         sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id ORDER BY c.updated_at DESC LIMIT 500`
       ]);
@@ -1552,6 +1898,7 @@ app.get("/api/conversations", async (req, res) => {
 
 app.get("/api/conversations/:id", async (req, res) => {
   try {
+    // Use null orgId = super admin context; endpoint validates ownership via id
     const rows = await sqlForOrg(null, sql`SELECT c.*, a.name as agent_name FROM conversations c LEFT JOIN agents a ON c.assigned_agent_id = a.id WHERE c.id = ${req.params.id}`);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
@@ -1562,17 +1909,22 @@ app.get("/api/conversations/:id", async (req, res) => {
 
 app.post("/api/conversations", async (req, res) => {
   const { org_id, tenant_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status } = req.body;
+  // Resolve org_id: widget sends tenant_id (= organisations.id UUID), dashboard sends org_id
   let resolvedOrgId = await resolveOrgId(org_id || tenant_id);
+  // If still nothing, use the raw value as fallback (will fail gracefully)
   if (!resolvedOrgId && (org_id || tenant_id)) resolvedOrgId = org_id || tenant_id;
+  // Plan enforcement — only block if we can resolve the org
   if (resolvedOrgId) {
     const limitErr = await checkConvoLimit(resolvedOrgId);
     if (limitErr) return res.status(403).json(limitErr);
   }
+  // Auto-detect location from IP if not supplied
   let resolvedLocation = visitor_location || null;
   if (!resolvedLocation) {
     try {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
       if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
+        // Try ip-api.com first (generous free tier, no auth needed)
         let geoResolved = false;
         try {
           const geoR = await fetch(`http://ip-api.com/json/${ip}?fields=status,city,regionName,country`);
@@ -1581,9 +1933,11 @@ app.post("/api/conversations", async (req, res) => {
             if (geo.status === "success" && (geo.city || geo.country)) {
               resolvedLocation = [geo.city, geo.regionName, geo.country].filter(Boolean).join(", ");
               geoResolved = true;
+              console.log(`[Conversations POST] geo (ip-api): "${resolvedLocation}" ip="${ip}"`);
             }
           }
         } catch (_) {}
+        // Fallback to ipapi.co
         if (!geoResolved) {
           try {
             const geoR2 = await fetch(`https://ipapi.co/${ip}/json/`);
@@ -1591,6 +1945,9 @@ app.post("/api/conversations", async (req, res) => {
               const geo2 = await geoR2.json();
               if (geo2.city || geo2.country_name) {
                 resolvedLocation = [geo2.city, geo2.region, geo2.country_name].filter(Boolean).join(", ");
+                console.log(`[Conversations POST] geo (ipapi.co): "${resolvedLocation}" ip="${ip}"`);
+              } else {
+                console.log(`[Conversations POST] geo: no result from either provider ip="${ip}"`);
               }
             }
           } catch (_) {}
@@ -1598,6 +1955,7 @@ app.post("/api/conversations", async (req, res) => {
       }
     } catch (_) {}
   }
+
   try {
     const rows = await sql`
       INSERT INTO conversations (org_id, visitor_name, visitor_email, visitor_phone, visitor_company, visitor_location, page, subject, status)
@@ -1606,6 +1964,7 @@ app.post("/api/conversations", async (req, res) => {
     `;
     res.status(201).json(rows[0]);
   } catch (e) {
+    // Auto-add missing columns and retry
     if (e.message && (e.message.includes("column") || e.message.includes("does not exist"))) {
       try {
         await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_phone TEXT`;
@@ -1633,6 +1992,7 @@ app.patch("/api/conversations/:id", async (req, res) => {
           priority } = req.body;
   try {
     await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS priority TEXT`.catch(()=>{});
+    // Get org for this conversation to set RLS context
     const [convOrg] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(()=>[null]);
     const rows = await sqlForOrg(convOrg?.org_id, sql`
       UPDATE conversations SET
@@ -1653,6 +2013,7 @@ app.patch("/api/conversations/:id", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (e) {
+    // Auto-add missing columns and retry with minimal update
     if (e.message && (e.message.includes("claimed_by") || e.message.includes("visitor_email") || e.message.includes("column"))) {
       try {
         await sql`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS claimed_by_id TEXT`;
@@ -1690,8 +2051,12 @@ app.delete("/api/conversations/:id", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// MESSAGES
+// ─────────────────────────────────────────────
 app.get("/api/conversations/:id/messages", async (req, res) => {
   try {
+    // Fetch the conversation's org_id first so RLS context is correct
     const [conv] = await sql`SELECT org_id FROM conversations WHERE id = ${req.params.id} LIMIT 1`.catch(() => [null]);
     const orgId = conv?.org_id || null;
     const rows = await sqlForOrg(orgId, sql`SELECT * FROM messages WHERE conversation_id = ${req.params.id} ORDER BY created_at ASC`);
@@ -1704,6 +2069,7 @@ app.get("/api/conversations/:id/messages", async (req, res) => {
 app.post("/api/conversations/:id/messages", async (req, res) => {
   const { type, sender, content, file_url } = req.body;
   if (!type || (!content && !file_url)) return res.status(400).json({ error: "type and content or file_url required" });
+  // Allowed types: visitor, agent, bot, system, note
   const validTypes = ["visitor","agent","bot","system","note"];
   const msgType = validTypes.includes(type) ? type : "agent";
   try {
@@ -1715,7 +2081,10 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
     `;
     await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${req.params.id}`;
     if (msgType === "agent") {
-      await sql`UPDATE conversations SET first_response_at = NOW() WHERE id = ${req.params.id} AND first_response_at IS NULL`.catch(() => {});
+      await sql`
+        UPDATE conversations SET first_response_at = NOW()
+        WHERE id = ${req.params.id} AND first_response_at IS NULL
+      `.catch(() => {});
     }
     res.status(201).json(rows[0]);
   } catch (e) {
@@ -1723,6 +2092,9 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// ALERT LOG
+// ─────────────────────────────────────────────
 app.get("/api/alert-log", async (req, res) => {
   try {
     const { org_id } = req.query;
@@ -1753,20 +2125,25 @@ app.post("/api/alert-log", async (req, res) => {
 app.patch("/api/alert-log/:id", async (req, res) => {
   const { status } = req.body;
   try {
-    const rows = await sql`UPDATE alert_log SET status = ${status} WHERE id = ${req.params.id} RETURNING *`;
+    const rows = await sql`
+      UPDATE alert_log SET status = ${status} WHERE id = ${req.params.id} RETURNING *
+    `;
     res.json(rows[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+// ─────────────────────────────────────────────
+// KNOWLEDGE BASE
+// ─────────────────────────────────────────────
 app.get("/api/kb", async (req, res) => {
   try {
     const { org_id } = req.query;
     if (!org_id) return res.status(400).json({ error: "org_id required" });
     const canonicalId = await resolveOrgId(org_id);
     if (!canonicalId) return res.status(404).json({ error: "Organisation not found" });
-    const [rows] = await sqlManyForOrg(canonicalId, [sql`SELECT * FROM kb_documents WHERE org_id = ${canonicalId} ORDER BY created_at DESC`]);
+    const [rows] = await sqlManyForOrg(canonicalId, [sql`SELECT * FROM kb_documents WHERE org_id = ${canonicalId} ORDER BY created_at DESC`]); // sqlManyForOrg already sets RLS context
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1776,6 +2153,7 @@ app.get("/api/kb", async (req, res) => {
 app.post("/api/kb", async (req, res) => {
   const { org_id, name, category, sub_category, size_kb, chunks } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
+  // Plan enforcement
   if (org_id) {
     const limitErr = await checkKbLimit(org_id);
     if (limitErr) return res.status(403).json(limitErr);
@@ -1837,9 +2215,137 @@ app.delete("/api/kb/:id", async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────
+// AUTH  — tenant admin login
+// POST /api/auth  { email, password }
+// Returns { ok, org_id, role, email, name }
+// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// UNIFIED AUTH — checks organisations (tenant admins) then agents
+// POST /api/auth  { email, password }
+// ─────────────────────────────────────────────
+// ── Forgot Password ───────────────────────────────────────────────────────────
+// Sends a password reset link via email. Works for both tenant admins and agents.
+// Always returns success (avoids email enumeration).
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email required" });
+  const emailLower = email.toLowerCase().trim();
+  res.json({ ok: true }); // Always respond OK immediately (no enumeration)
+
+  // Run lookup + email send async (fire-and-forget)
+  (async () => {
+    try {
+      // Check tenant admins first
+      let org = null;
+      let agent = null;
+      let name = "";
+      let orgId = null;
+
+      const orgRows = await sql`SELECT * FROM organisations WHERE email = ${emailLower} LIMIT 1`.catch(()=>[]);
+      if (orgRows.length) {
+        org = orgRows[0];
+        orgId = org.id;
+        name = org.name || "there";
+      } else {
+        // Check agents table
+        const agentRows = await sql`SELECT a.*, o.id as org_id FROM agents a JOIN organisations o ON o.id = a.org_id WHERE a.email = ${emailLower} LIMIT 1`.catch(()=>[]);
+        if (agentRows.length) {
+          agent = agentRows[0];
+          orgId = agent.org_id;
+          name = agent.name || "there";
+        }
+      }
+
+      if (!orgId) return; // No account — silent exit
+
+      // Generate a time-limited reset token (valid 1 hour)
+      const token = require("crypto").randomBytes(32).toString("hex");
+      const expiry = new Date(Date.now() + 3600000).toISOString();
+
+      // Store token in tenant_configs for this org
+      const [existing] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`.catch(()=>[null]);
+      const cfg = existing?.config || {};
+      cfg._resetToken = { token, expiry, email: emailLower };
+      await sql`
+        INSERT INTO tenant_configs (tenant_id, config)
+        VALUES (${orgId}, ${JSON.stringify(cfg)})
+        ON CONFLICT (tenant_id) DO UPDATE SET config = ${JSON.stringify(cfg)}
+      `.catch(()=>{});
+
+      // Build reset URL
+      const baseUrl = "https://chatbot.hindleconsultants.com";
+      const resetUrl = `${baseUrl}?reset=${token}&org=${orgId}`;
+
+      // Send email
+      const { smtpCfg, csCfg } = await loadEmailConfig(orgId).catch(()=>({smtpCfg:null,csCfg:null}));
+      await sendEmail({
+        to: emailLower,
+        toName: name,
+        subject: "Reset your Hindle password",
+        body: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+  <h2 style="margin:0 0 12px;color:#1e293b">Reset your password</h2>
+  <p style="color:#64748b;margin:0 0 20px">Hi ${name},<br><br>We received a request to reset your Hindle password. Click the button below to set a new password. This link expires in 1 hour.</p>
+  <a href="${resetUrl}" style="display:inline-block;background:#3B82F6;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:15px;margin-bottom:20px">Reset Password →</a>
+  <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">If you didn't request this, you can safely ignore this email. Your password won't change.</p>
+</div>`,
+        smtpCfg,
+        csCfg,
+      }).catch(e => console.error("[ForgotPW] email error:", e.message));
+
+      console.log(`[ForgotPW] Reset link sent to ${emailLower}`);
+    } catch (e) {
+      console.error("[ForgotPW] error:", e.message);
+    }
+  })();
+});
+
+// ── Reset Password (token verify + set new password) ─────────────────────────
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token, orgId, newPassword } = req.body;
+  if (!token || !orgId || !newPassword) return res.status(400).json({ error: "Missing fields" });
+  if (newPassword.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+  try {
+    const [cfgRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`.catch(()=>[null]);
+    const cfg = cfgRow?.config || {};
+    const rt = cfg._resetToken;
+    if (!rt || rt.token !== token) return res.status(400).json({ error: "Invalid or expired reset link" });
+    if (new Date(rt.expiry) < new Date()) return res.status(400).json({ error: "Reset link has expired. Please request a new one." });
+
+    const bcrypt = require("bcrypt");
+    const hash = await bcrypt.hash(newPassword, 10);
+    const email = rt.email;
+
+    // Update org (tenant admin) or agent password
+    const orgRows = await sql`SELECT id FROM organisations WHERE email = ${email} AND id = ${orgId} LIMIT 1`.catch(()=>[]);
+    if (orgRows.length) {
+      // Tenant admin — store hashed password in tenant_configs
+      const updated = { ...cfg, _adminPasswordHash: hash };
+      delete updated._resetToken;
+      await sql`UPDATE tenant_configs SET config = ${JSON.stringify(updated)} WHERE tenant_id = ${orgId}`;
+    } else {
+      // Agent
+      await sql`UPDATE agents SET password_hash = ${hash}, must_change_password = false WHERE email = ${email} AND org_id = ${orgId}`.catch(()=>{});
+      const updated = { ...cfg };
+      delete updated._resetToken;
+      await sql`UPDATE tenant_configs SET config = ${JSON.stringify(updated)} WHERE tenant_id = ${orgId}`;
+    }
+
+    await writeAudit(orgId, "password_reset", `Password reset for ${email}`, { email }).catch(()=>{});
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 app.post("/api/auth", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ ok: false, error: "email and password required" });
+
+  // 1. Try tenant admin (organisations table)
   try {
     const rows = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1`;
     if (rows.length) {
@@ -1855,6 +2361,8 @@ app.post("/api/auth", async (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
+
+  // 2. Try agent (agents table)
   try {
     const rows = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1`;
     if (!rows.length) return res.status(401).json({ ok: false, error: "No account found for that email address." });
@@ -1875,12 +2383,17 @@ app.post("/api/auth", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// SMS TEST  — send a test SMS via ClickSend
+// POST /api/sms-test  { username, apiKey, to, sender } OR { tenantId, to }
+// ─────────────────────────────────────────────
 app.post("/api/sms-test", async (req, res) => {
   let { username, apiKey, to, sender, tenantId } = req.body;
+  // If tenantId supplied, load credentials from DB
   if (tenantId && (!username || !apiKey)) {
     try {
+      // Try own tenant config first, then platform fallback
       for (const tid of [tenantId, "platform"]) {
-        if (!tid) continue;
         const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tid} LIMIT 1`;
         if (rows.length && rows[0].config?.clicksend?.username) {
           username = rows[0].config.clicksend.username;
@@ -1911,49 +2424,86 @@ app.post("/api/sms-test", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// HANDOFF TOKEN  — resolve a magic link token
+// GET /api/handoff-token/:token
+// Returns { ok, org_id, conversation_id, agent: { name, email, mobile } }
+// Marks token clicked on first use; returns 410 if expired (>5 min)
+// ─────────────────────────────────────────────
 app.get("/api/handoff-token/:token", async (req, res) => {
+  const { token } = req.params;
   try {
-    const rows = await sql`SELECT * FROM alert_log WHERE token = ${req.params.token} LIMIT 1`;
-    if (!rows.length) return res.status(404).json({ error: "Invalid or expired link" });
+    const rows = await sql`SELECT * FROM alert_log WHERE token = ${token} LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ ok: false, error: "Token not found" });
     const row = rows[0];
+    // Check expiry — 3 minutes
     const age = Date.now() - new Date(row.created_at).getTime();
     if (age > 3 * 60 * 1000) {
-      try { await sql`UPDATE alert_log SET status = 'expired' WHERE token = ${req.params.token}`; } catch (_) {}
-      return res.status(410).json({ error: "Link expired", expired: true });
+      await sql`UPDATE alert_log SET status = 'expired' WHERE id = ${row.id}`;
+      return res.status(410).json({ ok: false, error: "This link has expired (3-minute limit)." });
     }
-    if (row.status === "expired") return res.status(410).json({ error: "Link expired", expired: true });
-    try { await sql`UPDATE alert_log SET status = 'clicked' WHERE token = ${req.params.token}`; } catch (_) {}
-    const orgs   = await sql`SELECT * FROM organisations WHERE id = ${row.org_id} LIMIT 1`;
-    const agents = await sql`SELECT * FROM agents WHERE org_id = ${row.org_id} AND role = 'tenant_admin' LIMIT 1`;
-    res.json({ ok: true, token: row.token, org_id: row.org_id, conversation_id: row.conversation_id,
-               visitor_name: row.visitor_name, page: row.page, org: orgs[0] || null, agent: agents[0] || null });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    // Mark clicked (first use only)
+    if (row.status !== "clicked") {
+      await sql`UPDATE alert_log SET status = 'clicked' WHERE id = ${row.id}`;
+    }
+    // Look up agent details if possible
+    let agent = { name: row.agent_name, mobile: row.mobile, email: null };
+    try {
+      const agt = await sql`SELECT * FROM agents WHERE mobile = ${row.mobile} LIMIT 1`;
+      if (agt.length) agent = { name: agt[0].name, email: agt[0].email, mobile: agt[0].mobile };
+    } catch (_) {}
+    res.json({ ok: true, org_id: row.org_id, conversation_id: row.conversation_id, agent });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
+// ─────────────────────────────────────────────
+// POST /api/handoff  — visitor-initiated handoff + ClickSend SMS
+// ─────────────────────────────────────────────
 app.post("/api/handoff", async (req, res) => {
   const {
-    tenantId, conversationId: existingConvId,
-    visitorEmail, visitorName, visitorPhone, visitorCompany, visitorLocation: widgetLocation,
-    page, url, history,
+    tenantId,
+    conversationId: existingConvId,
+    visitorEmail,
+    visitorName,
+    visitorPhone,
+    visitorCompany,
+    visitorLocation: widgetLocation,
+    page,
+    url,
+    history,
   } = req.body;
+
   console.log(`[Handoff] ▶ tenantId="${tenantId}" existingConvId="${existingConvId||"none"}" visitor="${visitorName||visitorEmail||"anon"}"`);
+
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
+
+  // ── Load tenant config (with platform fallback for ClickSend creds) ──
   let tenantConfig = {};
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} LIMIT 1`;
     if (rows.length) tenantConfig = rows[0].config;
   } catch (e) {}
+
   if (!tenantConfig?.clicksend?.username) {
     try {
       let pCfg = {};
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
       if (rows.length) pCfg = rows[0].config;
       if (pCfg?.clicksend?.username) {
+        // Platform creds as base — only override with tenant values that are actually set
         const tCs = tenantConfig.clicksend || {};
-        tenantConfig = { ...tenantConfig, clicksend: { ...pCfg.clicksend, ...(tCs.username ? { username: tCs.username } : {}), ...(tCs.apiKey ? { apiKey: tCs.apiKey } : {}), ...(tCs.smsSender ? { smsSender: tCs.smsSender } : {}) }};
+        tenantConfig = { ...tenantConfig, clicksend: {
+          ...pCfg.clicksend,
+          ...(tCs.username ? { username: tCs.username } : {}),
+          ...(tCs.apiKey   ? { apiKey:   tCs.apiKey   } : {}),
+          ...(tCs.smsSender? { smsSender:tCs.smsSender} : {}),
+        }};
       }
     } catch (e) {}
   }
+
   if (!tenantConfig?.clicksend?.username) {
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE (config->'clicksend'->>'username') IS NOT NULL AND (config->'clicksend'->>'username') != '' LIMIT 1`;
@@ -1962,39 +2512,62 @@ app.post("/api/handoff", async (req, res) => {
       }
     } catch (e) {}
   }
-  const cs = tenantConfig.clicksend || {};
-  const smsSender = (cs.smsSender || "HINDLE").substring(0, 11);
+
+  const cs         = tenantConfig.clicksend || {};
+  const smsSender  = (cs.smsSender || "HINDLE").substring(0, 11);
   const visitorLabel = visitorName || visitorEmail || "A visitor";
+
+  // ── Resolve org UUID ──────────────────────────────────────────────────
   let resolvedOrgId = await resolveOrgId(tenantId);
   console.log(`[Handoff] org lookup → tenantId="${tenantId}" resolvedOrgId="${resolvedOrgId||"NOT FOUND"}"`);
   if (!resolvedOrgId) {
     console.error(`[Handoff] CRITICAL: cannot resolve org for tenantId="${tenantId}" — conv will NOT be created`);
   }
+
+  // ── Resolve visitor location ─────────────────────────────────────────
   let resolvedLocation = widgetLocation || null;
   if (!resolvedLocation) {
     try {
       const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
       if (ip && ip !== "127.0.0.1" && ip !== "::1" && !ip.startsWith("::ffff:127")) {
+        // Try ip-api.com first (generous free tier)
         let geoOk = false;
         try {
           const geoR = await fetch(`http://ip-api.com/json/${ip}?fields=status,city,regionName,country`);
-          if (geoR.ok) { const geo = await geoR.json(); if (geo.status === "success" && (geo.city || geo.country)) { resolvedLocation = [geo.city, geo.regionName, geo.country].filter(Boolean).join(", "); geoOk = true; } }
+          if (geoR.ok) {
+            const geo = await geoR.json();
+            if (geo.status === "success" && (geo.city || geo.country)) {
+              resolvedLocation = [geo.city, geo.regionName, geo.country].filter(Boolean).join(", ");
+              geoOk = true;
+              console.log(`[Handoff] geo (ip-api): "${resolvedLocation}" ip="${ip}"`);
+            }
+          }
         } catch (_) {}
         if (!geoOk) {
           try {
             const geoR2 = await fetch(`https://ipapi.co/${ip}/json/`);
-            if (geoR2.ok) { const geo2 = await geoR2.json(); if (geo2.city || geo2.country_name) { resolvedLocation = [geo2.city, geo2.region, geo2.country_name].filter(Boolean).join(", "); } }
+            if (geoR2.ok) {
+              const geo2 = await geoR2.json();
+              if (geo2.city || geo2.country_name) {
+                resolvedLocation = [geo2.city, geo2.region, geo2.country_name].filter(Boolean).join(", ");
+                console.log(`[Handoff] geo (ipapi.co): "${resolvedLocation}" ip="${ip}"`);
+              }
+            }
           } catch (_) {}
         }
       }
     } catch (_) {}
   }
+
+  // ── Load agents from DB ───────────────────────────────────────────────
   let agentsList = [];
   try {
     if (resolvedOrgId) {
       agentsList = await sql`SELECT * FROM agents WHERE org_id = ${resolvedOrgId} AND active != false`;
     }
   } catch (e) {}
+
+  // ── Upsert conversation ───────────────────────────────────────────────
   let conversationId = existingConvId || null;
   try {
     if (!conversationId && resolvedOrgId) {
@@ -2004,37 +2577,48 @@ app.post("/api/handoff", async (req, res) => {
         RETURNING *
       `;
       conversationId = convRows[0]?.id;
+      console.log(`[Handoff] created conv id="${conversationId}" org="${resolvedOrgId}" loc="${resolvedLocation||"none"}"`)
     } else if (conversationId) {
       await sql`
         UPDATE conversations SET
-          status = 'handoff',
-          visitor_name = COALESCE(NULLIF(${visitorLabel},''), visitor_name),
-          visitor_email = COALESCE(${visitorEmail||null}, visitor_email),
-          visitor_phone = COALESCE(${visitorPhone||null}, visitor_phone),
-          visitor_company = COALESCE(${visitorCompany||null}, visitor_company),
+          status           = 'handoff',
+          visitor_name     = COALESCE(NULLIF(${visitorLabel},''), visitor_name),
+          visitor_email    = COALESCE(${visitorEmail||null}, visitor_email),
+          visitor_phone    = COALESCE(${visitorPhone||null}, visitor_phone),
+          visitor_company  = COALESCE(${visitorCompany||null}, visitor_company),
           visitor_location = COALESCE(${resolvedLocation||null}, visitor_location),
-          updated_at = NOW()
+          updated_at       = NOW()
         WHERE id = ${conversationId}
       `;
+      console.log(`[Handoff] updated conv id="${conversationId}" status=handoff loc="${resolvedLocation||"none"}"`)
+    } else {
+      console.log(`[Handoff] WARNING: no conversationId and no resolvedOrgId — conv not created!`);
     }
   } catch (e) { console.error("[Handoff] conv upsert error:", e.message); }
+
+  // ── Build magic link ──────────────────────────────────────────────────
   const handoffToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
   const magicUrl = `https://chatbot.hindleconsultants.com/?token=${handoffToken}`;
+
+  // ── Log alert ─────────────────────────────────────────────────────────
   try {
     await sql`
       INSERT INTO alert_log (org_id, conversation_id, agent_name, mobile, visitor_name, page, token)
       VALUES (${resolvedOrgId}, ${conversationId || null}, ${"Widget Handoff"}, ${"—"}, ${visitorLabel}, ${page || "/"}, ${handoffToken})
     `;
   } catch (e) {}
+
+  // ── Send SMS via ClickSend ────────────────────────────────────────────
   let smsSent = false, smsError = null, smsTargets = 0;
+
   if (cs.username && cs.apiKey) {
     const targets = agentsList.filter(a => a.mobile && a.sms_alerts !== false && a.active !== false);
     smsTargets = targets.length;
     if (targets.length) {
       try {
-        const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
+        const auth    = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
         const smsBody = "[" + smsSender + "] " + visitorLabel + " on " + (page || "/") + " wants to chat. Join: " + magicUrl;
-        const msgs = targets.map(a => ({ source: "sdk", to: a.mobile, from: smsSender, body: smsBody, schedule: 0 }));
+        const msgs    = targets.map(a => ({ source: "sdk", to: a.mobile, from: smsSender, body: smsBody, schedule: 0 }));
         const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: auth },
@@ -2042,7 +2626,7 @@ app.post("/api/handoff", async (req, res) => {
           signal: AbortSignal.timeout(8000),
         });
         const d = await r.json();
-        smsSent = d?.data?.messages?.every(m => m.status === "SUCCESS");
+        smsSent  = d?.data?.messages?.every(m => m.status === "SUCCESS");
         smsError = smsSent ? null : (d?.data?.messages?.[0]?.status || "Send failed");
         try { await sql`UPDATE alert_log SET status = ${smsSent ? "sent" : "failed"} WHERE token = ${handoffToken}`; } catch (_) {}
       } catch (e) { smsError = e.message; }
@@ -2052,10 +2636,40 @@ app.post("/api/handoff", async (req, res) => {
   } else {
     smsError = "ClickSend credentials not configured";
   }
-  res.json({ ok: true, smsSent, smsTargets, smsError, token: handoffToken, conversationId,
-    message: smsSent ? "SMS sent to " + smsTargets + " agent(s)" : "Handoff logged — " + (smsError || "SMS not configured") });
+
+  res.json({
+    ok: true, smsSent, smsTargets, smsError, token: handoffToken, conversationId,
+    message: smsSent ? "SMS sent to " + smsTargets + " agent(s)" : "Handoff logged — " + (smsError || "SMS not configured"),
+  });
 });
 
+// ─────────────────────────────────────────────
+// GET /api/handoff-token/:token  — magic link verification
+// ─────────────────────────────────────────────
+app.get("/api/handoff-token/:token", async (req, res) => {
+  try {
+    const rows = await sql`SELECT * FROM alert_log WHERE token = ${req.params.token} LIMIT 1`;
+    if (!rows.length) return res.status(404).json({ error: "Invalid or expired link" });
+    const row = rows[0];
+    // Check expiry (3 minutes)
+    const age = Date.now() - new Date(row.created_at).getTime();
+    if (age > 3 * 60 * 1000) {
+      try { await sql`UPDATE alert_log SET status = 'expired' WHERE token = ${req.params.token}`; } catch (_) {}
+      return res.status(410).json({ error: "Link expired", expired: true });
+    }
+    if (row.status === "expired") return res.status(410).json({ error: "Link expired", expired: true });
+    // Mark clicked
+    try { await sql`UPDATE alert_log SET status = 'clicked' WHERE token = ${req.params.token}`; } catch (_) {}
+    const orgs   = await sql`SELECT * FROM organisations WHERE id = ${row.org_id} LIMIT 1`;
+    const agents = await sql`SELECT * FROM agents WHERE org_id = ${row.org_id} AND role = 'tenant_admin' LIMIT 1`;
+    res.json({ ok: true, token: row.token, org_id: row.org_id, conversation_id: row.conversation_id,
+               visitor_name: row.visitor_name, page: row.page, org: orgs[0] || null, agent: agents[0] || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// GET /api/org-by-email/:email
+// ─────────────────────────────────────────────
 app.get("/api/org-by-email/:email", async (req, res) => {
   try {
     const agents = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${req.params.email}) LIMIT 1`;
@@ -2071,6 +2685,9 @@ app.get("/api/org-by-email/:email", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────
+// AUTH
+// ─────────────────────────────────────────────
 app.post("/api/auth/check-email", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "email required" });
@@ -2090,8 +2707,11 @@ app.post("/api/auth/magic-link", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "no_account" });
     const agent = rows[0];
     const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    // Store the token (reuse alert_log or a dedicated table — using a temp JSON in tenant_configs)
+    // Simple approach: store in agent record temporarily
     await sql`UPDATE agents SET magic_token = ${token}, magic_token_at = NOW() WHERE id = ${agent.id}`;
     const link = `https://chatbot.hindleconsultants.com/?magic=${token}`;
+    // In production send via email — for now return it (dev mode)
     res.json({ ok: true, link, message: "Magic link generated (send via email in production)" });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2127,27 +2747,67 @@ app.post("/api/auth/set-password", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────
+// POST /api/sms-test  — test ClickSend credentials
+// ─────────────────────────────────────────────
+app.post("/api/sms-test", async (req, res) => {
+  const { username, apiKey, to, sender } = req.body;
+  if (!username || !apiKey || !to) return res.status(400).json({ error: "username, apiKey, and to are required" });
+  try {
+    const auth = "Basic " + Buffer.from(username + ":" + apiKey).toString("base64");
+    const from = (sender || "HINDLE").substring(0, 11);
+    const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth },
+      body: JSON.stringify({ messages: [{ source: "sdk", to, from, body: "Hindle SMS test — your ClickSend integration is working correctly.", schedule: 0 }] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const d = await r.json();
+    const ok = d?.data?.messages?.[0]?.status === "SUCCESS";
+    res.json({ ok, status: d?.data?.messages?.[0]?.status || "unknown", raw: d });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// AUDIT LOG
+// ─────────────────────────────────────────────
 async function ensureAuditTable() {
   try {
-    await sql`CREATE TABLE IF NOT EXISTS audit_log (id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, event_type TEXT NOT NULL, description TEXT, meta JSONB, created_at TIMESTAMPTZ DEFAULT NOW())`;
+    await sql`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id          BIGSERIAL PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        event_type  TEXT NOT NULL,
+        description TEXT,
+        meta        JSONB,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
     await sql`CREATE INDEX IF NOT EXISTS audit_log_tenant_idx ON audit_log (tenant_id, created_at DESC)`;
   } catch (_) {}
 }
 async function writeAudit(tenantId, eventType, description, meta) {
   try {
-    await sql`INSERT INTO audit_log (tenant_id, event_type, description, meta) VALUES (${tenantId}, ${eventType}, ${description || null}, ${meta ? JSON.stringify(meta) : null})`;
+    await sql`
+      INSERT INTO audit_log (tenant_id, event_type, description, meta)
+      VALUES (${tenantId}, ${eventType}, ${description || null}, ${meta ? JSON.stringify(meta) : null})
+    `;
   } catch (_) {}
 }
 ensureAuditTable();
 
 app.get("/api/audit-log/:tenantId", async (req, res) => {
   try {
-    const rows = await sql`SELECT * FROM audit_log WHERE tenant_id = ${req.params.tenantId} ORDER BY created_at DESC LIMIT 200`;
+    const rows = await sql`
+      SELECT * FROM audit_log WHERE tenant_id = ${req.params.tenantId}
+      ORDER BY created_at DESC LIMIT 200
+    `;
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/api/audit-log", async (req, res) => {
+  // Super admin — all tenants
   try {
     const rows = await sql`SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 500`;
     res.json(rows);
@@ -2163,6 +2823,9 @@ app.post("/api/audit-log", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────
+// PLAN ENFORCEMENT — usage limits per plan
+// ─────────────────────────────────────────────
 const PLAN_LIMITS = {
   free:         { agents: 1,  conversations_month: 100,  kb_docs: 0   },
   starter:      { agents: 5,  conversations_month: 500,  kb_docs: 5   },
@@ -2170,6 +2833,7 @@ const PLAN_LIMITS = {
   enterprise:   { agents: 999,conversations_month: 999999,kb_docs: 999 },
 };
 
+// Load admin-configured plan limits from DB (overrides hardcoded defaults)
 async function getAdminPlanLimits() {
   try {
     const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
@@ -2178,6 +2842,7 @@ async function getAdminPlanLimits() {
 }
 
 function getEffectiveLimits(org, adminPlanLimits) {
+  // Priority: per-org custom_limits > admin-configured planLimits > hardcoded PLAN_LIMITS
   const planBase = (adminPlanLimits && adminPlanLimits[org.plan]) || PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
   const custom = (org.custom_limits && typeof org.custom_limits === "object") ? org.custom_limits : {};
   return {
@@ -2187,6 +2852,7 @@ function getEffectiveLimits(org, adminPlanLimits) {
   };
 }
 
+// Ensure account_notes and custom_limits columns exist
 (async()=>{
   try{
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS account_notes TEXT`;
@@ -2195,6 +2861,7 @@ function getEffectiveLimits(org, adminPlanLimits) {
   }catch(_){}
 })();
 
+// Check agent limit before creating
 async function checkAgentLimit(org_id) {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
@@ -2210,6 +2877,7 @@ async function checkAgentLimit(org_id) {
   return null;
 }
 
+// Check KB doc limit before creating
 async function checkKbLimit(org_id) {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
@@ -2226,6 +2894,7 @@ async function checkKbLimit(org_id) {
   return null;
 }
 
+// Check monthly conversation limit
 async function checkConvoLimit(org_id) {
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id = ${org_id} LIMIT 1`;
@@ -2233,7 +2902,10 @@ async function checkConvoLimit(org_id) {
     const apl = await getAdminPlanLimits();
     const limits = getEffectiveLimits(org, apl);
     if (limits.conversations_month >= 999999) return null;
-    const [count] = await sql`SELECT COUNT(*)::int as c FROM conversations WHERE org_id = ${org_id} AND created_at >= DATE_TRUNC('month', NOW())`;
+    const [count] = await sql`
+      SELECT COUNT(*)::int as c FROM conversations
+      WHERE org_id = ${org_id} AND created_at >= DATE_TRUNC('month', NOW())
+    `;
     if ((count?.c || 0) >= limits.conversations_month) {
       return { error: `Monthly conversation limit reached for ${org.plan} plan (${limits.conversations_month}/mo). Upgrade your plan to continue.`, code: "LIMIT_CONVOS" };
     }
@@ -2248,19 +2920,36 @@ app.get("/api/tenants/:id/usage", async (req, res) => {
     const plan = org.plan || "free";
     const apl = await getAdminPlanLimits();
     const limits = getEffectiveLimits(org, apl);
-    const planLimits = (apl && apl[plan]) || PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+    const planLimits = (apl && apl[plan]) || PLAN_LIMITS[plan] || PLAN_LIMITS.free; // base plan limits without custom overrides
+    // Count agents
     const [agentCount] = await sql`SELECT COUNT(*)::int as count FROM agents WHERE org_id = ${org.id} AND active != false`;
-    const [convCount] = await sql`SELECT COUNT(*)::int as count FROM conversations WHERE org_id = ${org.id} AND created_at >= DATE_TRUNC('month', NOW())`;
+    // Count conversations this calendar month
+    const [convCount] = await sql`
+      SELECT COUNT(*)::int as count FROM conversations
+      WHERE org_id = ${org.id}
+        AND created_at >= DATE_TRUNC('month', NOW())
+    `;
+    // Count KB docs
     const [kbCount] = await sql`SELECT COUNT(*)::int as count FROM kb_documents WHERE org_id = ${org.id}`.catch(()=>[{count:0}]);
     res.json({
-      plan, limits, plan_limits: planLimits, custom_limits: org.custom_limits || {},
-      plan_snapshot: org.plan_snapshot || null, account_notes: org.account_notes || "",
-      usage: { agents: agentCount?.count || 0, conversations_month: convCount?.count || 0, kb_docs: kbCount?.count || 0 },
-      trial_start_date: org.trial_start_date || org.created_at, trial_day: org.trial_day || 0, status: org.status || "trial",
+      plan, limits,
+      plan_limits: planLimits, // base plan limits (no custom overrides) for display
+      custom_limits: org.custom_limits || {},
+      plan_snapshot: org.plan_snapshot || null,
+      account_notes: org.account_notes || "",
+      usage: {
+        agents: agentCount?.count || 0,
+        conversations_month: convCount?.count || 0,
+        kb_docs: kbCount?.count || 0,
+      },
+      trial_start_date: org.trial_start_date || org.created_at,
+      trial_day: org.trial_day || 0,
+      status: org.status || "trial",
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Plan management — change plan, extend trial, suspend/reactivate
 app.post("/api/tenants/:id/manage", async (req, res) => {
   const { action, plan, note, trialDays } = req.body;
   try {
@@ -2274,6 +2963,7 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
         return r;
       });
       await writeAudit(org.id, "plan_changed", `Plan changed to ${plan}${note?": "+note:""}`, { from: org.plan, to: plan });
+      // Snapshot plan limits+features at time of change
       try {
         const [snCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
         const snSc = snCfg?.config?._superConfig || {};
@@ -2305,10 +2995,12 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
       });
       await writeAudit(org.id, "trial_reset", note || "Trial reset by admin", {});
     } else if (action === "update_limits") {
+      // Custom per-account limit overrides (discretionary)
       const custom = {};
-      if (req.body.custom_agents != null) custom.agents              = parseInt(req.body.custom_agents) || null;
-      if (req.body.custom_convos != null) custom.conversations_month = parseInt(req.body.custom_convos) || null;
-      if (req.body.custom_kb     != null) custom.kb_docs             = parseInt(req.body.custom_kb)     || null;
+      if (req.body.custom_agents     != null) custom.agents              = parseInt(req.body.custom_agents)     || null;
+      if (req.body.custom_convos     != null) custom.conversations_month = parseInt(req.body.custom_convos)     || null;
+      if (req.body.custom_kb         != null) custom.kb_docs             = parseInt(req.body.custom_kb)         || null;
+      // Remove nulls — null means "use plan default"
       Object.keys(custom).forEach(k => { if (custom[k] == null) delete custom[k]; });
       [updated] = await sql`UPDATE organisations SET custom_limits = ${JSON.stringify(custom)} WHERE id = ${org.id} RETURNING *`
         .catch(async () => {
@@ -2324,11 +3016,17 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
         });
       await writeAudit(org.id, "notes_updated", "Account notes updated by admin", {});
     } else if (action === "snapshot_plan") {
+      // Manually snapshot current plan limits+features for this tenant
       const apl = await getAdminPlanLimits();
       const planBase = (apl && apl[org.plan]) || PLAN_LIMITS[org.plan] || PLAN_LIMITS.free;
       const [platCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
       const sc = platCfg?.config?._superConfig || {};
-      const snapshot = { plan: org.plan, snapped_at: new Date().toISOString(), limits: { ...planBase }, features: sc.planFeatures ? (sc.planFeatures[org.plan] || []) : [] };
+      const snapshot = {
+        plan: org.plan,
+        snapped_at: new Date().toISOString(),
+        limits: { ...planBase },
+        features: sc.planFeatures ? (sc.planFeatures[org.plan] || []) : [],
+      };
       [updated] = await sql`UPDATE organisations SET plan_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${org.id} RETURNING *`;
       await writeAudit(org.id, "plan_snapshotted", `Plan snapshot taken for ${org.plan}`, { plan: org.plan, limits: planBase });
     } else {
@@ -2339,38 +3037,18 @@ app.post("/api/tenants/:id/manage", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// TRIAL SCHEDULER — b260324b FIX
-// Now reads trialDays + reminderDays from platform config (_platformConfig)
-// so the schedule set in Super Admin → Settings is honoured.
-// Falls back to 14/[12,13,14] if not configured.
-// Also sends SMS alerts alongside emails.
+// TRIAL EMAIL SCHEDULER
+// Runs once on startup, then every hour
+// Days 12, 13, 14: sends reminder via ClickSend email
 // ─────────────────────────────────────────────
-async function getPlatformTrialSettings() {
-  try {
-    const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
-    const pc = cfg?.config?._platformConfig || {};
-    const trialTotal   = Math.max(1, parseInt(pc.trialDays)  || 14);
-    const reminderDays = (pc.reminderDays || "12,13,14")
-      .split(",")
-      .map(s => parseInt(s.trim()))
-      .filter(n => !isNaN(n) && n > 0 && n <= trialTotal)
-      .sort((a, b) => a - b);
-    return { trialTotal, reminderDays: reminderDays.length ? reminderDays : [12, 13, 14] };
-  } catch (_) {
-    return { trialTotal: 14, reminderDays: [12, 13, 14] };
-  }
-}
-
 async function runTrialScheduler() {
   try {
+    // Ensure columns exist
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ`;
+    // Backfill trial_start_date from created_at where null
     await sql`UPDATE organisations SET trial_start_date = created_at WHERE trial_start_date IS NULL`.catch(()=>{});
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_day INT DEFAULT 0`;
     await sql`ALTER TABLE organisations ADD COLUMN IF NOT EXISTS trial_reminded JSONB DEFAULT '[]'`;
-
-    // Read configured trial length and reminder schedule
-    const { trialTotal, reminderDays } = await getPlatformTrialSettings();
-    console.log(`[TrialScheduler] Settings — trialTotal=${trialTotal} reminderDays=${reminderDays}`);
 
     // Update trial_day for all trialling orgs
     await sql`
@@ -2379,39 +3057,31 @@ async function runTrialScheduler() {
       WHERE status IS NULL OR status IN ('trial', 'active')
     `.catch(()=>{});
 
-    // Fetch orgs on a configured reminder day
+    // Fetch orgs that need a reminder (day 12, 13, or 14) and haven't been reminded yet for that day
     const orgs = await sql`
       SELECT * FROM organisations
       WHERE (status IS NULL OR status IN ('trial'))
-        AND trial_day = ANY(${reminderDays}::int[])
+        AND trial_day BETWEEN 12 AND 14
     `.catch(()=>[]);
 
-    if (!orgs.length) {
-      // Expire orgs past trialTotal
-      await sql`
-        UPDATE organisations SET status = 'expired'
-        WHERE (status IS NULL OR status = 'trial') AND trial_day > ${trialTotal}
-      `.catch(()=>{});
-      return;
-    }
+    if (!orgs.length) return;
 
     // Load platform ClickSend creds
     let cs = {};
     try {
       const [cfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
       if (cfg?.config?.clicksend?.username) cs = cfg.config.clicksend;
-      else if (cfg?.config?._superConfig?.clicksend?.username) cs = cfg.config._superConfig.clicksend;
     } catch (_) {}
+    if (!cs.username || !cs.apiKey) return; // no email configured
+
+    const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
 
     for (const org of orgs) {
       const reminded = Array.isArray(org.trial_reminded) ? org.trial_reminded : [];
       const day = org.trial_day || 0;
       if (reminded.includes(day)) continue; // already sent for this day
 
-      const daysLeft = trialTotal - day;
-      const reminderNum = reminderDays.indexOf(day) + 1;
-
-      // ── Email ──────────────────────────────────────────────────────────
+      const daysLeft = 14 - day;
       const subject = daysLeft <= 0
         ? `Your Hindle AI trial has ended — upgrade to keep access`
         : `${daysLeft} day${daysLeft !== 1 ? "s" : ""} left on your Hindle AI trial`;
@@ -2420,69 +3090,42 @@ async function runTrialScheduler() {
 <h2 style="color:#2563EB;margin-bottom:8px">Hindle AI</h2>
 <p style="color:#334155">Hi ${org.name || "there"},</p>
 <p style="color:#334155">${daysLeft <= 0
-  ? "Your free trial has ended. Upgrade now to continue using Hindle AI — your data and settings are saved."
-  : `Your free trial ends in <strong>${daysLeft} day${daysLeft !== 1 ? "s" : ""}</strong> (Day ${day} of ${trialTotal}). Reminder ${reminderNum} of ${reminderDays.length}. Upgrade before it expires to keep your chatbot running without interruption.`
+  ? "Your 14-day free trial has ended. Upgrade now to continue using Hindle AI — your data and settings are saved."
+  : `Your free trial ends in <strong>${daysLeft} day${daysLeft !== 1 ? "s" : ""}</strong>. Upgrade before it expires to keep your chatbot running without interruption.`
 }</p>
 <div style="margin:24px 0">
   <a href="https://chatbot.hindleconsultants.com" style="background:#2563EB;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700;display:inline-block">
     ${daysLeft <= 0 ? "Upgrade Now →" : "Upgrade Before Trial Ends →"}
   </a>
 </div>
-<p style="color:#94A3B8;font-size:12px">You received this because you have an active trial on Hindle AI.</p>
+<p style="color:#94A3B8;font-size:12px">You received this because you have an active trial on Hindle AI. Questions? Reply to this email.</p>
 </div>`;
 
-      let emailSent = false;
-      let smsSent   = false;
-
-      // Send email
       try {
         const { smtpCfg: trSmtp, csCfg: trCs } = await loadEmailConfig(org.id).catch(()=>({smtpCfg:null,csCfg:cs}));
         const trResult = await sendEmail({ to: org.email, toName: org.name||"Tenant", subject, body: htmlBody, smtpCfg: trSmtp, csCfg: trCs });
-        emailSent = trResult.ok;
-        console.log(`[TrialScheduler] Day ${day} email ${emailSent?"sent":"FAILED"} → ${org.email}`);
+        const sent = trResult.ok;
+
+        // Mark this day as reminded
+        const newReminded = [...reminded, day];
+        await sql`UPDATE organisations SET trial_reminded = ${JSON.stringify(newReminded)} WHERE id = ${org.id}`.catch(()=>{});
+
+        // Write to audit log
+        await writeAudit(org.id, "trial_reminder_sent", `Day ${day} reminder email ${sent ? "sent" : "failed"} to ${org.email}`, {
+          day, daysLeft, sent, email: org.email,
+        });
+
+        console.log(`[TrialScheduler] Day ${day} reminder ${sent ? "sent" : "FAILED"} → ${org.email}`);
       } catch (err) {
-        console.warn(`[TrialScheduler] Email error for ${org.email}:`, err.message);
+        console.warn(`[TrialScheduler] Error sending to ${org.email}:`, err.message);
+        await writeAudit(org.id, "trial_reminder_failed", `Day ${day} reminder failed: ${err.message}`, { day, email: org.email });
       }
-
-      // Send SMS to all agents with SMS alerts enabled
-      if (cs.username && cs.apiKey) {
-        try {
-          const agents = await sql`SELECT mobile FROM agents WHERE org_id = ${org.id} AND sms_alerts = true AND mobile IS NOT NULL AND mobile != '' AND active != false`;
-          if (agents.length) {
-            const smsBody = daysLeft <= 0
-              ? `HINDLE — ${org.name || "Your account"}: trial ended. Upgrade at chatbot.hindleconsultants.com`
-              : `HINDLE — ${org.name || "Your account"}: ${daysLeft}d left in trial (Day ${day}/${trialTotal}, reminder ${reminderNum}/${reminderDays.length}). Upgrade: chatbot.hindleconsultants.com`;
-            const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
-            const msgs = agents.map(a => ({ source: "sdk", to: a.mobile, from: (cs.smsSender || "HINDLE").substring(0,11), body: smsBody }));
-            const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: auth },
-              body: JSON.stringify({ messages: msgs }),
-              signal: AbortSignal.timeout(8000),
-            });
-            const d = await r.json();
-            smsSent = d?.data?.messages?.some(m => m.status === "SUCCESS");
-            console.log(`[TrialScheduler] Day ${day} SMS ${smsSent?"sent":"FAILED"} → ${agents.length} agent(s) for ${org.name}`);
-          }
-        } catch (smsErr) {
-          console.warn(`[TrialScheduler] SMS error for ${org.name}:`, smsErr.message);
-        }
-      }
-
-      // Mark reminded
-      const newReminded = [...reminded, day];
-      await sql`UPDATE organisations SET trial_reminded = ${JSON.stringify(newReminded)} WHERE id = ${org.id}`.catch(()=>{});
-
-      await writeAudit(org.id, "trial_reminder_sent",
-        `Day ${day} of ${trialTotal} reminder — email:${emailSent} sms:${smsSent} → ${org.email}`,
-        { day, trialTotal, daysLeft, reminderNum, emailSent, smsSent, email: org.email }
-      );
     }
 
-    // Expire orgs past trialTotal
+    // Expire orgs past day 14
     await sql`
       UPDATE organisations SET status = 'expired'
-      WHERE (status IS NULL OR status = 'trial') AND trial_day > ${trialTotal}
+      WHERE (status IS NULL OR status = 'trial') AND trial_day > 14
     `.catch(()=>{});
 
   } catch (err) {
@@ -2490,6 +3133,7 @@ async function runTrialScheduler() {
   }
 }
 
+// Run immediately on startup, then every hour
 runTrialScheduler();
 setInterval(runTrialScheduler, 60 * 60 * 1000);
 
@@ -2497,5 +3141,5 @@ setInterval(runTrialScheduler, 60 * 60 * 1000);
 // START
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Hindle API b260324b running on port ${PORT}`);
+  console.log(`Hindle API running on port ${PORT}`);
 });
