@@ -1792,7 +1792,8 @@ app.post("/api/agents/:id/password", async (req, res) => {
   const { password } = req.body;
   if (!password || !password.trim()) return res.status(400).json({ error: "password required" });
   try {
-    await sql`UPDATE agents SET password_hash = ${password.trim()}, must_change_password = false WHERE id = ${req.params.id}`;
+    const _agentPwHash = await bcrypt.hash(password.trim(), 10);
+    await sql`UPDATE agents SET password_hash = ${_agentPwHash}, must_change_password = false WHERE id = ${req.params.id}`;
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1815,7 +1816,7 @@ app.post("/api/invite-agent", async (req, res) => {
     // Set the password on the agent record so they can log in immediately
     await sql`
       UPDATE agents
-      SET password_hash = ${tempPassword}, must_change_password = true
+      SET password_hash = ${await bcrypt.hash(tempPassword, 10)}, must_change_password = true
       WHERE LOWER(email) = LOWER(${email})
     `;
 
@@ -2351,12 +2352,20 @@ app.post("/api/auth", async (req, res) => {
     const rows = await sql`SELECT * FROM organisations WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1`;
     if (rows.length) {
       const org = rows[0];
-      let storedPass = "admin";
+      let storedPass = null;
+      let isHashed = false;
       try {
         const cfg = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org.id} LIMIT 1`;
-        if (cfg.length && cfg[0].config?.admin_password) storedPass = cfg[0].config.admin_password;
+        if (cfg.length) {
+          // Check bcrypt hash first (set via password reset)
+          if (cfg[0].config?._adminPasswordHash) { storedPass = cfg[0].config._adminPasswordHash; isHashed = true; }
+          // Fall back to plain text password
+          else if (cfg[0].config?.admin_password) { storedPass = cfg[0].config.admin_password; isHashed = false; }
+        }
       } catch (_) {}
-      if (password !== storedPass) return res.status(401).json({ ok: false, error: "Incorrect password." });
+      if (!storedPass) storedPass = "admin"; // default if nothing set
+      const passOk = isHashed ? await bcrypt.compare(password, storedPass) : (password === storedPass);
+      if (!passOk) return res.status(401).json({ ok: false, error: "Incorrect password." });
       return res.json({ ok: true, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });
     }
   } catch (e) {
@@ -2370,7 +2379,11 @@ app.post("/api/auth", async (req, res) => {
     const agent = rows[0];
     if (agent.active === false) return res.status(403).json({ ok: false, error: "Account is disabled." });
     if (!agent.password_hash) return res.status(401).json({ ok: false, error: "No password set. Contact your administrator." });
-    if (agent.password_hash !== password) return res.status(401).json({ ok: false, error: "Incorrect password." });
+    // Support both plain-text (legacy) and bcrypt-hashed passwords
+    const agentPassOk = agent.password_hash.startsWith("$2") 
+      ? await bcrypt.compare(password, agent.password_hash)
+      : agent.password_hash === password;
+    if (!agentPassOk) return res.status(401).json({ ok: false, error: "Incorrect password." });
     let orgId = agent.org_id || null;
     if (!orgId) {
       try {
@@ -2742,7 +2755,8 @@ app.post("/api/auth/set-password", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
   try {
-    const rows = await sql`UPDATE agents SET password_hash = ${password}, must_change_password = false WHERE LOWER(email) = LOWER(${email}) RETURNING id, name, email, role`;
+    const hashedPw = await bcrypt.hash(password, 10);
+    const rows = await sql`UPDATE agents SET password_hash = ${hashedPw}, must_change_password = false WHERE LOWER(email) = LOWER(${email}) RETURNING id, name, email, role`;
     if (!rows.length) return res.status(404).json({ error: "not found" });
     res.json({ ok: true, ...rows[0] });
   } catch (e) { res.status(500).json({ error: e.message }); }
