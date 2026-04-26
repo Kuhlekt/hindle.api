@@ -205,7 +205,7 @@ function buildCsEmail({ to, toName, subject, body, fromId, fromName, listId }) {
 // Check optional packages for KB file extraction
 // Add to package.json: "busboy", "pdf-parse", "mammoth"
 // Then redeploy — Railway will install them automatically
-["busboy","pdf-parse","mammoth","nodemailer"].forEach(pkg => {
+["busboy","pdf-parse","mammoth","nodemailer","bcryptjs"].forEach(pkg => {
   try { require(pkg); console.log(`[KB] ${pkg} ✓`); }
   catch (_) { console.log(`[KB] ${pkg} not installed — PDF/DOCX upload will return 503. Run: npm install ${pkg}`); }
 });
@@ -225,6 +225,8 @@ let stripe = null;
   }
 }());
 const { neon } = require("@neondatabase/serverless");
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 
 const sql = neon(process.env.DATABASE_URL);
 
@@ -2261,7 +2263,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       if (!orgId) return; // No account — silent exit
 
       // Generate a time-limited reset token (valid 1 hour)
-      const token = require("crypto").randomBytes(32).toString("hex");
+      const token = crypto.randomBytes(32).toString("hex");
       const expiry = new Date(Date.now() + 3600000).toISOString();
 
       // Store token in tenant_configs for this org
@@ -2313,7 +2315,6 @@ app.post("/api/auth/reset-password", async (req, res) => {
     if (!rt || rt.token !== token) return res.status(400).json({ error: "Invalid or expired reset link" });
     if (new Date(rt.expiry) < new Date()) return res.status(400).json({ error: "Reset link has expired. Please request a new one." });
 
-    const bcrypt = require("bcrypt");
     const hash = await bcrypt.hash(newPassword, 10);
     const email = rt.email;
 
