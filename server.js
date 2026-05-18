@@ -3036,10 +3036,11 @@ app.post("/api/auth", async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     const ADMIN_PW    = process.env.ADMIN_PW    || '';
     const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').toLowerCase();
+    console.log('[admin-login] received email:', email, '| ADMIN_EMAIL:', ADMIN_EMAIL, '| email_match:', email.toLowerCase() === ADMIN_EMAIL, '| pw_set:', !!ADMIN_PW, '| pw_match:', password === ADMIN_PW);
     if (!ADMIN_EMAIL || email.toLowerCase() !== ADMIN_EMAIL)
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json({ error: 'Invalid credentials', debug: 'email_mismatch' });
     if (!ADMIN_PW || password !== ADMIN_PW)
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json({ error: 'Invalid credentials', debug: 'pw_mismatch' });
     return res.status(200).json({ success: true });
   }
 
