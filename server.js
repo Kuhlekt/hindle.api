@@ -3029,6 +3029,20 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
 
 app.post("/api/auth", async (req, res) => {
+  // ── Activities admin-login action ─────────────────────────────────────────
+  const action = req.query.action;
+  if (action === 'admin-login') {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const ADMIN_PW    = process.env.ADMIN_PW    || '';
+    const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').toLowerCase();
+    if (!ADMIN_EMAIL || email.toLowerCase() !== ADMIN_EMAIL)
+      return res.status(401).json({ error: 'Invalid credentials' });
+    if (!ADMIN_PW || password !== ADMIN_PW)
+      return res.status(401).json({ error: 'Invalid credentials' });
+    return res.status(200).json({ success: true });
+  }
+
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ ok: false, error: "email and password required" });
 
