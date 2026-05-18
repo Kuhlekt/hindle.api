@@ -3036,11 +3036,42 @@ app.post("/api/auth", async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     const ADMIN_PW    = process.env.ADMIN_PW    || '';
     const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').toLowerCase();
-    console.log('[admin-login] received email:', email, '| ADMIN_EMAIL:', ADMIN_EMAIL, '| email_match:', email.toLowerCase() === ADMIN_EMAIL, '| pw_set:', !!ADMIN_PW, '| pw_match:', password === ADMIN_PW);
     if (!ADMIN_EMAIL || email.toLowerCase() !== ADMIN_EMAIL)
-      return res.status(401).json({ error: 'Invalid credentials', debug: 'email_mismatch' });
+      return res.status(401).json({ error: 'Invalid credentials' });
     if (!ADMIN_PW || password !== ADMIN_PW)
-      return res.status(401).json({ error: 'Invalid credentials', debug: 'pw_mismatch' });
+      return res.status(401).json({ error: 'Invalid credentials' });
+    // Issue a 24-hour admin session token
+    await sql`CREATE TABLE IF NOT EXISTS admin_sessions (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    )`;
+    const token = require('crypto').randomUUID();
+    await sql`INSERT INTO admin_sessions (token, email, expires_at)
+      VALUES (${token}, ${email.toLowerCase()}, NOW() + INTERVAL '24 hours')`;
+    // Clean up expired sessions
+    await sql`DELETE FROM admin_sessions WHERE expires_at < NOW()`.catch(() => {});
+    return res.status(200).json({ success: true, token });
+  }
+
+  if (action === 'admin-verify') {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({ error: 'No token' });
+    await sql`CREATE TABLE IF NOT EXISTS admin_sessions (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    )`.catch(() => {});
+    const rows = await sql`SELECT * FROM admin_sessions WHERE token=${token} AND expires_at > NOW() LIMIT 1`;
+    if (!rows.length) return res.status(401).json({ error: 'Invalid or expired token' });
+    return res.status(200).json({ success: true, email: rows[0].email });
+  }
+
+  if (action === 'admin-logout') {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (token) await sql`DELETE FROM admin_sessions WHERE token=${token}`.catch(() => {});
     return res.status(200).json({ success: true });
   }
 
