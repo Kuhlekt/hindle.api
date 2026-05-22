@@ -2033,8 +2033,8 @@ app.post("/api/chat", async (req, res) => {
 
     // Strip the confidence annotation from the reply
     const reply = rawReply
-      .replace(/\nCONFIDENCE:[\d.]+/g, "")
-      .replace(/\nSUGGEST_HUMAN:(true|false)/g, "")
+      .replace(/\n?CONFIDENCE:\s*[\d.]+/gi, "")
+      .replace(/\n?SUGGEST_HUMAN:\s*(true|false)/gi, "")
       .trim();
 
     if (conversationId) {
