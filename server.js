@@ -2010,7 +2010,7 @@ app.post("/api/chat", async (req, res) => {
         }
       } catch (_) {}
 
-      } catch (_) {}
+
     }
 
     const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
