@@ -2011,18 +2011,18 @@ app.post("/api/chat", async (req, res) => {
           }
         }
       } catch (_) {}
-    }
-
+    } // closes if (tenantId)
 
     const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
       kbContext +
       (additionalInstructions ? "\n\nAdditional instructions:\n" + additionalInstructions : "") +
       "\n\nIMPORTANT: After your answer, on a new line write exactly: CONFIDENCE:[0.0-1.0] where the number reflects how confident you are in your answer (1.0 = certain, 0.5 = unsure, 0.0 = no idea). If confidence is below 0.6, end with: SUGGEST_HUMAN:true";
-
-    // Include session history for conversation memory (last 6 turns from prior sessions)
     const fullMessages = sessionHistory && Array.isArray(sessionHistory)
       ? [...sessionHistory.slice(-6), ...messages]
       : messages;
+
+
+
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
