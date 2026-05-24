@@ -1997,6 +1997,19 @@ app.post("/api/chat", async (req, res) => {
           kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following information to answer questions. Only use information from this knowledge base when it is relevant. If the answer is not in the knowledge base, say so honestly.\n\n" +
             kbDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
         }
+      // ── Also fetch from Kuhlekt KB API ──
+      try {
+        const lastMsg = messages && messages.length ? messages[messages.length-1].content : "";
+        if (lastMsg) {
+          const kbRes = await fetch("https://kuhlekt-kb.vercel.app/api/public/search?key=kb_live_kh2026_kuhlekt&q="+encodeURIComponent(lastMsg)+"&limit=3");
+          const kbData = await kbRes.json();
+          if (kbData.items && kbData.items.length > 0) {
+            kbContext += "\n\n---\nKUHLEKT KB ARTICLES:\n\n" +
+              kbData.items.map(a => "["+a.title+"]\n"+(a.excerpt||"")).join("\n\n---\n\n");
+          }
+        }
+      } catch (_) {}
+
       } catch (_) {}
     }
 
