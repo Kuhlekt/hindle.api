@@ -499,7 +499,7 @@ const WIDGET_JS_CONTENT = `/**
     return fetch(API_BASE+'/api/conversations',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         tenant_id:TENANT,
-﻿        visitor_name:visitorData.name||visitorEmail||'Website Visitor',
+        visitor_name:visitorData.name||visitorEmail||'Website Visitor',
         visitor_email:visitorData.email||visitorEmail||null,
         visitor_phone:visitorData.phone||null,
         visitor_company:visitorData.company||null,
@@ -999,7 +999,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         await sql`UPDATE organisations SET status = 'paid', plan = ${planId || org.plan}, updated_at = NOW() WHERE id = ${org.id}`;
         // Snapshot plan at time of payment
         try {
-﻿          const [sCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
+          const [sCfg] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`.catch(()=>[null]);
           const sSc = sCfg?.config?._superConfig || {};
           const sApl = sSc.planLimits || null;
           const sPlan = planId || org.plan;
@@ -1499,7 +1499,7 @@ app.post("/api/kb/parse-json", async (req, res) => {
         items = Object.entries(raw).map(([k, v]) => ({ title: k, content: v }));
       } else {
         items = [raw];
-﻿      }
+      }
     }
 
     if (!items.length) return res.status(400).json({ error: "No items found in JSON" });
@@ -1999,7 +1999,7 @@ app.post("/api/chat", async (req, res) => {
         }
       } catch (_) {}
       // ── Also fetch from Kuhlekt KB API ──
-﻿      try {
+      try {
         const lastMsg = messages && messages.length ? messages[messages.length-1].content : ''; console.log('[KB] lastMsg:', lastMsg);
         if (lastMsg) {
           const kbRes = await fetch("https://kuhlekt-kb.vercel.app/api/public/search?key=kb_live_kh2026_kuhlekt&q="+encodeURIComponent(lastMsg)+"&limit=3");
@@ -2020,6 +2020,9 @@ app.post("/api/chat", async (req, res) => {
     const fullMessages = sessionHistory && Array.isArray(sessionHistory)
       ? [...sessionHistory.slice(-6), ...messages]
       : messages;
+
+
+
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -2496,7 +2499,7 @@ app.post("/api/agents/:id/password", async (req, res) => {
   }
 });
 
-﻿// POST /api/invite-agent — create login credentials and notify agent via SMS
+// POST /api/invite-agent — create login credentials and notify agent via SMS
 app.post("/api/invite-agent", async (req, res) => {
   const { tenantId, name, email, mobile } = req.body;
   if (!email) return res.status(400).json({ error: "email required" });
@@ -2996,7 +2999,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       console.log(`[ForgotPW] Reset link sent to ${emailLower}`);
     } catch (e) {
       console.error("[ForgotPW] error:", e.message);
-﻿    }
+    }
   })();
 });
 
@@ -3496,7 +3499,7 @@ app.post("/api/auth/magic-verify", async (req, res) => {
 app.post("/api/auth/set-password", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
-﻿  try {
+  try {
     const hashedPw = await bcrypt.hash(password, 10);
     const rows = await sql`UPDATE agents SET password_hash = ${hashedPw}, must_change_password = false WHERE LOWER(email) = LOWER(${email}) RETURNING id, name, email, role`;
     if (!rows.length) return res.status(404).json({ error: "not found" });
