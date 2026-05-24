@@ -2000,7 +2000,7 @@ app.post("/api/chat", async (req, res) => {
       } catch (_) {}
       // ── Also fetch from Kuhlekt KB API ──
       try {
-        const lastMsg = messages && messages.length ? messages[messages.length-1].content : "";
+        const lastMsg = messages && messages.length ? messages[messages.length-1].content : ''; console.log('[KB] lastMsg:', lastMsg);
         if (lastMsg) {
           const kbRes = await fetch("https://kuhlekt-kb.vercel.app/api/public/search?key=kb_live_kh2026_kuhlekt&q="+encodeURIComponent(lastMsg)+"&limit=3");
           const kbData = await kbRes.json();
