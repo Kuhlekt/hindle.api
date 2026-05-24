@@ -1,4 +1,4 @@
-require("dotenv").config();
+// build-fix
 const express = require("express");
 const cors = require("cors");
 const https = require("https");
