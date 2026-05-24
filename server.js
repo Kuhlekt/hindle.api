@@ -1997,6 +1997,7 @@ app.post("/api/chat", async (req, res) => {
           kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following information to answer questions. Only use information from this knowledge base when it is relevant. If the answer is not in the knowledge base, say so honestly.\n\n" +
             kbDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
         }
+      } catch (_) {}
       // ── Also fetch from Kuhlekt KB API ──
       try {
         const lastMsg = messages && messages.length ? messages[messages.length-1].content : "";
@@ -2010,8 +2011,8 @@ app.post("/api/chat", async (req, res) => {
         }
       } catch (_) {}
 
-
     }
+
 
     const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
       kbContext +
