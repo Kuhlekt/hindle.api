@@ -2004,7 +2004,7 @@ app.post("/api/chat", async (req, res) => {
         if (lastMsg) {
           const kbRes = await fetch("https://kuhlekt-kb.vercel.app/api/public/search?key=kb_live_kh2026_kuhlekt&q="+encodeURIComponent(lastMsg)+"&limit=3");
           const kbData = await kbRes.json();
-          if (kbData.items && kbData.items.length > 0) {
+          console.log('[KB] items:', kbData.items ? kbData.items.length : 'none', JSON.stringify(kbData).substring(0,200));
             kbContext += "\n\n---\nKUHLEKT KB ARTICLES:\n\n" +
               kbData.items.map(a => "["+a.title+"]\n"+(a.excerpt||"")).join("\n\n---\n\n");
           }
