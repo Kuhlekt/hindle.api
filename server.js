@@ -1899,7 +1899,7 @@ app.get("/api/onboarding/:orgId", async (req, res) => {
 // AI CHAT  — routes messages through Claude
 // POST /api/chat
 // Body: { tenantId, system, messages: [{role, content}] }
-  console.log('[CHAT HIT] messages:', JSON.stringify(messages).substring(0,100));
+
 app.post("/api/chat", async (req, res) => {
   const { system, messages, tenantId, conversationId, handoffCommands, handoffInactivityTimeout, additionalInstructions } = req.body;
 
