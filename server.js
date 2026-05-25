@@ -1976,12 +1976,8 @@ app.post("/api/chat", async (req, res) => {
     // Build confidence-aware system prompt
     const { confidenceThreshold = 0.6, sessionHistory } = req.body;
 
-    // ── Fetch KB documents from database and inject into system prompt ──
+    // -- KB fetch --
     let kbContext = "";
-    // ── Fetch KB documents from database and inject into system prompt ──
-    let kbContext = "";
-
-    // ── Always fetch from Kuhlekt KB API ──
     try {
       const _lastMsg = messages && messages.length ? messages[messages.length-1].content : "";
       if (_lastMsg) {
@@ -1989,29 +1985,21 @@ app.post("/api/chat", async (req, res) => {
         const _kbData = await _kbRes.json();
         console.log("[KB] items:", _kbData.items ? _kbData.items.length : 0);
         if (_kbData.items && _kbData.items.length > 0) {
-          kbContext += "\n\n---\nKUHLEKT KB ARTICLES:\n\n" + _kbData.items.map(a => "["+a.title+"]\n"+(a.excerpt||"")).join("\n\n---\n\n");
+          kbContext = "\n\n---\nKUHLEKT KB ARTICLES:\n\n" + _kbData.items.map(function(a){ return "["+a.title+"]\n"+(a.excerpt||""); }).join("\n\n---\n\n");
         }
       }
     } catch(e) { console.log("[KB] error:", e.message); }
 
     if (tenantId) {
-            kbDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
-        }
-      } catch (_) {}
-      // ── Also fetch from Kuhlekt KB API ──
       try {
-        const lastMsg = messages && messages.length ? messages[messages.length-1].content : ''; console.log('[KB] lastMsg:', lastMsg);
-        if (lastMsg) {
-          const kbRes = await fetch("https://kuhlekt-kb.vercel.app/api/public/search?key=kb_live_kh2026_kuhlekt&q="+encodeURIComponent(lastMsg)+"&limit=3");
-          const kbData = await kbRes.json();
-          console.log('[KB] items:', kbData.items ? kbData.items.length : 'none');
-          if (kbData.items && kbData.items.length > 0) {
-            kbContext += "\n\n---\nKUHLEKT KB ARTICLES:\n\n" +
-              kbData.items.map(a => "["+a.title+"]\n"+(a.excerpt||"")).join("\n\n---\n\n");
-          }
+        const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenantId} OR tenant_id = ${tenantId} LIMIT 1`;
+        const orgId = orgs.length ? orgs[0].id : tenantId;
+        const kbDocs = await sql`SELECT name, content FROM kb_documents WHERE org_id = ${orgId} AND status = 'indexed' AND content IS NOT NULL AND content != '' ORDER BY created_at DESC LIMIT 40`;
+        if (kbDocs.length > 0) {
+          kbContext += "\n\n---\nKNOWLEDGE BASE:\n\n" + kbDocs.map(function(doc){ return "["+doc.name+"]\n"+doc.content; }).join("\n\n---\n\n");
         }
       } catch (_) {}
-    } // closes if (tenantId)
+    }
 
     const confSystem = (system || "You are a helpful support assistant. Answer concisely and helpfully.") +
       kbContext +
@@ -2020,9 +2008,6 @@ app.post("/api/chat", async (req, res) => {
     const fullMessages = sessionHistory && Array.isArray(sessionHistory)
       ? [...sessionHistory.slice(-6), ...messages]
       : messages;
-
-
-
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
