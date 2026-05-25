@@ -1978,23 +1978,23 @@ app.post("/api/chat", async (req, res) => {
 
     // ── Fetch KB documents from database and inject into system prompt ──
     let kbContext = "";
+    // ── Fetch KB documents from database and inject into system prompt ──
+    let kbContext = "";
+
+    // ── Always fetch from Kuhlekt KB API ──
+    try {
+      const _lastMsg = messages && messages.length ? messages[messages.length-1].content : "";
+      if (_lastMsg) {
+        const _kbRes = await fetch("https://kuhlekt-kb.vercel.app/api/public/search?key=kb_live_kh2026_kuhlekt&q="+encodeURIComponent(_lastMsg)+"&limit=3");
+        const _kbData = await _kbRes.json();
+        console.log("[KB] items:", _kbData.items ? _kbData.items.length : 0);
+        if (_kbData.items && _kbData.items.length > 0) {
+          kbContext += "\n\n---\nKUHLEKT KB ARTICLES:\n\n" + _kbData.items.map(a => "["+a.title+"]\n"+(a.excerpt||"")).join("\n\n---\n\n");
+        }
+      }
+    } catch(e) { console.log("[KB] error:", e.message); }
+
     if (tenantId) {
-      try {
-        // Resolve org UUID from tenantId
-        const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenantId} OR tenant_id = ${tenantId} LIMIT 1`;
-        const orgId = orgs.length ? orgs[0].id : tenantId;
-        // Load KB docs that have content (manual/text entries)
-        const kbDocs = await sql`
-          SELECT name, content FROM kb_documents
-          WHERE org_id = ${orgId}
-            AND status = 'indexed'
-            AND content IS NOT NULL
-            AND content != ''
-          ORDER BY created_at DESC
-          LIMIT 40
-        `;
-        if (kbDocs.length > 0) {
-          kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following information to answer questions. Only use information from this knowledge base when it is relevant. If the answer is not in the knowledge base, say so honestly.\n\n" +
             kbDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
         }
       } catch (_) {}
