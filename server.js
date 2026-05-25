@@ -1983,7 +1983,7 @@ app.post("/api/chat", async (req, res) => {
       if (_lastMsg) {
         const _kbRes = await fetch("https://kuhlekt-kb.vercel.app/api/public/search?key=kb_live_kh2026_kuhlekt&q="+encodeURIComponent(_lastMsg)+"&limit=3");
         const _kbData = await _kbRes.json();
-        console.log("[KB] items:", _kbData.items ? _kbData.items.length : 0);
+        console.log("[KB] query:", _lastMsg, "items:", _kbData.items ? _kbData.items.length : 0):", _kbData.items ? _kbData.items.length : 0);
         if (_kbData.items && _kbData.items.length > 0) {
           kbContext = "\n\n---\nKUHLEKT KB ARTICLES:\n\n" + _kbData.items.map(function(a){ return "["+a.title+"]\n"+(a.excerpt||""); }).join("\n\n---\n\n");
         }
