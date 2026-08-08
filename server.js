@@ -1494,34 +1494,34 @@ app.post("/api/chat", async (req, res) => {
         const orgId = orgs.length ? orgs[0].id : tenantId;
         // Search KB for docs relevant to the visitor's question
         const lastMsg = messages[messages.length - 1];
-        const searchText = (lastMsg?.content || lastMsg?.text || "").slice(0, 200).toLowerCase();
-        // Extract keywords (words > 3 chars)
-        const keywords = searchText.match(/\b\w{4,}\b/g) || [];
-        const searchPattern = keywords.slice(0, 5).join('|') || 'kuhlekt';
+        const searchText = (lastMsg?.content || lastMsg?.text || "").slice(0, 200);
+        const keyword1 = (searchText.match(/\b\w{4,}\b/) || ['kuhlekt'])[0];
+        const keyword2 = (searchText.match(/\b\w{4,}\b/g) || [])[1] || keyword1;
 
         const kbDocs = await sql`
           SELECT name, LEFT(content, 2000) as content FROM kb_documents
           WHERE org_id = ${orgId}
             AND status = 'indexed'
             AND content IS NOT NULL
-            AND content != ''
+            AND LENGTH(content) > 50
             AND (
-              content ILIKE ${'%' + (keywords[0] || 'kuhlekt') + '%'}
-              OR content ILIKE ${'%' + (keywords[1] || 'kuhlekt') + '%'}
-              OR name ILIKE ${'%' + (keywords[0] || 'kuhlekt') + '%'}
+              content ILIKE ${'%' + keyword1 + '%'}
+              OR content ILIKE ${'%' + keyword2 + '%'}
+              OR name ILIKE ${'%' + keyword1 + '%'}
             )
           LIMIT 8
-        `;
-        // If no keyword matches, fall back to most recent docs
-        const fallbackDocs = kbDocs.length === 0 ? await sql`
-          SELECT name, LEFT(content, 1000) as content FROM kb_documents
-          WHERE org_id = ${orgId} AND status = 'indexed' AND content IS NOT NULL AND content != ''
+        `.catch(() => []);
+
+        const useDocs = kbDocs.length > 0 ? kbDocs : await sql`
+          SELECT name, LEFT(content, 800) as content FROM kb_documents
+          WHERE org_id = ${orgId} AND status = 'indexed'
+          AND content IS NOT NULL AND LENGTH(content) > 50
           ORDER BY created_at DESC LIMIT 5
-        ` : [];
-        const finalDocs = kbDocs.length > 0 ? kbDocs : fallbackDocs;
-        if (finalDocs.length > 0) {
+        `.catch(() => []);
+
+        if (useDocs.length > 0) {
           kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following to answer questions. Do NOT say 'I don't know' — find the closest relevant answer or ask to clarify.\n\n" +
-            finalDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
+            useDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
         }
       } catch (_) {}
     }
