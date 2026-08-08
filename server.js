@@ -1494,16 +1494,16 @@ app.post("/api/chat", async (req, res) => {
         const orgId = orgs.length ? orgs[0].id : tenantId;
         // Load KB docs that have content (manual/text entries)
         const kbDocs = await sql`
-          SELECT name, content FROM kb_documents
+          SELECT name, LEFT(content, 1500) as content FROM kb_documents
           WHERE org_id = ${orgId}
             AND status = 'indexed'
             AND content IS NOT NULL
             AND content != ''
           ORDER BY created_at DESC
-          LIMIT 80
+          LIMIT 15
         `;
         if (kbDocs.length > 0) {
-          kbContext = "\n\n---\nKNOWLEDGE BASE — You MUST use the following information to answer questions. This is the authoritative source about Kuhlekt products, features, pricing and services. Always find the most relevant answer from this knowledge base. Do NOT say 'I don't know' or 'I'm not sure' — instead, answer based on the closest relevant information available, or ask the visitor to clarify their question. If a topic is genuinely not covered, offer to connect them with the team.\n\n" +
+          kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following to answer questions. Do NOT say 'I don't know' — find the closest relevant answer or ask to clarify.\n\n" +
             kbDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
         }
       } catch (_) {}
