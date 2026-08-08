@@ -1554,13 +1554,14 @@ Always answer questions about AR, collections, dunning, credit management and re
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514", max_tokens: 1000,
+        model: "claude-haiku-4-5-20251001", max_tokens: 500,
         system: confSystem,
         messages: fullMessages.map(m => ({ role: m.role === "visitor" || m.role === "user" ? "user" : "assistant", content: m.content || m.text || "" })),
       }),
     });
     if (!response.ok) {
       const err = await response.text();
+      console.error("[Chat] Anthropic error:", err.slice(0, 500));
       return res.status(502).json({ error: "Anthropic API error", detail: err });
     }
     const data = await response.json();
