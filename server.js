@@ -10,12 +10,20 @@ const fetch = (url, opts = {}, _redirectCount = 0) => new Promise((resolve, reje
   if (_redirectCount > 5) return reject(new Error("Too many redirects"));
   const parsed = new URL(url);
   const mod = parsed.protocol === "https:" ? https : http;
+  // Default browser-like headers so sites don't block as a bot
+  const defaultHeaders = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
+    "Accept-Encoding": "identity",
+  };
   const options = {
     hostname: parsed.hostname,
     port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
     path: parsed.pathname + parsed.search,
     method: opts.method || "GET",
-    headers: opts.headers || {},
+    headers: { ...defaultHeaders, ...(opts.headers || {}) },
+    timeout: opts.timeout || 15000,
   };
   const body = opts.body;
   if (body && !options.headers["Content-Length"]) {
@@ -233,6 +241,9 @@ const sql = neon(process.env.DATABASE_URL);
 
 
 
+// fetchWithRedirects is an alias for the custom fetch above
+const fetchWithRedirects = fetch;
+
 // ── RLS Context Helpers ───────────────────────────────────────────────────────
 // sqlForOrg(orgId) — runs a single query with the tenant RLS context set
 // Usage: const rows = await sqlForOrg(orgId, sql`SELECT * FROM conversations`);
@@ -294,9 +305,15 @@ function extractTextFromHtml(html) {
 }
 
 async function scrapeAndStore(url, org_id, category) {
-  const r = await fetchWithRedirects(url, { timeout: 10000 });
+  const r = await fetchWithRedirects(url, { timeout: 15000 });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const html = await r.text();
+  // Detect Cloudflare/bot protection pages
+  if (html.includes('cf-browser-verification') || html.includes('challenge-platform') || 
+      html.includes('Just a moment') || html.includes('Enable JavaScript') ||
+      html.length < 500) {
+    throw new Error("Bot protection or empty page — try Import URL manually");
+  }
   const text = extractTextFromHtml(html);
   if (text.length < 100) throw new Error("Content too short");
   const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
