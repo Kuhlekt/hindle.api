@@ -408,50 +408,6 @@ app.post("/api/kb/scrape-discover", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-// ── Import from Kuhlekt KB API ────────────────────────────────────────────────
-app.post("/api/kb/import-from-kb-api", async (req, res) => {
-  const { org_id, kb_api_url, kb_api_key } = req.body;
-  if (!org_id || !kb_api_url) return res.status(400).json({ error: "org_id and kb_api_url required" });
-
-  const results = [];
-  try {
-    // Fetch all articles from the KB API
-    const apiUrl = `${kb_api_url}?key=${kb_api_key || ""}&q=&limit=200`;
-    const r = await fetch(apiUrl, { timeout: 15000 });
-    if (!r.ok) throw new Error(`KB API returned HTTP ${r.status}`);
-    const data = await r.json();
-
-    const articles = Array.isArray(data) ? data : (data.articles || data.results || data.data || []);
-    if (!articles.length) return res.json({ ok: false, error: "No articles returned from KB API", raw: data });
-
-    for (const article of articles) {
-      try {
-        const name = (article.title || article.name || article.question || "Untitled").slice(0, 120);
-        const content = article.content || article.body || article.answer || article.text || "";
-        if (!content || content.length < 20) continue;
-        const category = article.category || article.section || "Knowledge Base";
-        const size_kb = Math.round(content.length / 1024 * 10) / 10;
-
-        const existing = await sql`SELECT id FROM kb_documents WHERE org_id = ${org_id} AND name = ${name} LIMIT 1`.catch(()=>[]);
-        if (existing.length) {
-          await sql`UPDATE kb_documents SET content = ${content}, size_kb = ${size_kb}, updated_at = NOW() WHERE id = ${existing[0].id}`;
-          results.push({ ok: true, action: "updated", name });
-        } else {
-          await sql`INSERT INTO kb_documents (org_id, name, content, category, size_kb, chunks, status) VALUES (${org_id}, ${name}, ${content}, ${category}, ${size_kb}, ${1}, ${"indexed"})`;
-          results.push({ ok: true, action: "created", name });
-        }
-      } catch(e) {
-        results.push({ ok: false, name: article.title || "unknown", error: e.message });
-      }
-    }
-  } catch(e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-  res.json({ ok: true, results, imported: results.filter(r => r.ok).length });
-});
-// ─────────────────────────────────────────────────────────────────────────────
-
-
 // ── Serve widget.js ──────────────────────────────────────────────────────────
 // Proxies from Vercel with correct content-type (Vercel serves it as text/html)
 app.get("/widget.js", async (req, res) => {
@@ -557,6 +513,51 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// ── Import from Kuhlekt KB API ────────────────────────────────────────────────
+app.post("/api/kb/import-from-kb-api", async (req, res) => {
+  const { org_id, kb_api_url, kb_api_key } = req.body;
+  if (!org_id || !kb_api_url) return res.status(400).json({ error: "org_id and kb_api_url required" });
+
+  const results = [];
+  try {
+    // Fetch all articles from the KB API
+    const apiUrl = `${kb_api_url}?key=${kb_api_key || ""}&q=&limit=200`;
+    const r = await fetch(apiUrl, { timeout: 15000 });
+    if (!r.ok) throw new Error(`KB API returned HTTP ${r.status}`);
+    const data = await r.json();
+
+    const articles = Array.isArray(data) ? data : (data.articles || data.results || data.data || []);
+    if (!articles.length) return res.json({ ok: false, error: "No articles returned from KB API", raw: data });
+
+    for (const article of articles) {
+      try {
+        const name = (article.title || article.name || article.question || "Untitled").slice(0, 120);
+        const content = article.content || article.body || article.answer || article.text || "";
+        if (!content || content.length < 20) continue;
+        const category = article.category || article.section || "Knowledge Base";
+        const size_kb = Math.round(content.length / 1024 * 10) / 10;
+
+        const existing = await sql`SELECT id FROM kb_documents WHERE org_id = ${org_id} AND name = ${name} LIMIT 1`.catch(()=>[]);
+        if (existing.length) {
+          await sql`UPDATE kb_documents SET content = ${content}, size_kb = ${size_kb}, updated_at = NOW() WHERE id = ${existing[0].id}`;
+          results.push({ ok: true, action: "updated", name });
+        } else {
+          await sql`INSERT INTO kb_documents (org_id, name, content, category, size_kb, chunks, status) VALUES (${org_id}, ${name}, ${content}, ${category}, ${size_kb}, ${1}, ${"indexed"})`;
+          results.push({ ok: true, action: "created", name });
+        }
+      } catch(e) {
+        results.push({ ok: false, name: article.title || "unknown", error: e.message });
+      }
+    }
+  } catch(e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+  res.json({ ok: true, results, imported: results.filter(r => r.ok).length });
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 
 // ── RLS default context middleware ────────────────────────────────────────────
 // Sets app.current_org_id = '' (super admin / bypass) for every request.
