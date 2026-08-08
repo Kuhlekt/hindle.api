@@ -1492,19 +1492,36 @@ app.post("/api/chat", async (req, res) => {
         // Resolve org UUID from tenantId
         const orgs = await sql`SELECT id FROM organisations WHERE id::text = ${tenantId} OR tenant_id = ${tenantId} LIMIT 1`;
         const orgId = orgs.length ? orgs[0].id : tenantId;
-        // Load KB docs that have content (manual/text entries)
+        // Search KB for docs relevant to the visitor's question
+        const lastMsg = messages[messages.length - 1];
+        const searchText = (lastMsg?.content || lastMsg?.text || "").slice(0, 200).toLowerCase();
+        // Extract keywords (words > 3 chars)
+        const keywords = searchText.match(/\b\w{4,}\b/g) || [];
+        const searchPattern = keywords.slice(0, 5).join('|') || 'kuhlekt';
+
         const kbDocs = await sql`
-          SELECT name, LEFT(content, 1500) as content FROM kb_documents
+          SELECT name, LEFT(content, 2000) as content FROM kb_documents
           WHERE org_id = ${orgId}
             AND status = 'indexed'
             AND content IS NOT NULL
             AND content != ''
-          ORDER BY created_at DESC
-          LIMIT 15
+            AND (
+              content ILIKE ${'%' + (keywords[0] || 'kuhlekt') + '%'}
+              OR content ILIKE ${'%' + (keywords[1] || 'kuhlekt') + '%'}
+              OR name ILIKE ${'%' + (keywords[0] || 'kuhlekt') + '%'}
+            )
+          LIMIT 8
         `;
-        if (kbDocs.length > 0) {
+        // If no keyword matches, fall back to most recent docs
+        const fallbackDocs = kbDocs.length === 0 ? await sql`
+          SELECT name, LEFT(content, 1000) as content FROM kb_documents
+          WHERE org_id = ${orgId} AND status = 'indexed' AND content IS NOT NULL AND content != ''
+          ORDER BY created_at DESC LIMIT 5
+        ` : [];
+        const finalDocs = kbDocs.length > 0 ? kbDocs : fallbackDocs;
+        if (finalDocs.length > 0) {
           kbContext = "\n\n---\nKNOWLEDGE BASE — Use the following to answer questions. Do NOT say 'I don't know' — find the closest relevant answer or ask to clarify.\n\n" +
-            kbDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
+            finalDocs.map(doc => `[${doc.name}]\n${doc.content}`).join("\n\n---\n\n");
         }
       } catch (_) {}
     }
