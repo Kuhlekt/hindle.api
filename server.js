@@ -3379,6 +3379,210 @@ runTrialScheduler();
 setInterval(runTrialScheduler, 60 * 60 * 1000);
 
 // ─────────────────────────────────────────────
+// SUPPORT ACCESS REQUESTS
+// Elevated, time-boxed, approved access to a tenant's data for
+// helpdesk investigations. Every step is written to access_audit_log.
+// ─────────────────────────────────────────────
+
+const APP_BASE_URL = "https://chatbot.hindleconsultants.com";
+
+async function logAccessEvent(access_request_id, org_id, agent_id, action, detail, ip) {
+  try {
+    await sql`
+      INSERT INTO access_audit_log (access_request_id, org_id, agent_id, action, detail, ip)
+      VALUES (${access_request_id}, ${org_id}, ${agent_id}, ${action}, ${detail ? JSON.stringify(detail) : null}, ${ip || null})
+    `;
+  } catch (e) { console.error("[AccessAudit] error:", e.message); }
+}
+
+// Create a request + notify the tenant's approver (SMS and/or email)
+app.post("/api/access-requests", async (req, res) => {
+  const { org_id, requested_by_agent_id, requester_name, reason, scope, requested_duration_minutes } = req.body;
+  if (!org_id || !requested_by_agent_id || !reason || !scope || !requested_duration_minutes) {
+    return res.status(400).json({ ok: false, error: "org_id, requested_by_agent_id, reason, scope, requested_duration_minutes are required" });
+  }
+  try {
+    const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${org_id} LIMIT 1`;
+    if (!org) return res.status(404).json({ ok: false, error: "Tenant not found" });
+
+    const approval_token = crypto.randomBytes(32).toString("hex");
+    const linkExpires = new Date(Date.now() + 30 * 60000).toISOString();
+
+    const [reqRow] = await sql`
+      INSERT INTO access_requests
+        (org_id, requested_by_agent_id, reason, scope, requested_duration_minutes,
+         status, approval_token, approver_contact, expires_at)
+      VALUES
+        (${org_id}, ${requested_by_agent_id}, ${reason}, ${scope}, ${requested_duration_minutes},
+         'pending', ${approval_token}, ${org.email}, ${linkExpires})
+      RETURNING *
+    `;
+
+    await logAccessEvent(reqRow.id, org_id, requested_by_agent_id, "request_created",
+      { reason, scope, requested_duration_minutes }, req.ip);
+
+    const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
+    const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
+
+    if (org.email) {
+      await sendEmail({
+        to: org.email,
+        toName: org.name || "Customer",
+        subject: "Support access request — action required",
+        body: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+  <h2 style="margin:0 0 12px;color:#1e293b">Support access request</h2>
+  <p style="color:#64748b;margin:0 0 16px">Hi ${org.name || "there"},<br><br>
+  A Hindle Consultants support agent (${requester_name || "an agent"}) is requesting temporary access to your account to investigate a support ticket.</p>
+  <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 30 minutes</p>
+  <a href="${approveUrl}" style="display:inline-block;background:#3B82F6;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:15px;margin-bottom:20px">Review Request →</a>
+  <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">If you did not expect this, you can safely deny it on the review page. No access is granted unless you approve.</p>
+</div>`,
+        smtpCfg, csCfg,
+      }).catch(e => console.error("[AccessRequest] email error:", e.message));
+    }
+
+    try {
+      const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+      const cs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
+      if (cs.username && cs.apiKey && org.mobile) {
+        await fetch("https://rest.clicksend.com/v3/sms/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${cs.username}:${cs.apiKey}`).toString("base64") },
+          body: JSON.stringify({ messages: [{ source: "sdk", to: org.mobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: `Hindle support access request pending your approval: ${approveUrl}` }] }),
+        });
+      }
+    } catch (e) { console.error("[AccessRequest] SMS error:", e.message); }
+
+    res.json({ ok: true, request: reqRow });
+  } catch (e) {
+    console.error("[AccessRequest] create error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Public: view request details by token (no auth — token IS the auth)
+app.get("/api/access-requests/approve/:token", async (req, res) => {
+  try {
+    const [reqRow] = await sql`SELECT ar.*, o.name as org_name FROM access_requests ar JOIN organisations o ON o.id = ar.org_id WHERE approval_token = ${req.params.token} LIMIT 1`;
+    if (!reqRow) return res.status(404).json({ ok: false, error: "Invalid or unknown link" });
+    if (reqRow.status !== "pending") return res.json({ ok: true, request: reqRow, actionable: false, reason: `Already ${reqRow.status}` });
+    if (new Date(reqRow.expires_at) < new Date()) {
+      await sql`UPDATE access_requests SET status = 'expired' WHERE id = ${reqRow.id}`;
+      return res.json({ ok: true, request: reqRow, actionable: false, reason: "Link expired" });
+    }
+    res.json({ ok: true, request: reqRow, actionable: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Public: approve or deny by token
+app.post("/api/access-requests/approve/:token", async (req, res) => {
+  const { decision, approved_by_name } = req.body;
+  if (!["approved", "denied"].includes(decision)) return res.status(400).json({ ok: false, error: "decision must be 'approved' or 'denied'" });
+  try {
+    const [reqRow] = await sql`SELECT * FROM access_requests WHERE approval_token = ${req.params.token} LIMIT 1`;
+    if (!reqRow) return res.status(404).json({ ok: false, error: "Invalid or unknown link" });
+    if (reqRow.status !== "pending") return res.status(409).json({ ok: false, error: `Already ${reqRow.status}` });
+    if (new Date(reqRow.expires_at) < new Date()) {
+      await sql`UPDATE access_requests SET status = 'expired' WHERE id = ${reqRow.id}`;
+      return res.status(409).json({ ok: false, error: "Link expired" });
+    }
+
+    const ip = req.ip || req.headers["x-forwarded-for"] || null;
+    const ua = req.headers["user-agent"] || null;
+
+    if (decision === "approved") {
+      const grantExpires = new Date(Date.now() + reqRow.requested_duration_minutes * 60000).toISOString();
+      await sql`
+        UPDATE access_requests SET
+          status = 'approved', approved_by_name = ${approved_by_name || null},
+          approved_at = now(), approved_ip = ${ip}, approved_user_agent = ${ua},
+          expires_at = ${grantExpires}
+        WHERE id = ${reqRow.id}
+      `;
+      await logAccessEvent(reqRow.id, reqRow.org_id, reqRow.requested_by_agent_id, "approved", { approved_by_name, ip, ua }, ip);
+    } else {
+      await sql`UPDATE access_requests SET status = 'denied', approved_by_name = ${approved_by_name || null}, approved_at = now(), approved_ip = ${ip}, approved_user_agent = ${ua} WHERE id = ${reqRow.id}`;
+      await logAccessEvent(reqRow.id, reqRow.org_id, reqRow.requested_by_agent_id, "denied", { approved_by_name, ip, ua }, ip);
+    }
+
+    const [updated] = await sql`SELECT * FROM access_requests WHERE id = ${reqRow.id}`;
+    res.json({ ok: true, request: updated });
+  } catch (e) {
+    console.error("[AccessRequest] decision error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Check whether an agent currently holds a live, approved grant for an org.
+async function hasActiveGrant(agentId, orgId) {
+  const [row] = await sql`
+    SELECT id FROM access_requests
+    WHERE requested_by_agent_id = ${agentId} AND org_id::text = ${orgId}
+      AND status = 'approved' AND expires_at > now()
+    ORDER BY approved_at DESC LIMIT 1
+  `.catch(() => [null]);
+  return row || null;
+}
+
+// List / history — supports ?org_id=, ?status=
+app.get("/api/access-requests", async (req, res) => {
+  const { org_id, status } = req.query;
+  try {
+    let rows;
+    if (org_id && status) rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.org_id::text = ${org_id} AND ar.status = ${status} ORDER BY ar.created_at DESC`;
+    else if (org_id) rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.org_id::text = ${org_id} ORDER BY ar.created_at DESC`;
+    else if (status) rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.status = ${status} ORDER BY ar.created_at DESC`;
+    else rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id ORDER BY ar.created_at DESC LIMIT 200`;
+    res.json({ ok: true, requests: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Manual revoke (superadmin kill switch)
+app.post("/api/access-requests/:id/revoke", async (req, res) => {
+  const { revoked_by } = req.body;
+  try {
+    const [row] = await sql`UPDATE access_requests SET status = 'revoked', revoked_at = now(), revoked_by = ${revoked_by || "superadmin"} WHERE id = ${req.params.id} AND status = 'approved' RETURNING *`;
+    if (!row) return res.status(404).json({ ok: false, error: "No active grant found for that id" });
+    await logAccessEvent(row.id, row.org_id, row.requested_by_agent_id, "revoked", { revoked_by }, req.ip);
+    res.json({ ok: true, request: row });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Full audit trail for a request (compliance export)
+app.get("/api/access-audit-log", async (req, res) => {
+  const { access_request_id, org_id } = req.query;
+  try {
+    let rows;
+    if (access_request_id) rows = await sql`SELECT * FROM access_audit_log WHERE access_request_id = ${access_request_id} ORDER BY created_at ASC`;
+    else if (org_id) rows = await sql`SELECT * FROM access_audit_log WHERE org_id::text = ${org_id} ORDER BY created_at ASC`;
+    else return res.status(400).json({ ok: false, error: "access_request_id or org_id required" });
+    res.json({ ok: true, log: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Log an arbitrary action taken during an active elevated session
+app.post("/api/access-requests/:id/log", async (req, res) => {
+  const { agent_id, org_id, action, detail } = req.body;
+  if (!agent_id || !org_id || !action) return res.status(400).json({ ok: false, error: "agent_id, org_id, action required" });
+  try {
+    const grant = await hasActiveGrant(agent_id, org_id);
+    if (!grant) return res.status(403).json({ ok: false, error: "No active access grant for this agent/org" });
+    await logAccessEvent(req.params.id, org_id, agent_id, action, detail, req.ip);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
