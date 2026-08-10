@@ -3397,10 +3397,10 @@ async function logAccessEvent(access_request_id, org_id, agent_id, action, detai
 
 // Create a request + notify the tenant's approver (SMS and/or email)
 app.post("/api/access-requests", async (req, res) => {
-  const { org_id, requested_by_agent_id, requester_name, reason, scope, requested_duration_minutes,
+  const { org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
           approver_name, approver_email, approver_mobile } = req.body;
-  if (!org_id || !requested_by_agent_id || !reason || !scope || !requested_duration_minutes) {
-    return res.status(400).json({ ok: false, error: "org_id, requested_by_agent_id, reason, scope, requested_duration_minutes are required" });
+  if (!org_id || !requester_name || !reason || !scope || !requested_duration_minutes) {
+    return res.status(400).json({ ok: false, error: "org_id, requester_name, reason, scope, requested_duration_minutes are required" });
   }
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${org_id} LIMIT 1`;
@@ -3418,16 +3418,16 @@ app.post("/api/access-requests", async (req, res) => {
 
     const [reqRow] = await sql`
       INSERT INTO access_requests
-        (org_id, requested_by_agent_id, reason, scope, requested_duration_minutes,
+        (org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
          status, approval_token, approver_contact, approver_name, expires_at)
       VALUES
-        (${org_id}, ${requested_by_agent_id}, ${reason}, ${scope}, ${requested_duration_minutes},
+        (${org_id}, ${requested_by_agent_id || null}, ${requester_name}, ${requester_email || null}, ${reason}, ${scope}, ${requested_duration_minutes},
          'pending', ${approval_token}, ${contactEmail || contactMobile}, ${contactName}, ${linkExpires})
       RETURNING *
     `;
 
-    await logAccessEvent(reqRow.id, org_id, requested_by_agent_id, "request_created",
-      { reason, scope, requested_duration_minutes, approver_name: contactName, approver_email: contactEmail, approver_mobile: contactMobile }, req.ip);
+    await logAccessEvent(reqRow.id, org_id, requested_by_agent_id || null, "request_created",
+      { reason, scope, requested_duration_minutes, requester_name, approver_name: contactName, approver_email: contactEmail, approver_mobile: contactMobile }, req.ip);
 
     const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
     const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
@@ -3541,10 +3541,10 @@ app.get("/api/access-requests", async (req, res) => {
   const { org_id, status } = req.query;
   try {
     let rows;
-    if (org_id && status) rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.org_id::text = ${org_id} AND ar.status = ${status} ORDER BY ar.created_at DESC`;
-    else if (org_id) rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.org_id::text = ${org_id} ORDER BY ar.created_at DESC`;
-    else if (status) rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.status = ${status} ORDER BY ar.created_at DESC`;
-    else rows = await sql`SELECT ar.*, a.name as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id ORDER BY ar.created_at DESC LIMIT 200`;
+    if (org_id && status) rows = await sql`SELECT ar.*, COALESCE(ar.requester_name, a.name) as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.org_id::text = ${org_id} AND ar.status = ${status} ORDER BY ar.created_at DESC`;
+    else if (org_id) rows = await sql`SELECT ar.*, COALESCE(ar.requester_name, a.name) as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.org_id::text = ${org_id} ORDER BY ar.created_at DESC`;
+    else if (status) rows = await sql`SELECT ar.*, COALESCE(ar.requester_name, a.name) as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id WHERE ar.status = ${status} ORDER BY ar.created_at DESC`;
+    else rows = await sql`SELECT ar.*, COALESCE(ar.requester_name, a.name) as requester_name, o.name as org_name FROM access_requests ar LEFT JOIN agents a ON a.id = ar.requested_by_agent_id LEFT JOIN organisations o ON o.id = ar.org_id ORDER BY ar.created_at DESC LIMIT 200`;
     res.json({ ok: true, requests: rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
