@@ -3397,7 +3397,8 @@ async function logAccessEvent(access_request_id, org_id, agent_id, action, detai
 
 // Create a request + notify the tenant's approver (SMS and/or email)
 app.post("/api/access-requests", async (req, res) => {
-  const { org_id, requested_by_agent_id, requester_name, reason, scope, requested_duration_minutes } = req.body;
+  const { org_id, requested_by_agent_id, requester_name, reason, scope, requested_duration_minutes,
+          approver_name, approver_email, approver_mobile } = req.body;
   if (!org_id || !requested_by_agent_id || !reason || !scope || !requested_duration_minutes) {
     return res.status(400).json({ ok: false, error: "org_id, requested_by_agent_id, reason, scope, requested_duration_minutes are required" });
   }
@@ -3405,33 +3406,40 @@ app.post("/api/access-requests", async (req, res) => {
     const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${org_id} LIMIT 1`;
     if (!org) return res.status(404).json({ ok: false, error: "Tenant not found" });
 
+    const contactEmail = approver_email || org.email || null;
+    const contactMobile = approver_mobile || org.mobile || null;
+    if (!contactEmail && !contactMobile) {
+      return res.status(400).json({ ok: false, error: "No approver email or mobile — provide one, this tenant has none on file" });
+    }
+    const contactName = approver_name || org.name || "Customer";
+
     const approval_token = crypto.randomBytes(32).toString("hex");
     const linkExpires = new Date(Date.now() + 30 * 60000).toISOString();
 
     const [reqRow] = await sql`
       INSERT INTO access_requests
         (org_id, requested_by_agent_id, reason, scope, requested_duration_minutes,
-         status, approval_token, approver_contact, expires_at)
+         status, approval_token, approver_contact, approver_name, expires_at)
       VALUES
         (${org_id}, ${requested_by_agent_id}, ${reason}, ${scope}, ${requested_duration_minutes},
-         'pending', ${approval_token}, ${org.email}, ${linkExpires})
+         'pending', ${approval_token}, ${contactEmail || contactMobile}, ${contactName}, ${linkExpires})
       RETURNING *
     `;
 
     await logAccessEvent(reqRow.id, org_id, requested_by_agent_id, "request_created",
-      { reason, scope, requested_duration_minutes }, req.ip);
+      { reason, scope, requested_duration_minutes, approver_name: contactName, approver_email: contactEmail, approver_mobile: contactMobile }, req.ip);
 
     const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
     const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
 
-    if (org.email) {
+    if (contactEmail) {
       await sendEmail({
-        to: org.email,
-        toName: org.name || "Customer",
+        to: contactEmail,
+        toName: contactName,
         subject: "Support access request — action required",
         body: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
   <h2 style="margin:0 0 12px;color:#1e293b">Support access request</h2>
-  <p style="color:#64748b;margin:0 0 16px">Hi ${org.name || "there"},<br><br>
+  <p style="color:#64748b;margin:0 0 16px">Hi ${contactName},<br><br>
   A Hindle Consultants support agent (${requester_name || "an agent"}) is requesting temporary access to your account to investigate a support ticket.</p>
   <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 30 minutes</p>
   <a href="${approveUrl}" style="display:inline-block;background:#3B82F6;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:15px;margin-bottom:20px">Review Request →</a>
@@ -3441,17 +3449,19 @@ app.post("/api/access-requests", async (req, res) => {
       }).catch(e => console.error("[AccessRequest] email error:", e.message));
     }
 
-    try {
-      const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
-      const cs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
-      if (cs.username && cs.apiKey && org.mobile) {
-        await fetch("https://rest.clicksend.com/v3/sms/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${cs.username}:${cs.apiKey}`).toString("base64") },
-          body: JSON.stringify({ messages: [{ source: "sdk", to: org.mobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: `Hindle support access request pending your approval: ${approveUrl}` }] }),
-        });
-      }
-    } catch (e) { console.error("[AccessRequest] SMS error:", e.message); }
+    if (contactMobile) {
+      try {
+        const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+        const cs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
+        if (cs.username && cs.apiKey) {
+          await fetch("https://rest.clicksend.com/v3/sms/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${cs.username}:${cs.apiKey}`).toString("base64") },
+            body: JSON.stringify({ messages: [{ source: "sdk", to: contactMobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: `Hindle support access request pending your approval: ${approveUrl}` }] }),
+          });
+        }
+      } catch (e) { console.error("[AccessRequest] SMS error:", e.message); }
+    }
 
     res.json({ ok: true, request: reqRow });
   } catch (e) {
