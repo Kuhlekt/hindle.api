@@ -444,6 +444,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     console.error("[Stripe] Webhook signature error:", e.message);
     return res.status(400).json({ error: "Webhook signature error: " + e.message });
   }
+  
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
@@ -512,6 +513,8 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 });
 
 app.use(express.json({ limit: "10mb" }));
+const helpdeskProxy = require('./helpdesk-proxy-routes');
+app.use('/api/helpdesk', helpdeskProxy(sql));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // ── Import from Kuhlekt KB API ────────────────────────────────────────────────
