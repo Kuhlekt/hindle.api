@@ -2704,6 +2704,95 @@ app.get("/api/handoff-token/:token", async (req, res) => {
 // ─────────────────────────────────────────────
 // POST /api/handoff  — visitor-initiated handoff + ClickSend SMS
 // ─────────────────────────────────────────────
+// ─── Ticket notification webhook ────────────────────────────────────────────
+// Add this route to server.js, anywhere alongside your other /api/handoff
+// style routes. Mirrors the existing chatbot handoff SMS pattern exactly,
+// just triggered by the HELPDESK app instead of the widget.
+//
+// Env var needed (Railway): HELPDESK_WEBHOOK_SECRET=<random-string>
+// Same secret must be set in the helpdesk's env as HELPDESK_WEBHOOK_SECRET.
+
+app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
+  try {
+    const authHeader = req.headers["x-webhook-secret"];
+    if (!process.env.HELPDESK_WEBHOOK_SECRET || authHeader !== process.env.HELPDESK_WEBHOOK_SECRET) {
+      return res.status(401).json({ error: "Invalid webhook secret" });
+    }
+
+    const { event, helpdesk_org_id, ticket_number, subject, requester_name, ticket_id } = req.body;
+    if (!helpdesk_org_id || !ticket_number) {
+      return res.status(400).json({ error: "helpdesk_org_id and ticket_number required" });
+    }
+
+    // Reverse lookup: which chatbot tenant owns this helpdesk org?
+    const [org] = await sql`
+      SELECT * FROM organisations WHERE helpdesk_org_id = ${helpdesk_org_id}::uuid LIMIT 1
+    `;
+    if (!org) {
+      console.log(`[TicketWebhook] no chatbot tenant mapped to helpdesk_org_id=${helpdesk_org_id} — skipping`);
+      return res.json({ ok: true, skipped: true, reason: "No tenant mapping found" });
+    }
+
+    // Load agents scoped to receive ticket notifications
+    const agentsList = await sql`SELECT * FROM agents WHERE org_id = ${org.id} AND active != false`;
+    const targets = agentsList.filter(a =>
+      a.mobile &&
+      a.sms_alerts !== false &&
+      a.active !== false &&
+      (!a.work_scope || a.work_scope.includes("tickets"))
+    );
+
+    if (!targets.length) {
+      return res.json({ ok: true, smsSent: false, smsTargets: 0, reason: "No agents scoped for ticket notifications" });
+    }
+
+    // Load ClickSend creds (tenant, falling back to platform — same pattern as handoff)
+    let tenantConfig = {};
+    try {
+      const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org.id} LIMIT 1`;
+      if (rows.length) tenantConfig = rows[0].config;
+    } catch (e) {}
+    if (!tenantConfig?.clicksend?.username) {
+      try {
+        const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform'`;
+        if (rows.length && rows[0].config?.clicksend?.username) {
+          tenantConfig = { ...tenantConfig, clicksend: rows[0].config.clicksend };
+        }
+      } catch (e) {}
+    }
+    const cs = tenantConfig.clicksend || {};
+    if (!cs.username || !cs.apiKey) {
+      return res.json({ ok: true, smsSent: false, reason: "ClickSend not configured for this tenant" });
+    }
+    const smsSender = (cs.smsSender || "HINDLE").substring(0, 11);
+
+    const label = event === "new_message" ? "New reply on ticket" : "New ticket";
+    const ticketUrl = `https://chatbot.hindleconsultants.com/?page=helpdesk&ticket=${ticket_id || ""}`;
+    const smsBody = `[${smsSender}] ${label} #${ticket_number}: ${(subject || "").slice(0, 60)} — ${requester_name || "customer"}. ${ticketUrl}`;
+
+    let smsSent = false, smsError = null;
+    try {
+      const auth = "Basic " + Buffer.from(cs.username + ":" + cs.apiKey).toString("base64");
+      const msgs = targets.map(a => ({ source: "sdk", to: a.mobile, from: smsSender, body: smsBody, schedule: 0 }));
+      const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: auth },
+        body: JSON.stringify({ messages: msgs }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const d = await r.json();
+      smsSent = d?.data?.messages?.every(m => m.status === "SUCCESS");
+      smsError = smsSent ? null : (d?.data?.messages?.[0]?.status || "Send failed");
+    } catch (e) {
+      smsError = e.message;
+    }
+
+    res.json({ ok: true, smsSent, smsTargets: targets.length, smsError });
+  } catch (e) {
+    console.error("[TicketWebhook] error:", e.message);
+    res.status(500).json({ error: e.message || "Failed" });
+  }
+});
 app.post("/api/handoff", async (req, res) => {
   const {
     tenantId,
