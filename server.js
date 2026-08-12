@@ -2695,7 +2695,7 @@ app.get("/api/handoff-token/:token", async (req, res) => {
       const agt = await sql`SELECT * FROM agents WHERE mobile = ${row.mobile} LIMIT 1`;
       if (agt.length) agent = { name: agt[0].name, email: agt[0].email, mobile: agt[0].mobile };
     } catch (_) {}
-    res.json({ ok: true, org_id: row.org_id, conversation_id: row.conversation_id, agent });
+    res.json({ ok: true, org_id: row.org_id, conversation_id: row.conversation_id, ticket_id: row.ticket_id || null, agent });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -2712,6 +2712,13 @@ app.get("/api/handoff-token/:token", async (req, res) => {
 // Env var needed (Railway): HELPDESK_WEBHOOK_SECRET=<random-string>
 // Same secret must be set in the helpdesk's env as HELPDESK_WEBHOOK_SECRET.
 
+// ─── Ticket notification webhook (v2 — with magic-link login) ──────────────
+// Replaces the previous /api/helpdesk/webhook/ticket-event route entirely.
+// Now generates a one-time magic token (same alert_log + 3-minute-expiry
+// pattern as the existing chatbot handoff flow) so the SMS link logs the
+// agent straight into the Tickets tab with that ticket already open —
+// no separate sign-in step.
+
 app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
   try {
     const authHeader = req.headers["x-webhook-secret"];
@@ -2724,7 +2731,6 @@ app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
       return res.status(400).json({ error: "helpdesk_org_id and ticket_number required" });
     }
 
-    // Reverse lookup: which chatbot tenant owns this helpdesk org?
     const [org] = await sql`
       SELECT * FROM organisations WHERE helpdesk_org_id = ${helpdesk_org_id}::uuid LIMIT 1
     `;
@@ -2733,7 +2739,6 @@ app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
       return res.json({ ok: true, skipped: true, reason: "No tenant mapping found" });
     }
 
-    // Load agents scoped to receive ticket notifications
     const agentsList = await sql`SELECT * FROM agents WHERE org_id = ${org.id} AND active != false`;
     const targets = agentsList.filter(a =>
       a.mobile &&
@@ -2746,7 +2751,6 @@ app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
       return res.json({ ok: true, smsSent: false, smsTargets: 0, reason: "No agents scoped for ticket notifications" });
     }
 
-    // Load ClickSend creds (tenant, falling back to platform — same pattern as handoff)
     let tenantConfig = {};
     try {
       const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org.id} LIMIT 1`;
@@ -2766,9 +2770,21 @@ app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
     }
     const smsSender = (cs.smsSender || "HINDLE").substring(0, 11);
 
+    // Generate a magic-link token — same pattern as chatbot handoff.
+    // alert_log.ticket_id (not conversation_id) marks this as a ticket link.
+    const magicToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    try {
+      await sql`
+        INSERT INTO alert_log (org_id, ticket_id, agent_name, mobile, visitor_name, page, token)
+        VALUES (${org.id}, ${ticket_id || null}, ${"Ticket Notification"}, ${"—"}, ${requester_name || "customer"}, ${"/tickets"}, ${magicToken})
+      `;
+    } catch (e) {
+      console.error("[TicketWebhook] alert_log insert failed:", e.message);
+    }
+    const magicUrl = `https://chatbot.hindleconsultants.com/?token=${magicToken}`;
+
     const label = event === "new_message" ? "New reply on ticket" : "New ticket";
-    const ticketUrl = `https://chatbot.hindleconsultants.com/?page=helpdesk&ticket=${ticket_id || ""}`;
-    const smsBody = `[${smsSender}] ${label} #${ticket_number}: ${(subject || "").slice(0, 60)} — ${requester_name || "customer"}. ${ticketUrl}`;
+    const smsBody = `[${smsSender}] ${label} #${ticket_number}: ${(subject || "").slice(0, 50)} — ${requester_name || "customer"}. ${magicUrl}`;
 
     let smsSent = false, smsError = null;
     try {
@@ -2783,6 +2799,7 @@ app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
       const d = await r.json();
       smsSent = d?.data?.messages?.every(m => m.status === "SUCCESS");
       smsError = smsSent ? null : (d?.data?.messages?.[0]?.status || "Send failed");
+      try { await sql`UPDATE alert_log SET status = ${smsSent ? "sent" : "failed"} WHERE token = ${magicToken}`; } catch (_) {}
     } catch (e) {
       smsError = e.message;
     }
@@ -2983,27 +3000,6 @@ app.post("/api/handoff", async (req, res) => {
 // ─────────────────────────────────────────────
 // GET /api/handoff-token/:token  — magic link verification
 // ─────────────────────────────────────────────
-app.get("/api/handoff-token/:token", async (req, res) => {
-  try {
-    const rows = await sql`SELECT * FROM alert_log WHERE token = ${req.params.token} LIMIT 1`;
-    if (!rows.length) return res.status(404).json({ error: "Invalid or expired link" });
-    const row = rows[0];
-    // Check expiry (3 minutes)
-    const age = Date.now() - new Date(row.created_at).getTime();
-    if (age > 3 * 60 * 1000) {
-      try { await sql`UPDATE alert_log SET status = 'expired' WHERE token = ${req.params.token}`; } catch (_) {}
-      return res.status(410).json({ error: "Link expired", expired: true });
-    }
-    if (row.status === "expired") return res.status(410).json({ error: "Link expired", expired: true });
-    // Mark clicked
-    try { await sql`UPDATE alert_log SET status = 'clicked' WHERE token = ${req.params.token}`; } catch (_) {}
-    const orgs   = await sql`SELECT * FROM organisations WHERE id = ${row.org_id} LIMIT 1`;
-    const agents = await sql`SELECT * FROM agents WHERE org_id = ${row.org_id} AND role = 'tenant_admin' LIMIT 1`;
-    res.json({ ok: true, token: row.token, org_id: row.org_id, conversation_id: row.conversation_id,
-               visitor_name: row.visitor_name, page: row.page, org: orgs[0] || null, agent: agents[0] || null });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 // ─────────────────────────────────────────────
 // GET /api/org-by-email/:email
 // ─────────────────────────────────────────────
