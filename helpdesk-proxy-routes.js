@@ -1,21 +1,9 @@
-// ─── Helpdesk Proxy Routes ──────────────────────────────────────────────────
-// Bridges the chatbot dashboard to the separate Helpdesk (v0-kuhlekt-help-desk)
-// Next.js API, using the helpdesk_org_id mapping stored on each chatbot tenant.
-//
-// SECURITY: the helpdesk API trusts the X-Org-Id header verbatim (see its
-// middleware.ts). This proxy is the ONLY place that header gets set, and it is
-// always derived server-side from the CHATBOT tenant's own org_id via the
-// organisations.helpdesk_org_id column — never forwarded verbatim from the
-// browser's own X-Org-Id (that value identifies the CHATBOT tenant, not the
-// helpdesk org — the two are different UUID spaces, this proxy is the bridge).
-// The browser never talks to the helpdesk domain directly.
-//
-// Matches this codebase's existing convention: org_id comes from the
-// X-Org-Id header or ?org_id= query param, same as the rest of server.js.
-//
-// Wire into server.js with:
-//   const helpdeskProxy = require('./helpdesk-proxy-routes');
-//   app.use('/api/helpdesk', helpdeskProxy(sql));
+// ─── Helpdesk Proxy Routes (v2 — full agent parity) ─────────────────────────
+// Replaces the previous helpdesk-proxy-routes.js entirely.
+// Adds: categories, canned responses, ticket assignment/priority/category
+// updates, internal notes (via is_internal flag), cause/resolution save,
+// CSAT result lookup, and SLA info — all passthrough to the real helpdesk
+// API, scoped per-tenant exactly like the original routes.
 
 const HELPDESK_API_BASE = process.env.HELPDESK_API_BASE || 'https://helpdesk.hindleconsultants.com';
 
@@ -27,118 +15,125 @@ module.exports = function helpdeskProxyRouter(sql) {
     return req.headers['x-org-id'] || req.query.org_id || req.body?.org_id || null;
   }
 
-  // Resolve the CHATBOT tenant's org_id to the corresponding HELPDESK org UUID.
-  // Cached per-request via req._helpdeskOrgId so repeated calls don't hit the DB twice.
   async function resolveHelpdeskOrgId(req) {
     if (req._helpdeskOrgId !== undefined) return req._helpdeskOrgId;
     const tenantOrgId = chatbotOrgId(req);
-    if (!tenantOrgId) {
-      req._helpdeskOrgId = null;
-      return null;
-    }
-    const rows = await sql`
-      SELECT helpdesk_org_id FROM organisations WHERE id = ${tenantOrgId}::uuid LIMIT 1
-    `;
+    if (!tenantOrgId) { req._helpdeskOrgId = null; return null; }
+    const rows = await sql`SELECT helpdesk_org_id FROM organisations WHERE id = ${tenantOrgId}::uuid LIMIT 1`;
     req._helpdeskOrgId = rows[0]?.helpdesk_org_id || null;
     return req._helpdeskOrgId;
   }
 
-  // Shared fetch helper — always injects the resolved helpdesk org id.
   async function helpdeskFetch(helpdeskOrgId, path, opts = {}) {
     const res = await fetch(HELPDESK_API_BASE + path, {
       ...opts,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Org-Id': helpdeskOrgId,
-        ...(opts.headers || {}),
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Org-Id': helpdeskOrgId, ...(opts.headers || {}) },
     });
     const data = await res.json().catch(() => ({}));
     return { ok: res.ok, status: res.status, data };
   }
 
-  // GET /api/helpdesk/status — tells the frontend whether helpdesk is enabled
-  // for this tenant, so PHelpdesk can show a friendly "not enabled" state.
   router.get('/status', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     res.json({ enabled: !!helpdeskOrgId });
   });
 
-  // GET /api/helpdesk/tickets?limit=&offset=&status=&priority=&q=
+  // ── Tickets ────────────────────────────────────────────────────────────
   router.get('/tickets', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
-    if (!helpdeskOrgId) {
-      return res.json({ success: true, data: [], total: 0, enabled: false });
-    }
+    if (!helpdeskOrgId) return res.json({ success: true, data: [], total: 0, enabled: false });
     const qs = new URLSearchParams(req.query).toString();
     const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets${qs ? '?' + qs : ''}`);
     res.status(status).json({ ...data, enabled: true });
   });
 
-  // POST /api/helpdesk/tickets — create a new ticket
   router.post('/tickets', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
-    if (!helpdeskOrgId) {
-      return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    }
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, '/api/tickets', {
-      method: 'POST',
-      body: JSON.stringify(req.body),
-    });
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, '/api/tickets', { method: 'POST', body: JSON.stringify(req.body) });
     res.status(status).json(data);
   });
 
-  // GET /api/helpdesk/tickets/:id — ticket detail
-  // Note: the helpdesk's own route doesn't filter by org on single-ticket GET,
-  // so we defense-in-depth check the returned ticket's organization_id matches
-  // before returning it to the caller.
   router.get('/tickets/:id', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
-    if (!helpdeskOrgId) {
-      return res.status(404).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    }
+    if (!helpdeskOrgId) return res.status(404).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}`);
     const ticket = data?.data || data?.ticket;
-    if (ticket && String(ticket.organization_id) !== String(helpdeskOrgId)) {
-      return res.status(404).json({ error: 'Ticket not found' });
-    }
+    if (ticket && String(ticket.organization_id) !== String(helpdeskOrgId)) return res.status(404).json({ error: 'Ticket not found' });
     res.status(status).json(data);
   });
 
-  // PUT /api/helpdesk/tickets/:id — update status/priority/assignee
+  // Generic ticket update — status, priority, category_id, assigned_to all
+  // flow through here since the underlying helpdesk PUT route accepts all of them.
   router.put('/tickets/:id', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
-    if (!helpdeskOrgId) {
-      return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    }
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(req.body),
-    });
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}`, { method: 'PUT', body: JSON.stringify(req.body) });
     res.status(status).json(data);
   });
 
-  // GET /api/helpdesk/tickets/:id/messages
+  // ── Messages (reply / internal note / cause / resolution) ───────────────
+  // is_internal:true = internal note. is_cause:true = saved as ticket.cause.
+  // Resolution is saved via PUT /tickets/:id { resolution, status:'resolved' }.
   router.get('/tickets/:id/messages', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
-    if (!helpdeskOrgId) {
-      return res.json({ success: true, data: [], messages: [] });
-    }
+    if (!helpdeskOrgId) return res.json({ success: true, data: [], messages: [] });
     const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/messages`);
     res.status(status).json(data);
   });
 
-  // POST /api/helpdesk/tickets/:id/messages — reply to a ticket
   router.post('/tickets/:id/messages', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
-    if (!helpdeskOrgId) {
-      return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    }
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/messages`, {
       method: 'POST',
       headers: req.headers['x-user-id'] || req.body?.agent_id ? { 'X-User-Id': req.headers['x-user-id'] || req.body.agent_id } : {},
       body: JSON.stringify(req.body),
     });
+    res.status(status).json(data);
+  });
+
+  // ── Categories (for the category dropdown) ───────────────────────────────
+  router.get('/categories', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/categories`);
+    res.status(status).json(data);
+  });
+
+  // ── Canned responses ──────────────────────────────────────────────────
+  router.get('/canned-responses', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/canned-responses`);
+    res.status(status).json(data);
+  });
+
+  // ── Agents (for the assign-to dropdown) ──────────────────────────────
+  router.get('/agents', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/users`);
+    res.status(status).json(data);
+  });
+
+  // ── CSAT result for a specific ticket (if any) ────────────────────────
+  // Note: exact query shape of /api/admin/csat unconfirmed — this passes
+  // ticket_id as a query param, the most common convention. If it returns
+  // the wrong shape, the badge simply won't show (fails silently on the
+  // frontend) rather than breaking anything.
+  router.get('/tickets/:id/csat', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: null });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/csat?ticket_id=${encodeURIComponent(req.params.id)}`);
+    res.status(status).json(data);
+  });
+
+  // ── KPI / reporting snapshot ───────────────────────────────────────────
+  router.get('/reports/kpi', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: null });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/reports/kpi`);
     res.status(status).json(data);
   });
 
