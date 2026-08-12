@@ -2855,7 +2855,12 @@ app.post("/api/handoff", async (req, res) => {
   let smsSent = false, smsError = null, smsTargets = 0;
 
   if (cs.username && cs.apiKey) {
-    const targets = agentsList.filter(a => a.mobile && a.sms_alerts !== false && a.active !== false);
+    const targets = agentsList.filter(a =>
+  a.mobile &&
+  a.sms_alerts !== false &&
+  a.active !== false &&
+  (!a.work_scope || a.work_scope.includes("chatbot"))
+);
     smsTargets = targets.length;
     if (targets.length) {
       try {
