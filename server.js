@@ -2726,7 +2726,7 @@ app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
       return res.status(401).json({ error: "Invalid webhook secret" });
     }
 
-    const { event, helpdesk_org_id, ticket_number, subject, requester_name, ticket_id } = req.body;
+  const { event, helpdesk_org_id, ticket_number, subject, requester_name, requester_email, reply_body, ticket_id } = req.body;
     if (!helpdesk_org_id || !ticket_number) {
       return res.status(400).json({ error: "helpdesk_org_id and ticket_number required" });
     }
@@ -2746,7 +2746,29 @@ app.post("/api/helpdesk/webhook/ticket-event", async (req, res) => {
       a.active !== false &&
       (!a.work_scope || a.work_scope.includes("tickets"))
     );
-
+if (event === "agent_reply") {
+      if (!requester_email) {
+        return res.json({ ok: true, emailSent: false, reason: "No requester_email provided" });
+      }
+      const { smtpCfg, csCfg } = await loadEmailConfig(org.id);
+      const portalUrl = `https://helpdesk.hindleconsultants.com/portal/${org.helpdesk_slug || ""}`;
+      const emailBody = `
+        <p>Hi ${requester_name || "there"},</p>
+        <p>You have a new reply on your support ticket <strong>#${ticket_number}: ${subject || ""}</strong></p>
+        <blockquote style="border-left:3px solid #2563EB;padding-left:12px;color:#334155;margin:16px 0;">
+          ${(reply_body || "").replace(/\n/g, "<br>")}
+        </blockquote>
+        <p><a href="${portalUrl}">View and reply to this ticket</a></p>
+      `;
+      const result = await sendEmail({
+        to: requester_email,
+        toName: requester_name || "",
+        subject: `Re: [#${ticket_number}] ${subject || "Your support ticket"}`,
+        body: emailBody,
+        smtpCfg, csCfg,
+      });
+      return res.json({ ok: true, emailSent: !!result?.ok, emailError: result?.error || null });
+    }
     if (!targets.length) {
       return res.json({ ok: true, smsSent: false, smsTargets: 0, reason: "No agents scoped for ticket notifications" });
     }
