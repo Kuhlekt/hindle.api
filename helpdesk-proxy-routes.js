@@ -152,6 +152,43 @@ module.exports = function helpdeskProxyRouter(sql) {
     res.status(status).json(data);
   });
 
+  // ── Side conversations ────────────────────────────────────────────────
+  router.get('/tickets/:id/side-conversations', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/side-conversations`);
+    res.status(status).json(data);
+  });
+
+  router.post('/tickets/:id/side-conversations', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/side-conversations`, {
+      method: 'POST',
+      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
+      body: JSON.stringify(req.body),
+    });
+    res.status(status).json(data);
+  });
+
+  router.get('/side-conversations/:id/messages', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/side-conversations/${encodeURIComponent(req.params.id)}/messages`);
+    res.status(status).json(data);
+  });
+
+  router.post('/side-conversations/:id/messages', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/side-conversations/${encodeURIComponent(req.params.id)}/messages`, {
+      method: 'POST',
+      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
+      body: JSON.stringify(req.body),
+    });
+    res.status(status).json(data);
+  });
+
   // ── KPI / reporting snapshot ───────────────────────────────────────────
   router.get('/reports/kpi', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
