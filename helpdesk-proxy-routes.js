@@ -72,6 +72,18 @@ module.exports = function helpdeskProxyRouter(sql) {
     res.status(status).json(data);
   });
 
+  // ── Merge tickets ─────────────────────────────────────────────────────
+  router.post('/tickets/:id/merge', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/merge`, {
+      method: 'POST',
+      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
+      body: JSON.stringify(req.body),
+    });
+    res.status(status).json(data);
+  });
+
   // ── Messages (reply / internal note / cause / resolution) ───────────────
   // is_internal:true = internal note. is_cause:true = saved as ticket.cause.
   // Resolution is saved via PUT /tickets/:id { resolution, status:'resolved' }.
