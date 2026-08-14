@@ -3513,7 +3513,8 @@ async function logAccessEvent(access_request_id, org_id, agent_id, action, detai
 // Create a request + notify the tenant's approver (SMS and/or email)
 app.post("/api/access-requests", async (req, res) => {
   const { org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
-          approver_name, approver_email, approver_mobile } = req.body;
+          approver_name, approver_email, approver_mobile } = req.body;const { org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
+          approver_name, approver_email, approver_mobile, delivery_method = "both", on_behalf_of = "Hindle Consultants" } = req.body;
   if (!org_id || !requester_name || !reason || !scope || !requested_duration_minutes) {
     return res.status(400).json({ ok: false, error: "org_id, requester_name, reason, scope, requested_duration_minutes are required" });
   }
@@ -3547,7 +3548,7 @@ app.post("/api/access-requests", async (req, res) => {
     const approveUrl = `${APP_BASE_URL}/access-approve/${approval_token}`;
     const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
 
-    if (contactEmail) {
+    if (contactEmail && (delivery_method === "email" || delivery_method === "both")) {
       await sendEmail({
         to: contactEmail,
         toName: contactName,
@@ -3555,7 +3556,7 @@ app.post("/api/access-requests", async (req, res) => {
         body: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
   <h2 style="margin:0 0 12px;color:#1e293b">Support access request</h2>
   <p style="color:#64748b;margin:0 0 16px">Hi ${contactName},<br><br>
-  A Hindle Consultants support agent (${requester_name || "an agent"}) is requesting temporary access to your account to investigate a support ticket.</p>
+  A ${on_behalf_of} support agent (${requester_name || "an agent"}) is requesting temporary access to your account to investigate a support ticket.</p>
   <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 30 minutes</p>
   <a href="${approveUrl}" style="display:inline-block;background:#3B82F6;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:15px;margin-bottom:20px">Review Request →</a>
   <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">If you did not expect this, you can safely deny it on the review page. No access is granted unless you approve.</p>
@@ -3564,7 +3565,7 @@ app.post("/api/access-requests", async (req, res) => {
       }).catch(e => console.error("[AccessRequest] email error:", e.message));
     }
 
-    if (contactMobile) {
+    if (contactMobile && (delivery_method === "sms" || delivery_method === "both")) {
       try {
         const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
         const cs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
