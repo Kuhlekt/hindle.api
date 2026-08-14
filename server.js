@@ -3544,7 +3544,7 @@ app.post("/api/access-requests", async (req, res) => {
     await logAccessEvent(reqRow.id, org_id, requested_by_agent_id || null, "request_created",
       { reason, scope, requested_duration_minutes, requester_name, approver_name: contactName, approver_email: contactEmail, approver_mobile: contactMobile }, req.ip);
 
-    const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
+    const approveUrl = `${APP_BASE_URL}/access-approve/${approval_token}`;
     const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
 
     if (contactEmail) {
@@ -3599,6 +3599,110 @@ app.get("/api/access-requests/approve/:token", async (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── ADD to server.js — standalone approval page (no auth, no app shell) ────
+// This replaces the email/SMS link target. Add this route anywhere near the
+// existing /api/access-requests/approve/:token routes.
+//
+// Also update the link construction (in POST /api/access-requests) from:
+//   const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
+// to:
+//   const approveUrl = `${APP_BASE_URL}/access-approve/${approval_token}`;
+// (Note: APP_BASE_URL is presumably the hindle_api Railway URL or a proxied
+// domain — use whichever base the rest of your public-facing links use, this
+// route lives on the SAME server as the /api/access-requests/* routes.)
+
+app.get("/access-approve/:token", async (req, res) => {
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access Request Review</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#F8F9FB;color:#0F172A;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+  .card{background:#fff;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,.08);max-width:440px;width:100%;padding:32px;}
+  h1{font-size:19px;font-weight:700;margin-bottom:6px;}
+  .sub{font-size:13px;color:#64748B;margin-bottom:22px;}
+  .row{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #E2E6ED;font-size:13.5px;}
+  .row:last-child{border-bottom:none;}
+  .row b{color:#334155;font-weight:600;}
+  .row span{color:#64748B;text-align:right;max-width:60%;}
+  label{display:block;font-size:12px;font-weight:600;color:#334155;margin:20px 0 6px;}
+  input{width:100%;padding:10px 12px;border-radius:9px;border:1px solid #E2E6ED;font-size:13.5px;}
+  .btns{display:flex;gap:10px;margin-top:20px;}
+  button{flex:1;padding:12px;border-radius:10px;font-size:14px;font-weight:700;border:none;cursor:pointer;}
+  .approve{background:#2563EB;color:#fff;}
+  .deny{background:#FEE2E2;color:#991B1B;}
+  .approve:disabled,.deny:disabled{opacity:.5;cursor:default;}
+  .msg{font-size:14px;text-align:center;padding:20px 0;}
+  .msg.ok{color:#065F46;}
+  .msg.err{color:#991B1B;}
+  #loading{text-align:center;color:#94A3B8;font-size:13px;}
+</style>
+</head>
+<body>
+<div class="card" id="card"><p id="loading">Loading request…</p></div>
+<script>
+const token = ${JSON.stringify(req.params.token)};
+const card = document.getElementById('card');
+
+fetch('/api/access-requests/approve/' + token)
+  .then(r => r.json())
+  .then(d => {
+    if (!d.ok) { card.innerHTML = '<p class="msg err">This link is invalid.</p>'; return; }
+    const req = d.request;
+    if (!d.actionable) {
+      card.innerHTML = '<h1>Request already handled</h1><p class="msg">' + (d.reason || 'This request is no longer pending.') + '</p>';
+      return;
+    }
+    card.innerHTML =
+      '<h1>Support access request</h1>' +
+      '<p class="sub">' + (req.org_name || 'Your organisation') + '</p>' +
+      '<div class="row"><b>Requested by</b><span>' + escapeHtml(req.requester_name || 'An agent') + '</span></div>' +
+      '<div class="row"><b>Reason</b><span>' + escapeHtml(req.reason || '—') + '</span></div>' +
+      '<div class="row"><b>Access level</b><span>' + escapeHtml(req.scope || '—') + '</span></div>' +
+      '<div class="row"><b>Duration</b><span>' + req.requested_duration_minutes + ' minutes</span></div>' +
+      '<label for="name">Your name (for our records)</label>' +
+      '<input id="name" placeholder="Enter your full name" />' +
+      '<div class="btns">' +
+        '<button class="deny" id="denyBtn">Deny</button>' +
+        '<button class="approve" id="approveBtn">Approve</button>' +
+      '</div>';
+
+    function decide(decision) {
+      const name = document.getElementById('name').value.trim();
+      if (!name) { alert('Please enter your name first.'); return; }
+      document.getElementById('approveBtn').disabled = true;
+      document.getElementById('denyBtn').disabled = true;
+      fetch('/api/access-requests/approve/' + token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision, approved_by_name: name })
+      })
+        .then(r => r.json())
+        .then(res => {
+          if (!res.ok) { card.innerHTML = '<p class="msg err">' + (res.error || 'Something went wrong.') + '</p>'; return; }
+          card.innerHTML = decision === 'approved'
+            ? '<h1>Access approved</h1><p class="msg ok">Thanks, ' + escapeHtml(name) + '. Access has been granted for the requested duration.</p>'
+            : '<h1>Request denied</h1><p class="msg">Thanks, ' + escapeHtml(name) + '. No access has been granted.</p>';
+        })
+        .catch(() => { card.innerHTML = '<p class="msg err">Network error — please try again.</p>'; });
+    }
+    document.getElementById('approveBtn').addEventListener('click', () => decide('approved'));
+    document.getElementById('denyBtn').addEventListener('click', () => decide('denied'));
+  })
+  .catch(() => { card.innerHTML = '<p class="msg err">Could not load this request.</p>'; });
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>`);
 });
 
 // Public: approve or deny by token
