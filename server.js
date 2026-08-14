@@ -3519,6 +3519,8 @@ app.post("/api/access-requests", async (req, res) => {
   }
   try {
     const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${org_id} LIMIT 1`;
+    const [orgCfgRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org_id} LIMIT 1`.catch(() => [null]);
+    const orgLogoUrl = orgCfgRow?.config?.brand?.customLogoUrl || null;
     if (!org) return res.status(404).json({ ok: false, error: "Tenant not found" });
 
     const contactEmail = approver_email || org.email || null;
@@ -3553,6 +3555,7 @@ app.post("/api/access-requests", async (req, res) => {
         toName: contactName,
         subject: "Support access request — action required",
         body: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+  ${orgLogoUrl ? `<img src="${orgLogoUrl}" alt="${on_behalf_of}" style="max-height:40px;margin-bottom:20px;display:block" />` : ''}
   <h2 style="margin:0 0 12px;color:#1e293b">Support access request</h2>
   <p style="color:#64748b;margin:0 0 16px">Hi ${contactName},<br><br>
   A ${on_behalf_of} support agent (${requester_name || "an agent"}) is requesting temporary access to your account to investigate a support ticket.</p>
@@ -3588,7 +3591,11 @@ app.post("/api/access-requests", async (req, res) => {
 // Public: view request details by token (no auth — token IS the auth)
 app.get("/api/access-requests/approve/:token", async (req, res) => {
   try {
-    const [reqRow] = await sql`SELECT ar.*, o.name as org_name FROM access_requests ar JOIN organisations o ON o.id = ar.org_id WHERE approval_token = ${req.params.token} LIMIT 1`;
+    const [reqRow] = await sql`
+      SELECT ar.*, o.name as org_name,
+        (SELECT config->'brand'->>'customLogoUrl' FROM tenant_configs WHERE tenant_id = ar.org_id::text LIMIT 1) as org_logo_url
+      FROM access_requests ar JOIN organisations o ON o.id = ar.org_id
+      WHERE approval_token = ${req.params.token} LIMIT 1`;
     if (!reqRow) return res.status(404).json({ ok: false, error: "Invalid or unknown link" });
     if (reqRow.status !== "pending") return res.json({ ok: true, request: reqRow, actionable: false, reason: `Already ${reqRow.status}` });
     if (new Date(reqRow.expires_at) < new Date()) {
@@ -3600,6 +3607,18 @@ app.get("/api/access-requests/approve/:token", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// ── ADD to server.js — standalone approval page (no auth, no app shell) ────
+// This replaces the email/SMS link target. Add this route anywhere near the
+// existing /api/access-requests/approve/:token routes.
+//
+// Also update the link construction (in POST /api/access-requests) from:
+//   const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
+// to:
+//   const approveUrl = `${APP_BASE_URL}/access-approve/${approval_token}`;
+// (Note: APP_BASE_URL is presumably the hindle_api Railway URL or a proxied
+// domain — use whichever base the rest of your public-facing links use, this
+// route lives on the SAME server as the /api/access-requests/* routes.)
 
 // ── ADD to server.js — standalone approval page (no auth, no app shell) ────
 // This replaces the email/SMS link target. Add this route anywhere near the
@@ -3660,6 +3679,7 @@ fetch('/api/access-requests/approve/' + token)
       return;
     }
     card.innerHTML =
+      (req.org_logo_url ? '<img src="' + req.org_logo_url + '" alt="' + escapeHtml(req.org_name||'') + '" style="max-height:36px;margin-bottom:16px;display:block" />' : '') +
       '<h1>Support access request</h1>' +
       '<p class="sub">' + (req.org_name || 'Your organisation') + '</p>' +
       '<div class="row"><b>Requested by</b><span>' + escapeHtml(req.requester_name || 'An agent') + '</span></div>' +
