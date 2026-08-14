@@ -101,6 +101,21 @@ module.exports = function helpdeskProxyRouter(sql) {
     res.status(status).json(data);
   });
 
+  // ── Resolution types (for the resolution-type dropdown) ─────────────────
+  router.get('/resolution-types', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/resolution-types`);
+    res.status(status).json(data);
+  });
+
+  router.post('/resolution-types', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/resolution-types`, { method: 'POST', body: JSON.stringify(req.body) });
+    res.status(status).json(data);
+  });
+
   // ── Canned responses ──────────────────────────────────────────────────
   router.get('/canned-responses', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
