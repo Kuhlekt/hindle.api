@@ -3544,7 +3544,7 @@ app.post("/api/access-requests", async (req, res) => {
     await logAccessEvent(reqRow.id, org_id, requested_by_agent_id || null, "request_created",
       { reason, scope, requested_duration_minutes, requester_name, approver_name: contactName, approver_email: contactEmail, approver_mobile: contactMobile }, req.ip);
 
-    const approveUrl = `${APP_BASE_URL}/access-approve/${approval_token}`;
+    const approveUrl = `https://hindleapi-production.up.railway.app/access-approve/${approval_token}`;
     const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
 
     if (contactEmail && (delivery_method === "email" || delivery_method === "both")) {
@@ -3572,7 +3572,7 @@ app.post("/api/access-requests", async (req, res) => {
           await fetch("https://rest.clicksend.com/v3/sms/send", {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${cs.username}:${cs.apiKey}`).toString("base64") },
-            body: JSON.stringify({ messages: [{ source: "sdk", to: contactMobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: `Hindle support access request pending your approval: ${approveUrl}` }] }),
+            body: JSON.stringify({ messages: [{ source: "sdk", to: contactMobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: `${on_behalf_of} support access request pending your approval: ${approveUrl}` }] }),
           });
         }
       } catch (e) { console.error("[AccessRequest] SMS error:", e.message); }
