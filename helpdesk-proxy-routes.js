@@ -129,6 +129,14 @@ module.exports = function helpdeskProxyRouter(sql) {
     res.status(status).json(data);
   });
 
+  // ── Ticket audit log ────────────────────────────────────────────────
+  router.get('/tickets/:id/audit-log', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/audit-log`);
+    res.status(status).json(data);
+  });
+
   // ── KPI / reporting snapshot ───────────────────────────────────────────
   router.get('/reports/kpi', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
