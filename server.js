@@ -3513,7 +3513,6 @@ async function logAccessEvent(access_request_id, org_id, agent_id, action, detai
 // Create a request + notify the tenant's approver (SMS and/or email)
 app.post("/api/access-requests", async (req, res) => {
   const { org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
-          approver_name, approver_email, approver_mobile } = req.body;const { org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
           approver_name, approver_email, approver_mobile, delivery_method = "both", on_behalf_of = "Hindle Consultants" } = req.body;
   if (!org_id || !requester_name || !reason || !scope || !requested_duration_minutes) {
     return res.status(400).json({ ok: false, error: "org_id, requester_name, reason, scope, requested_duration_minutes are required" });
