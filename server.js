@@ -3973,6 +3973,15 @@ app.get("/api/access-requests", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+app.delete("/api/access-requests/:id", async (req, res) => {
+  try {
+    const [row] = await sql`DELETE FROM access_requests WHERE id = ${req.params.id} RETURNING id`;
+    if (!row) return res.status(404).json({ ok: false, error: "Not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // Manual revoke (superadmin kill switch)
 app.post("/api/access-requests/:id/revoke", async (req, res) => {
