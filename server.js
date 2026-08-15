@@ -516,6 +516,190 @@ app.use(express.json({ limit: "10mb" }));
 const helpdeskProxy = require('./helpdesk-proxy-routes');
 app.use('/api/helpdesk', helpdeskProxy(sql));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+// ─── Screen Share (view-only, WebRTC via REST-polling signaling) ───────────
+// Add all of this to server.js, anywhere near your other route definitions
+// (after app.use(express.json(...)) at minimum).
+
+// Create a new session — called by the agent's dashboard.
+app.post("/api/screen-share/create", async (req, res) => {
+  try {
+    const { org_id, ticket_id, ticket_number } = req.body;
+    if (!org_id) return res.status(400).json({ error: "org_id required" });
+    const [row] = await sql`
+      INSERT INTO screen_share_sessions (org_id, ticket_id, ticket_number)
+      VALUES (${org_id}::uuid, ${ticket_id || null}, ${ticket_number || null})
+      RETURNING id
+    `;
+    const customerUrl = `https://hindleapi-production.up.railway.app/screen-share/${row.id}`;
+    res.json({ ok: true, session_id: row.id, customer_url: customerUrl });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Poll session state — used by both agent viewer and customer page.
+app.get("/api/screen-share/:id", async (req, res) => {
+  try {
+    const [row] = await sql`SELECT * FROM screen_share_sessions WHERE id = ${req.params.id} LIMIT 1`;
+    if (!row) return res.status(404).json({ error: "Session not found" });
+    res.json({ ok: true, session: row });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Customer posts their offer once they've started sharing.
+app.put("/api/screen-share/:id/offer", async (req, res) => {
+  try {
+    const { sdp } = req.body;
+    await sql`UPDATE screen_share_sessions SET offer_sdp = ${sdp}, updated_at = NOW() WHERE id = ${req.params.id}`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Agent posts their answer once they've seen the offer.
+app.put("/api/screen-share/:id/answer", async (req, res) => {
+  try {
+    const { sdp } = req.body;
+    await sql`UPDATE screen_share_sessions SET answer_sdp = ${sdp}, status = 'connected', updated_at = NOW() WHERE id = ${req.params.id}`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Either side posts an ICE candidate as it's discovered.
+app.post("/api/screen-share/:id/ice", async (req, res) => {
+  try {
+    const { role, candidate } = req.body; // role: 'customer' | 'agent'
+    if (role !== "customer" && role !== "agent") return res.status(400).json({ error: "role must be customer or agent" });
+    if (role === "customer") {
+      await sql`UPDATE screen_share_sessions SET customer_ice = customer_ice || ${JSON.stringify([candidate])}::jsonb, updated_at = NOW() WHERE id = ${req.params.id}`;
+    } else {
+      await sql`UPDATE screen_share_sessions SET agent_ice = agent_ice || ${JSON.stringify([candidate])}::jsonb, updated_at = NOW() WHERE id = ${req.params.id}`;
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// End a session (either side can call this)
+app.post("/api/screen-share/:id/end", async (req, res) => {
+  try {
+    await sql`UPDATE screen_share_sessions SET status = 'ended', updated_at = NOW() WHERE id = ${req.params.id}`;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Standalone customer page — no login, no app shell ──────────────────────
+app.get("/screen-share/:id", async (req, res) => {
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screen Share</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0F172A;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+  .card{background:#1E293B;border-radius:16px;max-width:420px;width:100%;padding:32px;text-align:center;}
+  h1{font-size:19px;font-weight:700;margin-bottom:8px;}
+  p{font-size:13.5px;color:#94A3B8;line-height:1.5;margin-bottom:24px;}
+  button{background:#2563EB;color:#fff;border:none;padding:14px 28px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;width:100%;}
+  button:disabled{opacity:.5;cursor:default;}
+  .status{margin-top:16px;font-size:13px;color:#94A3B8;}
+  .status.live{color:#4ADE80;font-weight:700;}
+  .status.err{color:#F87171;}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Share Your Screen</h1>
+  <p>An agent from your support team has asked to view your screen to help troubleshoot your issue. Nothing is recorded — this only lasts while this page is open, and the agent cannot control your computer.</p>
+  <button id="startBtn">Start Sharing</button>
+  <p class="status" id="status"></p>
+</div>
+<script>
+const sessionId = ${JSON.stringify(req.params.id)};
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('startBtn');
+let pc;
+
+async function start() {
+  startBtn.disabled = true;
+  statusEl.textContent = 'Requesting screen access…';
+  statusEl.className = 'status';
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        fetch('/api/screen-share/' + sessionId + '/ice', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'customer', candidate: e.candidate }),
+        });
+      }
+    };
+
+    stream.getVideoTracks()[0].onended = () => {
+      statusEl.textContent = 'Sharing stopped.';
+      statusEl.className = 'status';
+      fetch('/api/screen-share/' + sessionId + '/end', { method: 'POST' });
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await fetch('/api/screen-share/' + sessionId + '/offer', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: offer.sdp }),
+    });
+
+    statusEl.textContent = 'Waiting for agent to connect…';
+
+    // Poll for the agent's answer
+    let polls = 0;
+    const pollInterval = setInterval(async () => {
+      polls++;
+      if (polls > 60) { clearInterval(pollInterval); statusEl.textContent = 'Timed out waiting for agent.'; statusEl.className = 'status err'; return; }
+      const r = await fetch('/api/screen-share/' + sessionId);
+      const d = await r.json();
+      if (d.session?.answer_sdp && !pc.currentRemoteDescription) {
+        await pc.setRemoteDescription({ type: 'answer', sdp: d.session.answer_sdp });
+        statusEl.textContent = 'Connected — agent can now see your screen.';
+        statusEl.className = 'status live';
+        clearInterval(pollInterval);
+        // Continue polling for late-arriving agent ICE candidates
+        const icePoll = setInterval(async () => {
+          const r2 = await fetch('/api/screen-share/' + sessionId);
+          const d2 = await r2.json();
+          const candidates = d2.session?.agent_ice || [];
+          for (const c of candidates) {
+            try { await pc.addIceCandidate(c); } catch (e) {}
+          }
+        }, 3000);
+      }
+    }, 1500);
+
+  } catch (err) {
+    statusEl.textContent = 'Could not start screen share: ' + err.message;
+    statusEl.className = 'status err';
+    startBtn.disabled = false;
+  }
+}
+
+startBtn.addEventListener('click', start);
+</script>
+</body>
+</html>`);
+});
 
 // ── Import from Kuhlekt KB API ────────────────────────────────────────────────
 app.post("/api/kb/import-from-kb-api", async (req, res) => {
