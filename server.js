@@ -3975,6 +3975,7 @@ app.get("/api/access-requests", async (req, res) => {
 });
 app.delete("/api/access-requests/:id", async (req, res) => {
   try {
+    await sql`DELETE FROM access_audit_log WHERE access_request_id = ${req.params.id}`;
     const [row] = await sql`DELETE FROM access_requests WHERE id = ${req.params.id} RETURNING id`;
     if (!row) return res.status(404).json({ ok: false, error: "Not found" });
     res.json({ ok: true });
