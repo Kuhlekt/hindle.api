@@ -2857,6 +2857,39 @@ app.post("/api/sms-test", async (req, res) => {
 // Returns { ok, org_id, conversation_id, agent: { name, email, mobile } }
 // Marks token clicked on first use; returns 410 if expired (>5 min)
 // ─────────────────────────────────────────────
+
+app.post("/api/widget-ping", async (req, res) => {
+  try {
+    const { tenant } = req.body;
+    if (!tenant) return res.status(400).json({ ok: false });
+    const orgId = await resolveOrgId(tenant).catch(() => tenant);
+    if (!orgId) return res.json({ ok: true });
+    await sql`
+      UPDATE tenant_configs
+      SET config = jsonb_set(COALESCE(config, '{}'::jsonb), '{widget_last_seen}', to_jsonb(now()::text))
+      WHERE tenant_id = ${orgId}
+    `.catch(async () => {
+      await sql`
+        INSERT INTO tenant_configs (tenant_id, config) VALUES (${orgId}, ${JSON.stringify({ widget_last_seen: new Date().toISOString() })})
+        ON CONFLICT (tenant_id) DO UPDATE SET config = jsonb_set(COALESCE(tenant_configs.config,'{}'::jsonb), '{widget_last_seen}', to_jsonb(now()::text))
+      `.catch(() => {});
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: true });
+  }
+});
+
+app.get("/api/widget-ping/:orgId", async (req, res) => {
+  try {
+    const [row] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${req.params.orgId} LIMIT 1`;
+    const lastSeen = row?.config?.widget_last_seen || null;
+    const detected = !!lastSeen && (Date.now() - new Date(lastSeen).getTime()) < 30 * 24 * 3600 * 1000;
+    res.json({ ok: true, detected, last_seen: lastSeen });
+  } catch (e) {
+    res.json({ ok: true, detected: false, last_seen: null });
+  }
+});
 app.get("/api/handoff-token/:token", async (req, res) => {
   const { token } = req.params;
   try {
