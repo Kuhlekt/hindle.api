@@ -118,22 +118,38 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── Categories (for the category dropdown) ───────────────────────────────
+  // NATIVE — Stage 2: queries the merged DB directly instead of proxying to
+  // the external helpdesk app. Same URL/contract, no frontend changes needed.
   router.get('/categories', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/categories`);
-    res.status(status).json(data);
+    try {
+      const rows = await sql`
+        SELECT id, name, description, organization_id, created_at
+        FROM categories WHERE organization_id = ${helpdeskOrgId}::uuid
+        ORDER BY name ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[categories GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
   });
 
   router.post('/categories', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/categories`, {
-      method: 'POST',
-      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(data);
+    const name = req.body?.name;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    try {
+      const r = await sql`
+        INSERT INTO categories (name, description, organization_id, created_at)
+        VALUES (${name}, ${req.body?.description || null}, ${helpdeskOrgId}::uuid, NOW())
+        RETURNING *`;
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[categories POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   // ── Resolution types (for the resolution-type dropdown) ─────────────────
