@@ -6,6 +6,7 @@
 // API, scoped per-tenant exactly like the original routes.
 
 const HELPDESK_API_BASE = process.env.HELPDESK_API_BASE || 'https://helpdesk.hindleconsultants.com';
+const SELF_BASE_URL = process.env.SELF_BASE_URL || 'https://hindleapi-production.up.railway.app';
 
 module.exports = function helpdeskProxyRouter(sql) {
   const express = require('express');
@@ -304,24 +305,103 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── Messages (reply / internal note / cause / resolution) ───────────────
-  // is_internal:true = internal note. is_cause:true = saved as ticket.cause.
-  // Resolution is saved via PUT /tickets/:id { resolution, status:'resolved' }.
+  // NATIVE — Stage 2: full logic ported from the perfected Kuhlekt
+  // messages/route.ts (UUID validation, audit logging, reopen-on-reply).
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
   router.get('/tickets/:id/messages', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [], messages: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/messages`);
-    res.status(status).json(data);
+    try {
+      const msgs = await sql`
+        SELECT m.id, m.ticket_id, m.user_id, m.message, m.message AS body,
+               m.is_internal, m.is_read, m.created_at, m.updated_at,
+               u.full_name AS author_name, u.role AS author_role
+        FROM ticket_messages m
+        LEFT JOIN user_profiles u ON u.id = m.user_id
+        WHERE m.ticket_id::text = ${req.params.id}
+        ORDER BY m.created_at ASC`;
+      res.json({ success: true, data: [...msgs], messages: [...msgs] });
+    } catch (e) {
+      console.error('[messages GET native]', e.message);
+      res.json({ success: true, data: [], messages: [] });
+    }
   });
 
   router.post('/tickets/:id/messages', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/messages`, {
-      method: 'POST',
-      headers: req.headers['x-user-id'] || req.body?.agent_id ? { 'X-User-Id': req.headers['x-user-id'] || req.body.agent_id } : {},
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(data);
+    const tid = req.params.id;
+    const b = req.body || {};
+    const userId = req.headers['x-user-id'] || req.body?.agent_id || null;
+    const userIdForDb = userId && UUID_RE.test(userId) ? userId : null;
+    const message = b.body || b.message || '';
+    const isInternal = b.is_internal || false;
+    if (!message.trim()) return res.status(400).json({ error: 'Message cannot be empty' });
+
+    try {
+      const ticket = await sql`SELECT id FROM tickets WHERE id::text = ${tid} OR ticket_number = ${tid} LIMIT 1`;
+      if (!ticket.length) return res.status(404).json({ error: 'Ticket not found' });
+      const ticketUUID = ticket[0].id;
+
+      const r = await sql`
+        INSERT INTO ticket_messages(ticket_id, user_id, message, is_internal, is_read, created_at, updated_at)
+        VALUES(${ticketUUID}, ${userIdForDb}::uuid, ${message}, ${isInternal}, false, NOW(), NOW())
+        RETURNING *`;
+      const msg = r[0];
+
+      const auditAction = b.is_cause ? 'cause_added' : isInternal ? 'internal_note' : 'reply';
+      await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action) VALUES (${ticketUUID}::uuid, ${userId ? 'Agent' : 'Customer'}, ${userId}, ${auditAction})`.catch(() => {});
+
+      if (b.is_cause && message) {
+        await sql`UPDATE tickets SET cause=${message}, updated_at=NOW() WHERE id::text=${tid}`.catch(() => {});
+      } else {
+        await sql`UPDATE tickets SET updated_at=NOW() WHERE id::text=${tid}`.catch(() => {});
+      }
+
+      // Reopen-on-reply
+      if (!isInternal && !b.is_cause) {
+        const ticketNow = await sql`SELECT status FROM tickets WHERE id::text = ${tid} LIMIT 1`;
+        const curStatus = ticketNow[0]?.status;
+        if (curStatus === 'resolved' || curStatus === 'closed') {
+          await sql`UPDATE tickets SET status = 'open', updated_at = NOW() WHERE id::text = ${tid}`.catch(() => {});
+          await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action, field_name, old_value, new_value) VALUES (${ticketUUID}::uuid, ${userId ? 'Agent' : 'Customer'}, ${userId}, 'field_changed', 'status', ${curStatus}, 'open')`.catch(() => {});
+        }
+      }
+
+      // Agent-reply email notification. Calls the existing, already-proven
+      // /api/helpdesk/webhook/ticket-event endpoint (self-call, since we're
+      // now running inside hindle_api itself rather than a separate app) —
+      // reuses the exact same tested email logic rather than duplicating it.
+      if (!isInternal && userId) {
+        const ticketRow = await sql`
+          SELECT t.ticket_number, t.subject, t.organization_id, u.full_name AS requester_name, u.email AS requester_email
+          FROM tickets t LEFT JOIN user_profiles u ON u.id = t.customer_id
+          WHERE t.id::text = ${tid} LIMIT 1`;
+        const row = ticketRow[0];
+        if (row?.organization_id && row?.requester_email && process.env.HELPDESK_WEBHOOK_SECRET) {
+          fetch(`${SELF_BASE_URL}/api/helpdesk/webhook/ticket-event`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': process.env.HELPDESK_WEBHOOK_SECRET },
+            body: JSON.stringify({
+              event: 'agent_reply',
+              helpdesk_org_id: String(row.organization_id),
+              ticket_id: tid,
+              ticket_number: row.ticket_number,
+              subject: row.subject,
+              requester_name: row.requester_name,
+              requester_email: row.requester_email,
+              reply_body: message,
+            }),
+          }).catch(e => console.error('[agent_reply notify self-call]', e.message));
+        }
+      }
+
+      res.json({ success: true, data: { ...msg, body: msg.message } });
+    } catch (e) {
+      console.error('[messages POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   // ── Categories (for the category dropdown) ───────────────────────────────
@@ -360,26 +440,56 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── Resolution types (for the resolution-type dropdown) ─────────────────
+  // NATIVE — Stage 2
   router.get('/resolution-types', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/resolution-types`);
-    res.status(status).json(data);
+    try {
+      const rows = await sql`
+        SELECT id, name, sort_order FROM resolution_types
+        WHERE organization_id = ${helpdeskOrgId}::uuid
+        ORDER BY sort_order ASC, name ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[resolution-types GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
   });
 
   router.post('/resolution-types', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/resolution-types`, { method: 'POST', body: JSON.stringify(req.body) });
-    res.status(status).json(data);
+    const name = req.body?.name;
+    if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+    try {
+      const maxRow = await sql`SELECT COALESCE(MAX(sort_order),0) as m FROM resolution_types WHERE organization_id = ${helpdeskOrgId}::uuid`;
+      const r = await sql`
+        INSERT INTO resolution_types (organization_id, name, sort_order)
+        VALUES (${helpdeskOrgId}::uuid, ${name.trim()}, ${(maxRow[0]?.m || 0) + 1})
+        RETURNING id, name, sort_order`;
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[resolution-types POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   // ── Canned responses ──────────────────────────────────────────────────
+  // NATIVE — Stage 2 (read-only for now; admin CRUD for canned responses is
+  // Tier 2 work, not yet needed by the dashboard UI which only reads them)
   router.get('/canned-responses', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/canned-responses`);
-    res.status(status).json(data);
+    try {
+      const rows = await sql`
+        SELECT id, title, content, category, shortcut, use_count
+        FROM canned_responses WHERE organization_id = ${helpdeskOrgId}::uuid
+        ORDER BY title ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[canned-responses GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
   });
 
   // ── Agents (for the assign-to dropdown) ──────────────────────────────
@@ -407,23 +517,39 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── CSAT result for a specific ticket (if any) ────────────────────────
-  // Note: exact query shape of /api/admin/csat unconfirmed — this passes
-  // ticket_id as a query param, the most common convention. If it returns
-  // the wrong shape, the badge simply won't show (fails silently on the
-  // frontend) rather than breaking anything.
+  // ── CSAT result for a specific ticket (if any) ────────────────────────
+  // NATIVE — Stage 2: uses the confirmed csat_reviews schema (ticket_id,
+  // organization_id, score, comment, created_at) from the Stage 1 migration.
   router.get('/tickets/:id/csat', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: null });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/csat?ticket_id=${encodeURIComponent(req.params.id)}`);
-    res.status(status).json(data);
+    try {
+      const rows = await sql`
+        SELECT score, comment, created_at FROM csat_reviews
+        WHERE ticket_id::text = ${req.params.id}
+        ORDER BY created_at DESC LIMIT 1`;
+      res.json({ success: true, data: rows[0] || null });
+    } catch (e) {
+      console.error('[csat GET native]', e.message);
+      res.json({ success: true, data: null });
+    }
   });
 
   // ── Ticket audit log ────────────────────────────────────────────────
+  // NATIVE — Stage 2
   router.get('/tickets/:id/audit-log', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/audit-log`);
-    res.status(status).json(data);
+    try {
+      const rows = await sql`
+        SELECT * FROM ticket_audit_log
+        WHERE ticket_id::text = ${req.params.id}
+        ORDER BY created_at ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[audit-log GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
   });
 
   // ── Side conversations ────────────────────────────────────────────────
