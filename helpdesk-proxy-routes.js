@@ -495,8 +495,7 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── Canned responses ──────────────────────────────────────────────────
-  // NATIVE — Stage 2 (read-only for now; admin CRUD for canned responses is
-  // Tier 2 work, not yet needed by the dashboard UI which only reads them)
+  // NATIVE — Stage 2, full admin CRUD (Tier 2)
   router.get('/canned-responses', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
@@ -509,6 +508,289 @@ module.exports = function helpdeskProxyRouter(sql) {
     } catch (e) {
       console.error('[canned-responses GET native]', e.message);
       res.json({ success: true, data: [] });
+    }
+  });
+
+  router.post('/canned-responses', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { title, content, category, shortcut } = req.body || {};
+    if (!title?.trim() || !content?.trim()) return res.status(400).json({ error: 'Title and content required' });
+    try {
+      const r = await sql`
+        INSERT INTO canned_responses (organization_id, title, content, category, shortcut, use_count, created_at, updated_at)
+        VALUES (${helpdeskOrgId}::uuid, ${title.trim()}, ${content.trim()}, ${category || 'General'}, ${shortcut || ''}, 0, now(), now())
+        RETURNING *`;
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[canned-responses POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  router.delete('/canned-responses/:id', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    try {
+      const r = await sql`DELETE FROM canned_responses WHERE id::text = ${req.params.id} AND organization_id = ${helpdeskOrgId}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) {
+      console.error('[canned-responses DELETE native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  // ── CSAT settings (per-tenant survey configuration) ────────────────────
+  // NATIVE — Tier 2
+  router.get('/csat-settings', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: null });
+    try {
+      const rows = await sql`SELECT enabled, delay_hours FROM csat_settings WHERE organization_id = ${helpdeskOrgId}::uuid LIMIT 1`;
+      res.json({ success: true, data: rows[0] || { enabled: false, delay_hours: 2 } });
+    } catch (e) {
+      console.error('[csat-settings GET native]', e.message);
+      res.json({ success: true, data: null });
+    }
+  });
+
+  router.post('/csat-settings', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { enabled, delay_hours } = req.body || {};
+    try {
+      const existing = await sql`SELECT id FROM csat_settings WHERE organization_id = ${helpdeskOrgId}::uuid LIMIT 1`;
+      let r;
+      if (existing.length) {
+        r = await sql`UPDATE csat_settings SET enabled = ${!!enabled}, delay_hours = ${delay_hours ?? 2}, updated_at = now() WHERE organization_id = ${helpdeskOrgId}::uuid RETURNING *`;
+      } else {
+        r = await sql`INSERT INTO csat_settings (organization_id, enabled, delay_hours, created_at, updated_at) VALUES (${helpdeskOrgId}::uuid, ${!!enabled}, ${delay_hours ?? 2}, now(), now()) RETURNING *`;
+      }
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[csat-settings POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  // ── SLA policies ────────────────────────────────────────────────────────
+  // NATIVE — Tier 2
+  router.get('/sla-policies', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    try {
+      const rows = await sql`
+        SELECT id, name, priority, first_response_hours, resolution_hours, is_active
+        FROM sla_policies WHERE organization_id = ${helpdeskOrgId}::uuid
+        ORDER BY priority ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[sla-policies GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
+  });
+
+  router.post('/sla-policies', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { name, priority, first_response_hours, resolution_hours } = req.body || {};
+    if (!name?.trim() || !priority) return res.status(400).json({ error: 'Name and priority required' });
+    try {
+      const r = await sql`
+        INSERT INTO sla_policies (organization_id, name, priority, first_response_hours, resolution_hours, is_active, created_at, updated_at)
+        VALUES (${helpdeskOrgId}::uuid, ${name.trim()}, ${priority}, ${first_response_hours ?? 4}, ${resolution_hours ?? 24}, true, now(), now())
+        RETURNING *`;
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[sla-policies POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  router.delete('/sla-policies/:id', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    try {
+      const r = await sql`DELETE FROM sla_policies WHERE id::text = ${req.params.id} AND organization_id = ${helpdeskOrgId}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) {
+      console.error('[sla-policies DELETE native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  // ── Departments ─────────────────────────────────────────────────────────
+  // NATIVE — Tier 2
+  router.get('/departments', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    try {
+      const rows = await sql`SELECT id, name, description FROM departments WHERE organization_id = ${helpdeskOrgId}::uuid ORDER BY name ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[departments GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
+  });
+
+  router.post('/departments', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { name, description } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+    try {
+      const r = await sql`
+        INSERT INTO departments (name, description, organization_id, created_at)
+        VALUES (${name.trim()}, ${description || null}, ${helpdeskOrgId}::uuid, NOW())
+        RETURNING *`;
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[departments POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  router.delete('/departments/:id', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    try {
+      const r = await sql`DELETE FROM departments WHERE id::text = ${req.params.id} AND organization_id = ${helpdeskOrgId}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) {
+      console.error('[departments DELETE native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  // ── Tags ────────────────────────────────────────────────────────────────
+  // NATIVE — Tier 2. Includes ticket-tag assignment via ticket_tags junction.
+  router.get('/tags', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    try {
+      const rows = await sql`SELECT id, name, color FROM tags WHERE organization_id = ${helpdeskOrgId}::uuid ORDER BY name ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[tags GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
+  });
+
+  router.post('/tags', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { name, color } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+    try {
+      const r = await sql`
+        INSERT INTO tags (organization_id, name, color, created_at)
+        VALUES (${helpdeskOrgId}::uuid, ${name.trim()}, ${color || '#2563eb'}, now())
+        RETURNING *`;
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[tags POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  router.delete('/tags/:id', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    try {
+      const r = await sql`DELETE FROM tags WHERE id::text = ${req.params.id} AND organization_id = ${helpdeskOrgId}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) {
+      console.error('[tags DELETE native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  router.get('/tickets/:id/tags', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    try {
+      const rows = await sql`
+        SELECT t.id, t.name, t.color FROM tags t
+        JOIN ticket_tags tt ON tt.tag_id = t.id
+        WHERE tt.ticket_id::text = ${req.params.id}`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[ticket tags GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
+  });
+
+  router.post('/tickets/:id/tags', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const tagId = req.body?.tag_id;
+    if (!tagId) return res.status(400).json({ error: 'tag_id required' });
+    try {
+      await sql`INSERT INTO ticket_tags (ticket_id, tag_id) VALUES (${req.params.id}::uuid, ${tagId}::uuid) ON CONFLICT DO NOTHING`;
+      res.json({ success: true });
+    } catch (e) {
+      console.error('[ticket tags POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  router.delete('/tickets/:id/tags/:tagId', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    try {
+      await sql`DELETE FROM ticket_tags WHERE ticket_id::text = ${req.params.id} AND tag_id::text = ${req.params.tagId}`;
+      res.json({ success: true });
+    } catch (e) {
+      console.error('[ticket tags DELETE native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  // ── Escalation rules ────────────────────────────────────────────────────
+  // NATIVE — Tier 2
+  router.get('/escalation-rules', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.json({ success: true, data: [] });
+    try {
+      const rows = await sql`SELECT id, condition, action, threshold, is_active FROM escalation_rules WHERE organization_id = ${helpdeskOrgId}::uuid ORDER BY created_at DESC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[escalation-rules GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
+  });
+
+  router.post('/escalation-rules', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    const { condition, action, threshold } = req.body || {};
+    if (!condition?.trim() || !action?.trim()) return res.status(400).json({ error: 'Condition and action required' });
+    try {
+      const r = await sql`
+        INSERT INTO escalation_rules (organization_id, condition, action, threshold, is_active, created_at, updated_at)
+        VALUES (${helpdeskOrgId}::uuid, ${condition.trim()}, ${action.trim()}, ${threshold ?? null}, true, NOW(), NOW())
+        RETURNING *`;
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[escalation-rules POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
+  });
+
+  router.delete('/escalation-rules/:id', async (req, res) => {
+    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+    if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+    try {
+      const r = await sql`DELETE FROM escalation_rules WHERE id::text = ${req.params.id} AND organization_id = ${helpdeskOrgId}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) {
+      console.error('[escalation-rules DELETE native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
     }
   });
 
