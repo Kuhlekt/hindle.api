@@ -220,40 +220,83 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── Side conversations ────────────────────────────────────────────────
+  // NATIVE — Stage 2: side_conversations is self-contained (its own table,
+  // no cross-references to the old helpdesk app's other tables), making
+  // this a clean, low-risk one to convert.
   router.get('/tickets/:id/side-conversations', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/side-conversations`);
-    res.status(status).json(data);
+    try {
+      const rows = await sql`
+        SELECT sc.*, COUNT(m.id)::int as message_count
+        FROM side_conversations sc
+        LEFT JOIN side_conversation_messages m ON m.side_conversation_id = sc.id
+        WHERE sc.ticket_id::text = ${req.params.id}
+        GROUP BY sc.id
+        ORDER BY sc.updated_at DESC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[side-conversations GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
   });
 
   router.post('/tickets/:id/side-conversations', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/side-conversations`, {
-      method: 'POST',
-      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(data);
+    const userId = req.headers['x-user-id'] || null;
+    const subject = req.body?.subject;
+    if (!subject?.trim()) return res.status(400).json({ error: 'Subject required' });
+    try {
+      const r = await sql`
+        INSERT INTO side_conversations (ticket_id, subject, created_by_name, created_by_id)
+        VALUES (${req.params.id}::uuid, ${subject.trim()}, ${req.body?.created_by_name || 'Agent'}, ${userId})
+        RETURNING *`;
+      const sc = r[0];
+      if (req.body?.first_message?.trim()) {
+        await sql`
+          INSERT INTO side_conversation_messages (side_conversation_id, sender_name, sender_id, message)
+          VALUES (${sc.id}, ${req.body?.created_by_name || 'Agent'}, ${userId}, ${req.body.first_message.trim()})`;
+      }
+      res.json({ success: true, data: sc });
+    } catch (e) {
+      console.error('[side-conversations POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   router.get('/side-conversations/:id/messages', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/side-conversations/${encodeURIComponent(req.params.id)}/messages`);
-    res.status(status).json(data);
+    try {
+      const rows = await sql`
+        SELECT * FROM side_conversation_messages
+        WHERE side_conversation_id::text = ${req.params.id}
+        ORDER BY created_at ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[side-conversation messages GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
   });
 
   router.post('/side-conversations/:id/messages', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/side-conversations/${encodeURIComponent(req.params.id)}/messages`, {
-      method: 'POST',
-      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(data);
+    const userId = req.headers['x-user-id'] || null;
+    const message = req.body?.message;
+    if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
+    try {
+      const r = await sql`
+        INSERT INTO side_conversation_messages (side_conversation_id, sender_name, sender_id, message)
+        VALUES (${req.params.id}::uuid, ${req.body?.sender_name || 'Agent'}, ${userId}, ${message.trim()})
+        RETURNING *`;
+      await sql`UPDATE side_conversations SET updated_at = NOW() WHERE id::text = ${req.params.id}`.catch(() => {});
+      res.json({ success: true, data: r[0] });
+    } catch (e) {
+      console.error('[side-conversation messages POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   // ── KPI / reporting snapshot ───────────────────────────────────────────
