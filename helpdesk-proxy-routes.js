@@ -176,21 +176,27 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── Agents (for the assign-to dropdown) ──────────────────────────────
+  // ── Agents (for the assign-to dropdown) ──────────────────────────────
+  // NATIVE — Stage 2: queries user_profiles directly, filtered to this
+  // tenant's actual support staff (agent/admin, active). Replaces the old
+  // approach of fetching every user across every org and filtering after
+  // the fact.
   router.get('/agents', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [] });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/users`);
-    // /api/admin/users is a platform-wide list (all orgs, all roles — including
-    // customers). Filter down here to just this tenant's actual support staff
-    // (agent/admin, active) so the "Assigned to" dropdown only shows people
-    // who can genuinely be assigned a ticket.
-    const raw = data?.data || data?.users || [];
-    const filtered = raw.filter(u =>
-      String(u.organization_id) === String(helpdeskOrgId) &&
-      ['agent', 'admin'].includes(u.role) &&
-      u.is_active !== false
-    );
-    res.status(status).json({ success: true, data: filtered });
+    try {
+      const rows = await sql`
+        SELECT id, email, full_name, role, is_active, organization_id
+        FROM user_profiles
+        WHERE organization_id = ${helpdeskOrgId}::uuid
+          AND role IN ('agent', 'admin')
+          AND is_active IS NOT FALSE
+        ORDER BY full_name ASC`;
+      res.json({ success: true, data: [...rows] });
+    } catch (e) {
+      console.error('[agents GET native]', e.message);
+      res.json({ success: true, data: [] });
+    }
   });
 
   // ── CSAT result for a specific ticket (if any) ────────────────────────
