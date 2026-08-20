@@ -39,61 +39,268 @@ module.exports = function helpdeskProxyRouter(sql) {
   });
 
   // ── Tickets ────────────────────────────────────────────────────────────
+  // ── Tickets ──────────────────────────────────────────────────────────
+  // NATIVE — Stage 2: the big one. Same query logic as the original
+  // Kuhlekt/app/api/tickets route.ts (non-super-admin branch, since this
+  // proxy is always scoped to one resolved tenant), just run directly here.
   router.get('/tickets', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.json({ success: true, data: [], total: 0, enabled: false });
-    const qs = new URLSearchParams(req.query).toString();
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets${qs ? '?' + qs : ''}`);
-    res.status(status).json({ ...data, enabled: true });
+    try {
+      const limit = Math.min(100, parseInt(req.query.limit) || 25);
+      const offset = parseInt(req.query.offset) || 0;
+      const statusF = req.query.status || '';
+      const priorityF = req.query.priority || '';
+      const q = (req.query.q || '').trim();
+
+      let tickets, total;
+      if (q) {
+        const like = `%${q}%`;
+        tickets = await sql`
+          SELECT t.id,t.ticket_number,t.subject,t.status,t.priority,t.created_at,t.updated_at,t.assigned_to,t.customer_id,t.organization_id,
+                 rq.full_name AS requester_name,rq.email AS requester_email,ag.full_name AS assignee_name
+          FROM tickets t
+          LEFT JOIN user_profiles rq ON rq.id=t.customer_id
+          LEFT JOIN user_profiles ag ON ag.id=t.assigned_to
+          WHERE t.organization_id=${helpdeskOrgId}::uuid AND (t.subject ILIKE ${like} OR t.ticket_number ILIKE ${like})
+          ORDER BY t.updated_at DESC LIMIT ${limit} OFFSET ${offset}`;
+        const cnt = await sql`SELECT COUNT(*)::int AS c FROM tickets t WHERE t.organization_id=${helpdeskOrgId}::uuid AND (t.subject ILIKE ${like} OR t.ticket_number ILIKE ${like})`;
+        total = cnt[0]?.c || 0;
+      } else {
+        tickets = await sql`
+          SELECT t.id,t.ticket_number,t.subject,t.status,t.priority,t.created_at,t.updated_at,t.assigned_to,t.customer_id,t.organization_id,
+                 rq.full_name AS requester_name,rq.email AS requester_email,ag.full_name AS assignee_name
+          FROM tickets t
+          LEFT JOIN user_profiles rq ON rq.id=t.customer_id
+          LEFT JOIN user_profiles ag ON ag.id=t.assigned_to
+          WHERE t.organization_id=${helpdeskOrgId}::uuid
+          ORDER BY t.updated_at DESC LIMIT ${limit} OFFSET ${offset}`;
+        const cnt = await sql`SELECT COUNT(*)::int AS c FROM tickets t WHERE t.organization_id=${helpdeskOrgId}::uuid`;
+        total = cnt[0]?.c || 0;
+      }
+      let result = [...tickets];
+      if (statusF) result = result.filter(t => t.status === statusF);
+      if (priorityF) result = result.filter(t => t.priority === priorityF);
+      res.json({ success: true, data: result, total, enabled: true });
+    } catch (e) {
+      console.error('[tickets GET native]', e.message);
+      res.json({ success: true, data: [], total: 0, enabled: true });
+    }
   });
 
   router.post('/tickets', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, '/api/tickets', { method: 'POST', body: JSON.stringify(req.body) });
-    res.status(status).json(data);
+    const b = req.body || {};
+    if (!b.subject || !b.requester_email) return res.status(400).json({ error: 'Subject and requester email required' });
+    try {
+      const catId = b.category_id?.trim() || null;
+
+      // Find-or-create the requester's user_profiles row (see Stage 1 fix —
+      // without this, agent-reply notification emails silently fail for
+      // any ticket whose requester wasn't already a known customer).
+      let custId = null;
+      const ex = await sql`SELECT id FROM user_profiles WHERE LOWER(email)=LOWER(${b.requester_email}) LIMIT 1`;
+      if (ex.length) {
+        custId = ex[0].id;
+      } else {
+        const SSO_PLACEHOLDER_HASH = '$2a$10$SSOACCOUNTNOPASSWORDSETXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
+        const created = await sql`
+          INSERT INTO user_profiles (id, email, full_name, role, organization_id, password_hash, is_active, created_at, updated_at)
+          VALUES (gen_random_uuid(), ${b.requester_email}, ${b.requester_name || b.requester_email}, 'customer', ${helpdeskOrgId}::uuid, ${SSO_PLACEHOLDER_HASH}, true, NOW(), NOW())
+          RETURNING id`;
+        custId = created[0]?.id || null;
+      }
+
+      // Ticket numbers unique per-org — scoped count + retry-on-collision.
+      let t = [], lastErr = null;
+      for (let attempt = 0; attempt < 5 && !t.length; attempt++) {
+        const orgCnt = await sql`SELECT COUNT(*)::int AS c FROM tickets WHERE organization_id = ${helpdeskOrgId}::uuid`;
+        const num = String(10000 + (orgCnt[0]?.c || 0) + 1 + attempt);
+        try {
+          t = await sql`
+            INSERT INTO tickets(ticket_number,subject,description,status,priority,customer_id,organization_id,category_id,created_at,updated_at)
+            VALUES(${num},${b.subject},${b.description||''},${b.status||'open'},${b.priority||'medium'},${custId}::uuid,${helpdeskOrgId}::uuid,${catId}::uuid,NOW(),NOW())
+            RETURNING *`;
+        } catch (e) {
+          lastErr = e;
+          if (!String(e.message || '').includes('duplicate key')) throw e;
+        }
+      }
+      if (!t.length) throw lastErr || new Error('Could not generate a unique ticket number after 5 attempts');
+      res.json({ success: true, data: t[0] });
+    } catch (e) {
+      console.error('[tickets POST native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   router.get('/tickets/:id', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(404).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}`);
-    const ticket = data?.data || data?.ticket;
-    if (ticket && String(ticket.organization_id) !== String(helpdeskOrgId)) return res.status(404).json({ error: 'Ticket not found' });
-    res.status(status).json(data);
+    try {
+      const r = await sql`
+        SELECT t.*,
+          u.full_name as requester_name, u.email as requester_email,
+          a.full_name as assignee_name, c.name as category_name,
+          rt.name as resolution_type_name,
+          mt.ticket_number as merged_into_ticket_number
+        FROM tickets t
+        LEFT JOIN user_profiles u ON t.customer_id::text = u.id::text
+        LEFT JOIN user_profiles a ON t.assigned_to::text = a.id::text
+        LEFT JOIN categories c ON t.category_id::text = c.id::text
+        LEFT JOIN resolution_types rt ON t.resolution_type_id::text = rt.id::text
+        LEFT JOIN tickets mt ON t.merged_into_id = mt.id
+        WHERE t.id::text = ${req.params.id}`;
+      if (!r.length) return res.status(404).json({ error: 'Ticket not found' });
+      const ticket = r[0];
+      if (String(ticket.organization_id) !== String(helpdeskOrgId)) return res.status(404).json({ error: 'Ticket not found' });
+      res.json({ success: true, data: ticket });
+    } catch (e) {
+      console.error('[ticket GET native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
-  // Generic ticket update — status, priority, category_id, assigned_to all
-  // flow through here since the underlying helpdesk PUT route accepts all of them.
+  // Generic ticket update — status, priority, category_id, assigned_to,
+  // resolution, resolution_type_id, cause. Includes optimistic-concurrency
+  // collision detection and full audit logging, same as the original route.
   router.put('/tickets/:id', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}`, { method: 'PUT', body: JSON.stringify(req.body) });
-    res.status(status).json(data);
+    const b = req.body || {};
+    const rawId = req.params.id;
+    try {
+      if (b.expected_updated_at) {
+        const current = await sql`SELECT updated_at FROM tickets WHERE id::text = ${rawId} LIMIT 1`;
+        if (!current.length) return res.status(404).json({ error: 'Not found' });
+        if (new Date(current[0].updated_at).getTime() !== new Date(b.expected_updated_at).getTime()) {
+          const latest = await sql`
+            SELECT t.*, a.full_name as assignee_name, c.name as category_name
+            FROM tickets t
+            LEFT JOIN user_profiles a ON t.assigned_to::text = a.id::text
+            LEFT JOIN categories c ON t.category_id::text = c.id::text
+            WHERE t.id::text = ${rawId}`;
+          await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action) VALUES (${rawId}::uuid, ${b.actor_name || 'Agent'}, ${req.headers['x-user-id'] || null}, 'conflict_blocked')`.catch(() => {});
+          return res.status(409).json({ error: 'This ticket was updated by someone else — please review the latest changes before saving.', conflict: true, latest: latest[0] || null });
+        }
+      }
+
+      const before = await sql`SELECT * FROM tickets WHERE id::text = ${rawId} LIMIT 1`;
+      if (!before.length) return res.status(404).json({ error: 'Not found' });
+      const prev = before[0];
+
+      const r = await sql`
+        UPDATE tickets SET
+          status        = COALESCE(${b.status ?? null}, status),
+          priority      = COALESCE(${b.priority ?? null}, priority),
+          assigned_to   = COALESCE(${b.assigned_to ?? null}, assigned_to)::uuid,
+          category_id   = COALESCE(${b.category_id ?? null}, category_id)::uuid,
+          resolution    = COALESCE(${b.resolution ?? null}, resolution),
+          resolution_type_id = COALESCE(${b.resolution_type_id ?? null}, resolution_type_id)::uuid,
+          cause         = COALESCE(${b.cause ?? null}, cause),
+          resolved_at   = CASE WHEN ${b.status ?? null} = 'resolved' AND status != 'resolved' THEN NOW() ELSE resolved_at END,
+          closed_at     = CASE WHEN ${b.status ?? null} = 'closed' AND status != 'closed' THEN NOW() ELSE closed_at END,
+          updated_at    = NOW()
+        WHERE id::text = ${rawId}
+        RETURNING *`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      const after = r[0];
+
+      const actorName = b.actor_name || 'Agent';
+      const actorId = req.headers['x-user-id'] || null;
+      for (const f of ['status','priority','assigned_to','category_id','resolution','resolution_type_id','cause']) {
+        const oldVal = prev[f] != null ? String(prev[f]) : null;
+        const newVal = after[f] != null ? String(after[f]) : null;
+        if (oldVal !== newVal && b[f] !== undefined && b[f] !== null) {
+          await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action, field_name, old_value, new_value) VALUES (${rawId}::uuid, ${actorName}, ${actorId}, 'field_changed', ${f}, ${oldVal}, ${newVal})`.catch(() => {});
+        }
+      }
+      res.json({ success: true, data: after });
+    } catch (e) {
+      console.error('[ticket PUT native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   // ── Merge tickets ─────────────────────────────────────────────────────
   router.post('/tickets/:id/merge', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/merge`, {
-      method: 'POST',
-      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(data);
+    const userId = req.headers['x-user-id'] || null;
+    try {
+      const source = await sql`SELECT * FROM tickets WHERE id::text = ${req.params.id} LIMIT 1`;
+      if (!source.length) return res.status(404).json({ error: 'Source ticket not found' });
+      const sourceTicket = source[0];
+      if (!req.body?.merge_into_ticket_number?.trim()) return res.status(400).json({ error: 'merge_into_ticket_number required' });
+
+      const target = await sql`SELECT * FROM tickets WHERE ticket_number = ${req.body.merge_into_ticket_number.trim()} AND organization_id = ${sourceTicket.organization_id} LIMIT 1`;
+      if (!target.length) return res.status(404).json({ error: `Ticket #${req.body.merge_into_ticket_number} not found in this organisation` });
+      const targetTicket = target[0];
+      if (targetTicket.id === sourceTicket.id) return res.status(400).json({ error: 'Cannot merge a ticket into itself' });
+      if (sourceTicket.merged_into_id) return res.status(409).json({ error: 'This ticket has already been merged' });
+
+      await sql`UPDATE ticket_messages SET ticket_id = ${targetTicket.id} WHERE ticket_id = ${sourceTicket.id}`;
+      await sql`INSERT INTO ticket_messages (ticket_id, user_id, message, is_internal, is_read, created_at, updated_at) VALUES (${targetTicket.id}, ${userId}::uuid, ${'🔗 Merged in ticket #' + sourceTicket.ticket_number + ': "' + sourceTicket.subject + '" — messages from that ticket now appear above.'}, true, true, NOW(), NOW())`;
+      await sql`INSERT INTO ticket_messages (ticket_id, user_id, message, is_internal, is_read, created_at, updated_at) VALUES (${sourceTicket.id}, ${userId}::uuid, ${'🔗 This ticket was merged into #' + targetTicket.ticket_number + '.'}, true, true, NOW(), NOW())`;
+      await sql`UPDATE tickets SET status = 'merged', merged_into_id = ${targetTicket.id}, updated_at = NOW() WHERE id = ${sourceTicket.id}`;
+      await sql`UPDATE tickets SET updated_at = NOW() WHERE id = ${targetTicket.id}`;
+      await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action, field_name, old_value, new_value) VALUES (${sourceTicket.id}, 'Agent', ${userId}, 'field_changed', 'status', ${sourceTicket.status}, 'merged')`.catch(() => {});
+      await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action) VALUES (${targetTicket.id}, 'Agent', ${userId}, 'merge_received')`.catch(() => {});
+
+      res.json({ success: true, merged_into: targetTicket.ticket_number });
+    } catch (e) {
+      console.error('[ticket merge native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   // ── Split ticket ──────────────────────────────────────────────────────
   router.post('/tickets/:id/split', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/tickets/${encodeURIComponent(req.params.id)}/split`, {
-      method: 'POST',
-      headers: req.headers['x-user-id'] ? { 'X-User-Id': req.headers['x-user-id'] } : {},
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(data);
+    const userId = req.headers['x-user-id'] || null;
+    const b = req.body || {};
+    try {
+      if (!Array.isArray(b.message_ids) || b.message_ids.length === 0) return res.status(400).json({ error: 'message_ids (non-empty array) required' });
+      if (!b.new_subject?.trim()) return res.status(400).json({ error: 'new_subject required' });
+
+      const source = await sql`SELECT * FROM tickets WHERE id::text = ${req.params.id} LIMIT 1`;
+      if (!source.length) return res.status(404).json({ error: 'Source ticket not found' });
+      const sourceTicket = source[0];
+
+      const msgCheck = await sql`SELECT id FROM ticket_messages WHERE ticket_id = ${sourceTicket.id} AND id::text = ANY(${b.message_ids})`;
+      if (msgCheck.length !== b.message_ids.length) return res.status(400).json({ error: "One or more selected messages don't belong to this ticket" });
+
+      let newTicket = null, lastErr = null;
+      for (let attempt = 0; attempt < 5 && !newTicket; attempt++) {
+        const orgCnt = await sql`SELECT COUNT(*)::int AS c FROM tickets WHERE organization_id = ${sourceTicket.organization_id}`;
+        const num = String(10000 + (orgCnt[0]?.c || 0) + 1 + attempt);
+        try {
+          const r = await sql`
+            INSERT INTO tickets (ticket_number, subject, description, status, priority, customer_id, organization_id, category_id, created_at, updated_at)
+            VALUES (${num}, ${b.new_subject.trim()}, ${'Split from ticket #' + sourceTicket.ticket_number}, 'open', ${sourceTicket.priority}, ${sourceTicket.customer_id}, ${sourceTicket.organization_id}, ${sourceTicket.category_id}, NOW(), NOW())
+            RETURNING *`;
+          newTicket = r[0];
+        } catch (e) {
+          lastErr = e;
+          if (!String(e.message || '').includes('duplicate key')) throw e;
+        }
+      }
+      if (!newTicket) throw lastErr || new Error('Could not generate a unique ticket number');
+
+      await sql`UPDATE ticket_messages SET ticket_id = ${newTicket.id} WHERE ticket_id = ${sourceTicket.id} AND id::text = ANY(${b.message_ids})`;
+      await sql`INSERT INTO ticket_messages (ticket_id, user_id, message, is_internal, is_read, created_at, updated_at) VALUES (${sourceTicket.id}, ${userId}::uuid, ${'✂️ Some messages were split into new ticket #' + newTicket.ticket_number + ': "' + newTicket.subject + '"'}, true, true, NOW(), NOW())`;
+      await sql`INSERT INTO ticket_messages (ticket_id, user_id, message, is_internal, is_read, created_at, updated_at) VALUES (${newTicket.id}, ${userId}::uuid, ${'✂️ This ticket was split from #' + sourceTicket.ticket_number + ': "' + sourceTicket.subject + '"'}, true, true, NOW(), NOW())`;
+      await sql`UPDATE tickets SET updated_at = NOW() WHERE id = ${sourceTicket.id}`;
+      await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action) VALUES (${sourceTicket.id}, 'Agent', ${userId}, 'split_out')`.catch(() => {});
+      await sql`INSERT INTO ticket_audit_log (ticket_id, actor_name, actor_id, action) VALUES (${newTicket.id}, 'Agent', ${userId}, 'split_created')`.catch(() => {});
+
+      res.json({ success: true, new_ticket: newTicket });
+    } catch (e) {
+      console.error('[ticket split native]', e.message);
+      res.status(500).json({ error: e.message || 'Failed' });
+    }
   });
 
   // ── Messages (reply / internal note / cause / resolution) ───────────────
