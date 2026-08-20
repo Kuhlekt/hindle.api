@@ -129,6 +129,26 @@ module.exports = function helpdeskProxyRouter(sql) {
         }
       }
       if (!t.length) throw lastErr || new Error('Could not generate a unique ticket number after 5 attempts');
+
+      // New-ticket notification to agents scoped for 'tickets'. This is a
+      // real feature that was dropped during the Stage 2 native conversion
+      // (it used to come free via the external app's own notifyChatbot call)
+      // — restored here via the same self-call pattern proven for agent-reply.
+      if (process.env.HELPDESK_WEBHOOK_SECRET) {
+        fetch(`${SELF_BASE_URL}/api/helpdesk/webhook/ticket-event`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': process.env.HELPDESK_WEBHOOK_SECRET },
+          body: JSON.stringify({
+            event: 'new_ticket',
+            helpdesk_org_id: helpdeskOrgId,
+            ticket_id: String(t[0].id),
+            ticket_number: t[0].ticket_number,
+            subject: t[0].subject,
+            requester_name: b.requester_name || b.requester_email || '',
+          }),
+        }).catch(e => console.error('[new_ticket notify self-call]', e.message));
+      }
+
       res.json({ success: true, data: t[0] });
     } catch (e) {
       console.error('[tickets POST native]', e.message);
