@@ -2092,18 +2092,18 @@ app.delete("/api/tenants/:id", async (req, res) => {
 // ─────────────────────────────────────────────
 // AGENTS
 // ─────────────────────────────────────────────
-app.get("/api/agents", async (req, res) => {
+app.get("/api/agents", requireAuth, async (req, res) => {
   try {
     const { org_id } = req.query;
-    const rows = org_id
-      ? await sqlForOrg(org_id, sql`SELECT * FROM agents WHERE org_id = ${org_id} ORDER BY name`)
-      : await sqlForOrg(null, sql`SELECT * FROM agents ORDER BY name`);
+    const scope = req.auth.role === "super_admin" ? (org_id || null) : req.auth.org_id;
+    const rows = scope
+      ? await sqlForOrg(scope, sql`SELECT id, org_id, name, email, mobile, role, status, sms_alerts, active, restrict_to_mine, work_scope, must_change_password, created_at FROM agents WHERE org_id = ${scope} ORDER BY name`)
+      : await sqlForOrg(null, sql`SELECT id, org_id, name, email, mobile, role, status, sms_alerts, active, restrict_to_mine, work_scope, must_change_password, created_at FROM agents ORDER BY name`);
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
 app.get("/api/agents/:id", async (req, res) => {
   try {
     const rows = await sql`SELECT * FROM agents WHERE id = ${req.params.id}`;
@@ -2163,13 +2163,17 @@ app.post("/api/agents", async (req, res) => {
   }
 });
 
-app.patch("/api/agents/:id", async (req, res) => {
-  const { name, email, mobile, role, status, sms_alerts, restrict_to_mine } = req.body;
+app.patch("/api/agents/:id", requireAuth, async (req, res) => {
+  const { name, email, mobile, role, status, sms_alerts, restrict_to_mine, active, work_scope } = req.body;
   try {
-    // Auto-add columns that may not exist yet
+    const [target] = await sql`SELECT org_id FROM agents WHERE id = ${req.params.id} LIMIT 1`;
+    if (!target) return res.status(404).json({ error: "Not found" });
+    if (req.auth.role !== "super_admin" && String(target.org_id) !== String(req.auth.org_id))
+      return res.status(403).json({ error: "Forbidden" });
     await sql`ALTER TABLE agents ADD COLUMN IF NOT EXISTS restrict_to_mine BOOLEAN DEFAULT false`.catch(()=>{});
-    // Build update — only set fields that were actually sent
     const rtm = restrict_to_mine !== undefined && restrict_to_mine !== null ? Boolean(restrict_to_mine) : null;
+    const act = active !== undefined && active !== null ? Boolean(active) : null;
+    const ws  = Array.isArray(work_scope) && work_scope.length ? work_scope : null;
     const rows = await sql`
       UPDATE agents SET
         name             = COALESCE(${name},         name),
@@ -2178,9 +2182,11 @@ app.patch("/api/agents/:id", async (req, res) => {
         role             = COALESCE(${role},         role),
         status           = COALESCE(${status},       status),
         sms_alerts       = COALESCE(${sms_alerts},   sms_alerts),
-        restrict_to_mine = COALESCE(${rtm},          restrict_to_mine)
+        restrict_to_mine = COALESCE(${rtm},          restrict_to_mine),
+        active           = COALESCE(${act},          active),
+        work_scope       = COALESCE(${ws}::text[],   work_scope)
       WHERE id = ${req.params.id}
-      RETURNING *
+      RETURNING id, org_id, name, email, mobile, role, status, sms_alerts, active, restrict_to_mine, work_scope, must_change_password, created_at
     `;
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
@@ -2188,29 +2194,39 @@ app.patch("/api/agents/:id", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-app.delete("/api/agents/:id", async (req, res) => {
+app.delete("/api/agents/:id", requireAuth, async (req, res) => {
   try {
+    const [target] = await sql`SELECT id, org_id FROM agents WHERE id = ${req.params.id} LIMIT 1`;
+    if (!target) return res.status(404).json({ error: "Not found" });
+    if (req.auth.role !== "super_admin" && String(target.org_id) !== String(req.auth.org_id))
+      return res.status(403).json({ error: "Forbidden" });
+    const [{ c }] = await sql`SELECT COUNT(*)::int AS c FROM conversations
+      WHERE claimed_by_id = ${req.params.id} OR assigned_agent_id = ${req.params.id}`;
+    if (c > 0 && !req.query.force)
+      return res.status(409).json({ error: `This agent is linked to ${c} conversation(s). Disable them instead, or delete with force.`, conversations: c });
     await sql`DELETE FROM agents WHERE id = ${req.params.id}`;
     res.json({ deleted: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
 // POST /api/agents/:id/password
-app.post("/api/agents/:id/password", async (req, res) => {
+app.post("/api/agents/:id/password", requireAuth, async (req, res) => {
   const { password } = req.body;
   if (!password || !password.trim()) return res.status(400).json({ error: "password required" });
+  if (password.trim().length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
   try {
+    const [target] = await sql`SELECT org_id FROM agents WHERE id = ${req.params.id} LIMIT 1`;
+    if (!target) return res.status(404).json({ error: "Not found" });
+    if (req.auth.role !== "super_admin" && String(target.org_id) !== String(req.auth.org_id))
+      return res.status(403).json({ error: "Forbidden" });
     const _agentPwHash = await bcrypt.hash(password.trim(), 10);
-    await sql`UPDATE agents SET password_hash = ${_agentPwHash}, must_change_password = false WHERE id = ${req.params.id}`;
+    await sql`UPDATE agents SET password_hash = ${_agentPwHash}, must_change_password = true WHERE id = ${req.params.id}`;
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
 // POST /api/invite-agent — create login credentials and notify agent via SMS
 app.post("/api/invite-agent", async (req, res) => {
   const { tenantId, name, email, mobile } = req.body;
