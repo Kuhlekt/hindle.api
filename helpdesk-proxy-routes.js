@@ -14,7 +14,7 @@ module.exports = function helpdeskProxyRouter(sql) {
   const bcrypt = require('bcryptjs');
 
   function chatbotOrgId(req) {
-    return req.headers['x-org-id'] || req.query.org_id || req.body?.org_id || null;
+  return req.headers['x-org-id'] || req.query.org_id || req.body?.org_id || req.auth?.org_id || null;
   }
 
   async function resolveHelpdeskOrgId(req) {
