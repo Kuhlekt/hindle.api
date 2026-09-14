@@ -2807,10 +2807,11 @@ app.post("/api/auth", async (req, res) => {
           else if (cfg[0].config?.admin_password) { storedPass = cfg[0].config.admin_password; isHashed = false; }
         }
       } catch (_) {}
-      if (!storedPass) return res.status(401).json({ ok: false, error: "No password set. Use Forgot password to set one." });      const passOk = isHashed ? await bcrypt.compare(password, storedPass) : (password === storedPass);
+      if (!storedPass) return res.status(401).json({ ok: false, error: "No password set. Use Forgot password to set one." });
+      const passOk = isHashed ? await bcrypt.compare(password, storedPass) : (password === storedPass);
       if (!passOk) return res.status(401).json({ ok: false, error: "Incorrect password." });
-      return res.json({ ok: true, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });
-    }
+      const token = await createSession({ org_id: org.id, email: org.email, role: "tenant_admin" });
+      return res.json({ ok: true, token, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });    }
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
