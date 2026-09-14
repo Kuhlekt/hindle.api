@@ -11,6 +11,7 @@ const SELF_BASE_URL = process.env.SELF_BASE_URL || 'https://hindleapi-production
 module.exports = function helpdeskProxyRouter(sql) {
   const express = require('express');
   const router = express.Router();
+  const bcrypt = require('bcryptjs');
 
   function chatbotOrgId(req) {
     return req.headers['x-org-id'] || req.query.org_id || req.body?.org_id || null;
@@ -940,6 +941,82 @@ module.exports = function helpdeskProxyRouter(sql) {
     if (!helpdeskOrgId) return res.json({ success: true, data: null });
     const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/reports/kpi`);
     res.status(status).json(data);
+  });
+  // ── User management (helpdesk user_profiles) ─────────────────────────
+  const USER_COLS = `id, email, full_name, phone, role, is_active, is_super_admin,
+                     force_password_change, organization_id, created_at`;
+
+  router.get('/users', async (req, res) => {
+    try {
+      const isSuper = req.auth?.role === 'super_admin';
+      const filter = req.query.org_id || null;
+      let rows;
+      if (isSuper && !filter) {
+        rows = await sql`SELECT id, email, full_name, phone, role, is_active, is_super_admin,
+                                force_password_change, organization_id, created_at
+                         FROM user_profiles ORDER BY full_name ASC`;
+      } else {
+        const orgId = isSuper ? filter : await resolveHelpdeskOrgId(req);
+        if (!orgId) return res.json({ success: true, data: [] });
+        rows = await sql`SELECT id, email, full_name, phone, role, is_active, is_super_admin,
+                                force_password_change, organization_id, created_at
+                         FROM user_profiles WHERE organization_id = ${orgId}::uuid ORDER BY full_name ASC`;
+      }
+      res.json({ success: true, data: [...rows] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  async function assertUserScope(req, res, userId) {
+    const [u] = await sql`SELECT organization_id FROM user_profiles WHERE id = ${userId}::uuid LIMIT 1`;
+    if (!u) { res.status(404).json({ error: 'Not found' }); return null; }
+    if (req.auth?.role === 'super_admin') return u;
+    const mine = await resolveHelpdeskOrgId(req);
+    if (!mine || String(u.organization_id) !== String(mine)) { res.status(403).json({ error: 'Forbidden' }); return null; }
+    return u;
+  }
+
+  router.patch('/users/:id', async (req, res) => {
+    try {
+      if (!await assertUserScope(req, res, req.params.id)) return;
+      const { full_name, email, phone, role, is_active } = req.body;
+      const act = is_active !== undefined && is_active !== null ? Boolean(is_active) : null;
+      const rows = await sql`
+        UPDATE user_profiles SET
+          full_name = COALESCE(${full_name || null}, full_name),
+          email     = COALESCE(${email || null},     email),
+          phone     = COALESCE(${phone || null},     phone),
+          role      = COALESCE(${role || null},      role),
+          is_active = COALESCE(${act},               is_active),
+          updated_at = NOW()
+        WHERE id = ${req.params.id}::uuid
+        RETURNING id, email, full_name, phone, role, is_active, is_super_admin,
+                  force_password_change, organization_id, created_at`;
+      res.json({ success: true, data: rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  router.post('/users/:id/password', async (req, res) => {
+    try {
+      if (!await assertUserScope(req, res, req.params.id)) return;
+      const pw = (req.body?.password || '').trim();
+      if (pw.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+      const hash = await bcrypt.hash(pw, 10);
+      await sql`UPDATE user_profiles SET password_hash = ${hash}, force_password_change = true, updated_at = NOW()
+                WHERE id = ${req.params.id}::uuid`;
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  router.delete('/users/:id', async (req, res) => {
+    try {
+      if (!await assertUserScope(req, res, req.params.id)) return;
+      const [{ c }] = await sql`SELECT COUNT(*)::int AS c FROM tickets
+        WHERE customer_id = ${req.params.id}::uuid OR assigned_to = ${req.params.id}::uuid`;
+      if (c > 0 && !req.query.force)
+        return res.status(409).json({ error: `This user is linked to ${c} ticket(s). Disable them instead, or delete with force.`, tickets: c });
+      await sql`DELETE FROM user_profiles WHERE id = ${req.params.id}::uuid`;
+      res.json({ success: true, deleted: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   return router;
