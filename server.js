@@ -2755,6 +2755,37 @@ app.post("/api/auth/reset-password", async (req, res) => {
 });
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────
+// SESSIONS / AUTH
+// ─────────────────────────────────────────────
+async function createSession({ agent_id = null, org_id = null, email, role }) {
+  const token = crypto.randomBytes(32).toString("hex");
+  const expires = new Date(Date.now() + 12 * 3600 * 1000);
+  await sql`INSERT INTO sessions (token, agent_id, org_id, email, role, expires_at)
+            VALUES (${token}, ${agent_id}, ${org_id}, ${email}, ${role}, ${expires})`;
+  return token;
+}
+
+async function requireAuth(req, res, next) {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const rows = await sql`SELECT * FROM sessions WHERE token = ${token} AND expires_at > NOW() LIMIT 1`;
+    if (!rows.length) return res.status(401).json({ error: "Session expired" });
+    req.auth = rows[0];
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+function requireSuper(req, res, next) {
+  if (req.auth?.role !== "super_admin") return res.status(403).json({ error: "Forbidden" });
+  next();
+}
+
+function scopeOrg(req, orgId) {
+  if (req.auth?.role === "super_admin") return orgId || null;
+  return req.auth?.org_id || null;
+}
 
 app.post("/api/auth", async (req, res) => {
   const { email, password } = req.body;
@@ -2776,8 +2807,7 @@ app.post("/api/auth", async (req, res) => {
           else if (cfg[0].config?.admin_password) { storedPass = cfg[0].config.admin_password; isHashed = false; }
         }
       } catch (_) {}
-      if (!storedPass) storedPass = "admin"; // default if nothing set
-      const passOk = isHashed ? await bcrypt.compare(password, storedPass) : (password === storedPass);
+      if (!storedPass) return res.status(401).json({ ok: false, error: "No password set. Use Forgot password to set one." });      const passOk = isHashed ? await bcrypt.compare(password, storedPass) : (password === storedPass);
       if (!passOk) return res.status(401).json({ ok: false, error: "Incorrect password." });
       return res.json({ ok: true, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });
     }
@@ -2798,16 +2828,14 @@ app.post("/api/auth", async (req, res) => {
       : agent.password_hash === password;
     if (!agentPassOk) return res.status(401).json({ ok: false, error: "Incorrect password." });
     let orgId = agent.org_id || null;
-    if (!orgId) {
-      try {
+    if (!orgId && agent.role !== "super_admin") {
+        try {
         const orgs = await sql`SELECT id FROM organisations LIMIT 1`;
         if (orgs.length) { orgId = orgs[0].id; await sql`UPDATE agents SET org_id = ${orgId} WHERE id = ${agent.id}`; }
       } catch (_) {}
     }
-    return res.json({ ok: true, id: agent.id, org_id: orgId, role: agent.role || "agent", email: agent.email, name: agent.name, mustChangePassword: agent.must_change_password || false });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
+    const token = await createSession({ agent_id: agent.id, org_id: orgId, email: agent.email, role: agent.role || "agent" });
+    return res.json({ ok: true, token, id: agent.id, org_id: orgId, role: agent.role || "agent", email: agent.email, name: agent.name, mustChangePassword: agent.must_change_password || false });  }
 });
 
 // ─────────────────────────────────────────────
