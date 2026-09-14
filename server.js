@@ -1831,15 +1831,13 @@ app.get("/api/admin-settings", async (req, res) => {
     if (!rows.length) return res.json({});
     const cfg = rows[0].config || {};
     res.json({
-      profile:         cfg._adminProfile   || {},
-      platform:        cfg._platformConfig || {},
-      github:          cfg._githubConfig   || {},
-      superConfig:     cfg._superConfig    || {},
-      adminPassword:   cfg._adminPassword  || null,
-      adminAccounts:   cfg._adminAccounts  || [],
-      _adminPasswords: cfg._adminPasswords || {},
+      profile:     cfg._adminProfile   || {},
+      platform:    cfg._platformConfig || {},
+      github:      cfg._githubConfig   || {},
+      superConfig: cfg._superConfig    || {},
+      adminAccounts: (cfg._adminAccounts || []).map(a => ({ email: a.email, name: a.name || null })),
     });
-  } catch (e) {
+    } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
