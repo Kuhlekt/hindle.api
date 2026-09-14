@@ -2835,9 +2835,11 @@ app.post("/api/auth", async (req, res) => {
       } catch (_) {}
     }
     const token = await createSession({ agent_id: agent.id, org_id: orgId, email: agent.email, role: agent.role || "agent" });
-    return res.json({ ok: true, token, id: agent.id, org_id: orgId, role: agent.role || "agent", email: agent.email, name: agent.name, mustChangePassword: agent.must_change_password || false });  }
+    return res.json({ ok: true, token, id: agent.id, org_id: orgId, role: agent.role || "agent", email: agent.email, name: agent.name, mustChangePassword: agent.must_change_password || false });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
-
 // ─────────────────────────────────────────────
 // SMS TEST  — send a test SMS via ClickSend
 // POST /api/sms-test  { username, apiKey, to, sender } OR { tenantId, to }
