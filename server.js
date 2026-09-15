@@ -3014,7 +3014,7 @@ if (event === "agent_reply") {
         return res.json({ ok: true, emailSent: false, reason: "No requester_email provided" });
       }
       const { smtpCfg, csCfg } = await loadEmailConfig(org.id);
-      const portalUrl = `https://helpdesk.hindleconsultants.com/portal/${org.helpdesk_slug || ""}`;
+      const portalUrl = `https://helpdesk.hindleconsultants.com/t/${org.helpdesk_slug || ""}`;
       const emailBody = `
         <p>Hi ${requester_name || "there"},</p>
         <p>You have a new reply on your support ticket <strong>#${ticket_number}: ${subject || ""}</strong></p>
