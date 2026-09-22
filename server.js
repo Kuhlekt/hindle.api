@@ -275,7 +275,7 @@ async function sqlManyForOrg(orgId, queries) {
       sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
       ...queries,
     ]);
-    return results.slice(1); // drop set_config result
+    const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
   } catch (e) {
     console.error('[RLS] multi-transaction error:', e.message);
     return await Promise.all(queries.map(q => q));
