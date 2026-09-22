@@ -268,30 +268,19 @@ async function sqlForOrg(orgId, query) {
 }
 
 // sqlManyForOrg — run multiple queries in one transaction under the same RLS context
-// ── Identity autofill toggle ──────────────────────────────────────
-// Controls whether content.ts offers to fill personal-details forms
-// (name/address/phone/email) on the page — the actual gate lives in
-// content.ts's detectAndInject(), which checks this same storage key
-// before ever calling detectIdentityForm()/attachIdentityFillBtn.
-// Defaults to enabled (true) since the underlying detection is already
-// conservative (requires 3+ distinct identity-shaped fields clustered
-// together before it ever offers to fill anything).
-const identityToggle = document.getElementById("identity-autofill-toggle") as HTMLInputElement;
-
-browser.storage.local.get("vaulis_identity_autofill_enabled").then((s) => {
-  const enabled = s.vaulis_identity_autofill_enabled !== false; // default true
-  if (identityToggle) identityToggle.checked = enabled;
-});
-
-identityToggle?.addEventListener("change", () => {
-  browser.storage.local.set({ vaulis_identity_autofill_enabled: identityToggle.checked });
-});
-
-document.getElementById("account-passphrase")?.addEventListener("click", async (e) => {
-  e.preventDefault();
-  accountMenu.style.display = "none";
-  await focusOrOpenVault("/account/change-passphrase");
-});
+async function sqlManyForOrg(orgId, queries) {
+  const ctx = orgId ? String(orgId) : '';
+  try {
+    const results = await sql.transaction([
+      sql`SELECT set_config('app.current_org_id', ${ctx}, true)`,
+      ...queries,
+    ]);
+    return results.slice(1);
+  } catch (e) {
+    console.error('[RLS] multi-transaction error:', e.message);
+    return await Promise.all(queries.map(q => q));
+  }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
