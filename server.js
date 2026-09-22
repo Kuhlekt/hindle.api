@@ -3794,7 +3794,7 @@ app.post("/api/access-requests", async (req, res) => {
     const contactName = approver_name || org.name || "Customer";
 
     const approval_token = crypto.randomBytes(32).toString("hex");
-    const linkExpires = new Date(Date.now() + 30 * 60000).toISOString();
+    const linkExpires = new Date(Date.now() + 2 * 60 * 60000).toISOString();
 
     const [reqRow] = await sql`
       INSERT INTO access_requests
@@ -3822,7 +3822,7 @@ app.post("/api/access-requests", async (req, res) => {
   <h2 style="margin:0 0 12px;color:#1e293b">Support access request</h2>
   <p style="color:#64748b;margin:0 0 16px">Hi ${contactName},<br><br>
   A ${on_behalf_of} support agent (${requester_name || "an agent"}) is requesting temporary access to your account to investigate a support ticket.</p>
-  <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 30 minutes</p>
+  <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 2 hours</p> <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 30 minutes</p>
   <a href="${approveUrl}" style="display:inline-block;background:#3B82F6;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:15px;margin-bottom:20px">Review Request →</a>
   <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">If you did not expect this, you can safely deny it on the review page. No access is granted unless you approve.</p>
 </div>`,
