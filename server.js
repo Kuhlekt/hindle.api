@@ -2775,7 +2775,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
 // ─────────────────────────────────────────────
 async function createSession({ agent_id = null, org_id = null, email, role }) {
   const token = crypto.randomBytes(32).toString("hex");
-  const expires = new Date(Date.now() + 12 * 3600 * 1000);
+  const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
   await sql`INSERT INTO sessions (token, agent_id, org_id, email, role, expires_at)
             VALUES (${token}, ${agent_id}, ${org_id}, ${email}, ${role}, ${expires})`;
   return token;
