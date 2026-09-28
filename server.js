@@ -2912,12 +2912,12 @@ app.post("/api/widget-ping", async (req, res) => {
     if (!orgId) return res.json({ ok: true });
     await sql`
       UPDATE tenant_configs
-      SET config = jsonb_set(COALESCE(config, '{}'::jsonb), '{widget_last_seen}', to_jsonb(now()::text))
+      SET config = jsonb_set(jsonb_set(COALESCE(config, '{}'::jsonb), '{widget_last_seen}', to_jsonb(now()::text)), '{widgetInstalled}', 'true'::jsonb)
       WHERE tenant_id = ${orgId}
     `.catch(async () => {
       await sql`
-        INSERT INTO tenant_configs (tenant_id, config) VALUES (${orgId}, ${JSON.stringify({ widget_last_seen: new Date().toISOString() })})
-        ON CONFLICT (tenant_id) DO UPDATE SET config = jsonb_set(COALESCE(tenant_configs.config,'{}'::jsonb), '{widget_last_seen}', to_jsonb(now()::text))
+        INSERT INTO tenant_configs (tenant_id, config) VALUES (${orgId}, ${JSON.stringify({ widget_last_seen: new Date().toISOString(), widgetInstalled: true })})
+        ON CONFLICT (tenant_id) DO UPDATE SET config = jsonb_set(jsonb_set(COALESCE(tenant_configs.config,'{}'::jsonb), '{widget_last_seen}', to_jsonb(now()::text)), '{widgetInstalled}', 'true'::jsonb)
       `.catch(() => {});
     });
     res.json({ ok: true });
