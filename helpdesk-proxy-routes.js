@@ -244,7 +244,28 @@ module.exports = function helpdeskProxyRouter(sql) {
       res.status(500).json({ error: e.message || 'Failed' });
     }
   });
-
+router.delete('/tickets/:id', async (req, res) => {
+  const helpdeskOrgId = await resolveHelpdeskOrgId(req);
+  if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
+  const role = (req.headers['x-user-role'] || '').toLowerCase();
+  if (role !== 'tenant_admin' && role !== 'super_admin') {
+    return res.status(403).json({ error: 'Only a tenant admin or super admin can delete tickets' });
+  }
+  const rawId = req.params.id;
+  try {
+    const existing = await sql`SELECT id, ticket_number, organization_id FROM tickets WHERE id::text = ${rawId} LIMIT 1`;
+    if (!existing.length) return res.status(404).json({ error: 'Not found' });
+    if (String(existing[0].organization_id) !== String(helpdeskOrgId)) {
+      return res.status(403).json({ error: 'Ticket does not belong to this tenant' });
+    }
+    await sql`DELETE FROM tickets WHERE id::text = ${rawId}`;
+    console.log('ticket deleted: ' + existing[0].ticket_number);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('ticket delete error', e.message);
+    res.status(500).json({ error: e.message || 'Failed' });
+  }
+});
   // ── Merge tickets ─────────────────────────────────────────────────────
   router.post('/tickets/:id/merge', async (req, res) => {
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
