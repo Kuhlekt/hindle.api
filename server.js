@@ -3773,6 +3773,109 @@ async function logAccessEvent(access_request_id, org_id, agent_id, action, detai
   } catch (e) { console.error("[AccessAudit] error:", e.message); }
 }
 
+const ACCESS_LINK_MINUTES = 60;                 // approval link lifetime
+const ACCESS_RESEND_COOLDOWN_SECONDS = 60;      // min gap between resends
+const ACCESS_MAX_RESENDS = 5;                   // cap per request
+const ACCESS_PUBLIC_BASE = "https://hindleapi-production.up.railway.app";
+
+async function ensureAccessRequestColumns() {
+  await sql`ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS approver_email TEXT`.catch(() => {});
+  await sql`ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS approver_mobile TEXT`.catch(() => {});
+  await sql`ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS delivery_method TEXT`.catch(() => {});
+  await sql`ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS on_behalf_of TEXT`.catch(() => {});
+  await sql`ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS resend_count INT DEFAULT 0`.catch(() => {});
+  await sql`ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ`.catch(() => {});
+}
+let _accessColsReady = null;
+function accessColsReady() { return _accessColsReady || (_accessColsReady = ensureAccessRequestColumns()); }
+
+function escHtml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// Sends the approval email and/or SMS for a request row. Used by create and both resend paths.
+async function sendAccessRequestNotifications(reqRow, { isResend = false } = {}) {
+  const org_id = reqRow.org_id;
+  const contactName = reqRow.approver_name || "Customer";
+  const contactEmail = reqRow.approver_email || (reqRow.approver_contact && reqRow.approver_contact.includes("@") ? reqRow.approver_contact : null);
+  const contactMobile = reqRow.approver_mobile || (reqRow.approver_contact && !reqRow.approver_contact.includes("@") ? reqRow.approver_contact : null);
+  const delivery = reqRow.delivery_method || "both";
+  const onBehalfOf = reqRow.on_behalf_of || "Hindle Consultants";
+  const approveUrl = `${ACCESS_PUBLIC_BASE}/access-approve/${reqRow.approval_token}`;
+  const resendUrl = `${approveUrl}?resend=1`;
+  const sent = { email: false, sms: false };
+
+  const [orgCfgRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${String(org_id)} LIMIT 1`.catch(() => [null]);
+  const orgLogoUrl = orgCfgRow?.config?.brand?.customLogoUrl || null;
+
+  if (contactEmail && (delivery === "email" || delivery === "both")) {
+    const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
+    try {
+      await sendEmail({
+        to: contactEmail,
+        toName: contactName,
+        subject: isResend ? "Reminder: support access request — action required" : "Support access request — action required",
+        body: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+  ${orgLogoUrl ? `<img src="${escHtml(orgLogoUrl)}" alt="${escHtml(onBehalfOf)}" style="max-height:40px;margin-bottom:20px;display:block" />` : ''}
+  <h2 style="margin:0 0 12px;color:#1e293b">Support access request${isResend ? " (new link)" : ""}</h2>
+  <p style="color:#64748b;margin:0 0 16px">Hi ${escHtml(contactName)},<br><br>
+  A ${escHtml(onBehalfOf)} support agent (${escHtml(reqRow.requester_name || "an agent")}) is requesting temporary access to your account to investigate a support ticket.</p>
+  <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${escHtml(reqRow.reason)}<br><b>Access level:</b> ${escHtml(reqRow.scope)}<br><b>Duration:</b> ${reqRow.requested_duration_minutes} minutes<br><b>Link expires:</b> 1 hour</p>
+  <a href="${approveUrl}" style="display:inline-block;background:#3B82F6;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:15px;margin-bottom:16px">Review Request →</a>
+  <p style="color:#64748b;font-size:13px;margin:0 0 8px">Link expired? <a href="${resendUrl}" style="color:#3B82F6">Send me a new link</a></p>
+  <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">If you did not expect this, you can safely deny it on the review page. No access is granted unless you approve.</p>
+</div>`,
+        smtpCfg, csCfg,
+      });
+      sent.email = true;
+    } catch (e) { console.error("[AccessRequest] email error:", e.message); }
+  }
+
+  if (contactMobile && (delivery === "sms" || delivery === "both")) {
+    try {
+      const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
+      const cs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
+      if (cs.username && cs.apiKey) {
+        const body = `${onBehalfOf} support access request${isResend ? " (new link)" : ""} pending your approval: ${approveUrl} (valid 1 hr). Expired? Get a new link: ${resendUrl}`;
+        const r = await fetch("https://rest.clicksend.com/v3/sms/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${cs.username}:${cs.apiKey}`).toString("base64") },
+          body: JSON.stringify({ messages: [{ source: "sdk", to: contactMobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body }] }),
+        });
+        sent.sms = r.ok;
+      }
+    } catch (e) { console.error("[AccessRequest] SMS error:", e.message); }
+  }
+  return sent;
+}
+
+// Rotates the token, resets the 1-hour window, re-notifies. Shared by dashboard + approver resend.
+async function resendAccessRequest(reqRow, { actor, ip }) {
+  if (!["pending", "expired"].includes(reqRow.status)) {
+    return { status: 409, body: { ok: false, error: `Request is already ${reqRow.status} — create a new request instead` } };
+  }
+  if ((reqRow.resend_count || 0) >= ACCESS_MAX_RESENDS) {
+    return { status: 429, body: { ok: false, error: `Resend limit reached (${ACCESS_MAX_RESENDS}). Please create a new request.` } };
+  }
+  if (reqRow.last_sent_at && Date.now() - new Date(reqRow.last_sent_at).getTime() < ACCESS_RESEND_COOLDOWN_SECONDS * 1000) {
+    return { status: 429, body: { ok: false, error: `Please wait a minute before resending again.` } };
+  }
+  const newToken = crypto.randomBytes(32).toString("hex");
+  const linkExpires = new Date(Date.now() + ACCESS_LINK_MINUTES * 60000).toISOString();
+  const [updated] = await sql`
+    UPDATE access_requests SET
+      approval_token = ${newToken}, expires_at = ${linkExpires}, status = 'pending',
+      resend_count = COALESCE(resend_count, 0) + 1, last_sent_at = now()
+    WHERE id = ${reqRow.id} AND status IN ('pending','expired')
+    RETURNING *`;
+  if (!updated) return { status: 409, body: { ok: false, error: "Request could not be resent" } };
+  const sent = await sendAccessRequestNotifications(updated, { isResend: true });
+  await logAccessEvent(updated.id, updated.org_id, updated.requested_by_agent_id, "request_resent",
+    { actor, resend_count: updated.resend_count, sent }, ip);
+  const { approval_token, ...safe } = updated;
+  return { status: 200, body: { ok: true, request: safe, sent } };
+}
+
 // Create a request + notify the tenant's approver (SMS and/or email)
 app.post("/api/access-requests", async (req, res) => {
   const { org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
@@ -3781,9 +3884,8 @@ app.post("/api/access-requests", async (req, res) => {
     return res.status(400).json({ ok: false, error: "org_id, requester_name, reason, scope, requested_duration_minutes are required" });
   }
   try {
+    await accessColsReady();
     const [org] = await sql`SELECT * FROM organisations WHERE id::text = ${org_id} LIMIT 1`;
-    const [orgCfgRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org_id} LIMIT 1`.catch(() => [null]);
-    const orgLogoUrl = orgCfgRow?.config?.brand?.customLogoUrl || null;
     if (!org) return res.status(404).json({ ok: false, error: "Tenant not found" });
 
     const contactEmail = approver_email || org.email || null;
@@ -3794,59 +3896,56 @@ app.post("/api/access-requests", async (req, res) => {
     const contactName = approver_name || org.name || "Customer";
 
     const approval_token = crypto.randomBytes(32).toString("hex");
-    const linkExpires = new Date(Date.now() + 2 * 60 * 60000).toISOString();
+    const linkExpires = new Date(Date.now() + ACCESS_LINK_MINUTES * 60000).toISOString();
 
     const [reqRow] = await sql`
       INSERT INTO access_requests
         (org_id, requested_by_agent_id, requester_name, requester_email, reason, scope, requested_duration_minutes,
-         status, approval_token, approver_contact, approver_name, expires_at)
+         status, approval_token, approver_contact, approver_name, expires_at,
+         approver_email, approver_mobile, delivery_method, on_behalf_of, resend_count, last_sent_at)
       VALUES
         (${org_id}, ${requested_by_agent_id || null}, ${requester_name}, ${requester_email || null}, ${reason}, ${scope}, ${requested_duration_minutes},
-         'pending', ${approval_token}, ${contactEmail || contactMobile}, ${contactName}, ${linkExpires})
+         'pending', ${approval_token}, ${contactEmail || contactMobile}, ${contactName}, ${linkExpires},
+         ${contactEmail}, ${contactMobile}, ${delivery_method}, ${on_behalf_of}, 0, now())
       RETURNING *
     `;
 
     await logAccessEvent(reqRow.id, org_id, requested_by_agent_id || null, "request_created",
       { reason, scope, requested_duration_minutes, requester_name, approver_name: contactName, approver_email: contactEmail, approver_mobile: contactMobile }, req.ip);
 
-    const approveUrl = `https://hindleapi-production.up.railway.app/access-approve/${approval_token}`;
-    const { smtpCfg, csCfg } = await loadEmailConfig(org_id).catch(() => ({ smtpCfg: null, csCfg: null }));
-
-    if (contactEmail && (delivery_method === "email" || delivery_method === "both")) {
-      await sendEmail({
-        to: contactEmail,
-        toName: contactName,
-        subject: "Support access request — action required",
-        body: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-  ${orgLogoUrl ? `<img src="${orgLogoUrl}" alt="${on_behalf_of}" style="max-height:40px;margin-bottom:20px;display:block" />` : ''}
-  <h2 style="margin:0 0 12px;color:#1e293b">Support access request</h2>
-  <p style="color:#64748b;margin:0 0 16px">Hi ${contactName},<br><br>
-  A ${on_behalf_of} support agent (${requester_name || "an agent"}) is requesting temporary access to your account to investigate a support ticket.</p>
-  <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 2 hours</p> <p style="color:#334155;margin:0 0 16px"><b>Reason:</b> ${reason}<br><b>Access level:</b> ${scope}<br><b>Duration:</b> ${requested_duration_minutes} minutes<br><b>Link expires:</b> 30 minutes</p>
-  <a href="${approveUrl}" style="display:inline-block;background:#3B82F6;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;font-size:15px;margin-bottom:20px">Review Request →</a>
-  <p style="color:#94a3b8;font-size:12px;margin:16px 0 0">If you did not expect this, you can safely deny it on the review page. No access is granted unless you approve.</p>
-</div>`,
-        smtpCfg, csCfg,
-      }).catch(e => console.error("[AccessRequest] email error:", e.message));
-    }
-
-    if (contactMobile && (delivery_method === "sms" || delivery_method === "both")) {
-      try {
-        const [platRow] = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
-        const cs = platRow?.config?._superConfig?.clicksend || platRow?.config?.clicksend || {};
-        if (cs.username && cs.apiKey) {
-          await fetch("https://rest.clicksend.com/v3/sms/send", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: "Basic " + Buffer.from(`${cs.username}:${cs.apiKey}`).toString("base64") },
-            body: JSON.stringify({ messages: [{ source: "sdk", to: contactMobile, from: (cs.smsSender || "HINDLE").substring(0, 11), body: `${on_behalf_of} support access request pending your approval: ${approveUrl}` }] }),
-          });
-        }
-      } catch (e) { console.error("[AccessRequest] SMS error:", e.message); }
-    }
-
-    res.json({ ok: true, request: reqRow });
+    const sent = await sendAccessRequestNotifications(reqRow);
+    res.json({ ok: true, request: reqRow, sent });
   } catch (e) {
     console.error("[AccessRequest] create error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Dashboard: resend a pending/expired request (new token, new 1-hour window)
+app.post("/api/access-requests/:id/resend", async (req, res) => {
+  try {
+    await accessColsReady();
+    const [reqRow] = await sql`SELECT * FROM access_requests WHERE id = ${req.params.id} LIMIT 1`;
+    if (!reqRow) return res.status(404).json({ ok: false, error: "Not found" });
+    const out = await resendAccessRequest(reqRow, { actor: req.body?.resent_by || "dashboard", ip: req.ip });
+    res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error("[AccessRequest] resend error:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Public: approver asks for a fresh link (token is the auth; new link goes only to the contact on file)
+app.post("/api/access-requests/approve/:token/resend", async (req, res) => {
+  try {
+    await accessColsReady();
+    const [reqRow] = await sql`SELECT * FROM access_requests WHERE approval_token = ${req.params.token} LIMIT 1`;
+    if (!reqRow) return res.status(404).json({ ok: false, error: "Invalid or unknown link" });
+    const out = await resendAccessRequest(reqRow, { actor: "approver", ip: req.ip || req.headers["x-forwarded-for"] || null });
+    if (out.status === 200) return res.json({ ok: true, sent: out.body.sent });
+    res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error("[AccessRequest] approver resend error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -3860,10 +3959,11 @@ app.get("/api/access-requests/approve/:token", async (req, res) => {
       FROM access_requests ar JOIN organisations o ON o.id = ar.org_id
       WHERE approval_token = ${req.params.token} LIMIT 1`;
     if (!reqRow) return res.status(404).json({ ok: false, error: "Invalid or unknown link" });
+    if (reqRow.status === "expired") return res.json({ ok: true, request: reqRow, actionable: false, resendable: true, reason: "This link has expired." });
     if (reqRow.status !== "pending") return res.json({ ok: true, request: reqRow, actionable: false, reason: `Already ${reqRow.status}` });
     if (new Date(reqRow.expires_at) < new Date()) {
       await sql`UPDATE access_requests SET status = 'expired' WHERE id = ${reqRow.id}`;
-      return res.json({ ok: true, request: reqRow, actionable: false, reason: "Link expired" });
+      return res.json({ ok: true, request: reqRow, actionable: false, resendable: true, reason: "This link has expired." });
     }
     res.json({ ok: true, request: reqRow, actionable: true });
   } catch (e) {
@@ -3871,30 +3971,7 @@ app.get("/api/access-requests/approve/:token", async (req, res) => {
   }
 });
 
-// ── ADD to server.js — standalone approval page (no auth, no app shell) ────
-// This replaces the email/SMS link target. Add this route anywhere near the
-// existing /api/access-requests/approve/:token routes.
-//
-// Also update the link construction (in POST /api/access-requests) from:
-//   const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
-// to:
-//   const approveUrl = `${APP_BASE_URL}/access-approve/${approval_token}`;
-// (Note: APP_BASE_URL is presumably the hindle_api Railway URL or a proxied
-// domain — use whichever base the rest of your public-facing links use, this
-// route lives on the SAME server as the /api/access-requests/* routes.)
-
-// ── ADD to server.js — standalone approval page (no auth, no app shell) ────
-// This replaces the email/SMS link target. Add this route anywhere near the
-// existing /api/access-requests/approve/:token routes.
-//
-// Also update the link construction (in POST /api/access-requests) from:
-//   const approveUrl = `${APP_BASE_URL}?access_approve=${approval_token}`;
-// to:
-//   const approveUrl = `${APP_BASE_URL}/access-approve/${approval_token}`;
-// (Note: APP_BASE_URL is presumably the hindle_api Railway URL or a proxied
-// domain — use whichever base the rest of your public-facing links use, this
-// route lives on the SAME server as the /api/access-requests/* routes.)
-
+// Standalone approval page (no auth, no app shell). Email/SMS links point here.
 app.get("/access-approve/:token", async (req, res) => {
   res.setHeader("Content-Type", "text/html");
   res.send(`<!DOCTYPE html>
@@ -3931,6 +4008,26 @@ app.get("/access-approve/:token", async (req, res) => {
 <script>
 const token = ${JSON.stringify(req.params.token)};
 const card = document.getElementById('card');
+const wantsResend = new URLSearchParams(location.search).get('resend') === '1';
+
+function showResend(reason) {
+  card.innerHTML = '<h1>Link expired</h1>' +
+    '<p class="sub">' + escapeHtml(reason || 'This approval link is no longer valid.') + '</p>' +
+    '<p style="font-size:13.5px;color:#334155;margin-bottom:16px">We can send a new link (valid for 1 hour) to the email and/or mobile on file for this request.</p>' +
+    '<div class="btns"><button class="approve" id="resendBtn">Send me a new link</button></div>';
+  document.getElementById('resendBtn').addEventListener('click', () => {
+    const b = document.getElementById('resendBtn');
+    b.disabled = true; b.textContent = 'Sending…';
+    fetch('/api/access-requests/approve/' + token + '/resend', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+      .then(r => r.json())
+      .then(res => {
+        card.innerHTML = res.ok
+          ? '<h1>New link sent</h1><p class="msg ok">Check your email and/or SMS for a new approval link. It is valid for 1 hour.</p>'
+          : '<h1>Could not resend</h1><p class="msg err">' + escapeHtml(res.error || 'Something went wrong.') + '</p>';
+      })
+      .catch(() => { card.innerHTML = '<p class="msg err">Network error — please try again.</p>'; });
+  });
+}
 
 fetch('/api/access-requests/approve/' + token)
   .then(r => r.json())
@@ -3938,7 +4035,8 @@ fetch('/api/access-requests/approve/' + token)
     if (!d.ok) { card.innerHTML = '<p class="msg err">This link is invalid.</p>'; return; }
     const req = d.request;
     if (!d.actionable) {
-      card.innerHTML = '<h1>Request already handled</h1><p class="msg">' + (d.reason || 'This request is no longer pending.') + '</p>';
+      if (d.resendable) { showResend(d.reason); return; }
+      card.innerHTML = '<h1>Request already handled</h1><p class="msg">' + escapeHtml(d.reason || 'This request is no longer pending.') + '</p>';
       return;
     }
     card.innerHTML =
@@ -3955,6 +4053,10 @@ fetch('/api/access-requests/approve/' + token)
         '<button class="deny" id="denyBtn">Deny</button>' +
         '<button class="approve" id="approveBtn">Approve</button>' +
       '</div>';
+
+    if (wantsResend) {
+      card.insertAdjacentHTML('afterbegin', '<p class="msg ok" style="padding:0 0 14px">This link is still valid — you can review the request below.</p>');
+    }
 
     function decide(decision) {
       const name = document.getElementById('name').value.trim();
@@ -3998,7 +4100,7 @@ app.post("/api/access-requests/approve/:token", async (req, res) => {
     if (reqRow.status !== "pending") return res.status(409).json({ ok: false, error: `Already ${reqRow.status}` });
     if (new Date(reqRow.expires_at) < new Date()) {
       await sql`UPDATE access_requests SET status = 'expired' WHERE id = ${reqRow.id}`;
-      return res.status(409).json({ ok: false, error: "Link expired" });
+      return res.status(409).json({ ok: false, error: "This link has expired — reload the page to request a new one." });
     }
 
     const ip = req.ip || req.headers["x-forwarded-for"] || null;
