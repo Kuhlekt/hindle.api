@@ -516,6 +516,7 @@ app.use(express.json({ limit: "10mb" }));
 const helpdeskProxy = require('./helpdesk-proxy-routes');
 app.use('/api/helpdesk/users', requireAuth);
 app.use('/api/helpdesk', helpdeskProxy(sql));
+app.use('/api/sso', requireAuth, require('./sso-settings-routes')(sql));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // ─── Screen Share (view-only, WebRTC via REST-polling signaling) ───────────
 // Add all of this to server.js, anywhere near your other route definitions
