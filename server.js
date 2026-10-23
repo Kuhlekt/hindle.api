@@ -543,8 +543,27 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 
 app.use(express.json({ limit: "10mb" }));
 const helpdeskProxy = require('./helpdesk-proxy-routes');
-app.use('/api/helpdesk/users', requireAuth);
-app.use('/api/helpdesk', helpdeskProxy(sql));
+// Helpdesk API: signed-in users only. The tenant (org) and role come from the
+// server-side session, never from client headers — except super admins, who
+// may act on any tenant via X-Org-Id / org_id. The portal's webhook keeps its
+// own shared-secret check.
+function helpdeskGuard(req, res, next) {
+  if (req.path.startsWith('/webhook/')) return next();
+  return requireAuth(req, res, () => {
+    const a = req.auth || {};
+    if (a.role !== 'super_admin') {
+      if (!a.org_id) return res.status(403).json({ error: 'No organisation on this session' });
+      req.headers['x-org-id'] = String(a.org_id);
+      if (req.query && 'org_id' in req.query) req.query.org_id = String(a.org_id);
+      if (req.body && typeof req.body === 'object' && 'org_id' in req.body) req.body.org_id = String(a.org_id);
+    }
+    req.headers['x-user-role'] = String(a.role || '');
+    if (a.agent_id) req.headers['x-user-id'] = String(a.agent_id); else delete req.headers['x-user-id'];
+    req.headers['x-user-email'] = String(a.email || '');
+    next();
+  });
+}
+app.use('/api/helpdesk', helpdeskGuard, helpdeskProxy(sql));
 app.use('/api/sso', requireAuth, require('./sso-settings-routes')(sql));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // ─── Screen Share (view-only, WebRTC via REST-polling signaling) ───────────
@@ -2987,13 +3006,18 @@ app.get("/api/handoff-token/:token", async (req, res) => {
     if (row.status !== "clicked") {
       await sql`UPDATE alert_log SET status = 'clicked' WHERE id = ${row.id}`;
     }
-    // Look up agent details if possible
+    // Look up the agent within THIS org only
     let agent = { name: row.agent_name, mobile: row.mobile, email: null };
+    let agentRow = null;
     try {
-      const agt = await sql`SELECT * FROM agents WHERE mobile = ${row.mobile} LIMIT 1`;
-      if (agt.length) agent = { name: agt[0].name, email: agt[0].email, mobile: agt[0].mobile };
+      const agt = await sql`SELECT * FROM agents WHERE mobile = ${row.mobile} AND org_id::text = ${String(row.org_id)} LIMIT 1`;
+      if (agt.length) { agentRow = agt[0]; agent = { id: agt[0].id, name: agt[0].name, email: agt[0].email, mobile: agt[0].mobile }; }
     } catch (_) {}
-    res.json({ ok: true, org_id: row.org_id, conversation_id: row.conversation_id, ticket_id: row.ticket_id || null, agent });
+    // Issue a real session so the link works with authenticated APIs.
+    // Role is the agent's own role (never escalated to admin by the link).
+    const role = agentRow?.role === "admin" ? "admin" : "agent";
+    const sessionToken = await createSession({ agent_id: agentRow?.id || null, org_id: row.org_id, email: agentRow?.email || agent.email || `sms:${row.mobile}`, role });
+    res.json({ ok: true, org_id: row.org_id, conversation_id: row.conversation_id, ticket_id: row.ticket_id || null, agent, token: sessionToken, role });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }

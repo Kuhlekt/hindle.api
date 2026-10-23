@@ -248,8 +248,8 @@ router.delete('/tickets/:id', async (req, res) => {
   const helpdeskOrgId = await resolveHelpdeskOrgId(req);
   if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
   const role = (req.headers['x-user-role'] || '').toLowerCase();
-  if (role !== 'tenant_admin' && role !== 'super_admin') {
-    return res.status(403).json({ error: 'Only a tenant admin or super admin can delete tickets' });
+  if (role !== 'tenant_admin' && role !== 'super_admin' && role !== 'admin') {
+    return res.status(403).json({ error: 'Only an admin can delete tickets' });
   }
   const rawId = req.params.id;
   try {
@@ -991,6 +991,7 @@ router.delete('/tickets/:id', async (req, res) => {
     const [u] = await sql`SELECT organization_id FROM user_profiles WHERE id = ${userId}::uuid LIMIT 1`;
     if (!u) { res.status(404).json({ error: 'Not found' }); return null; }
     if (req.auth?.role === 'super_admin') return u;
+    if (req.auth?.role !== 'tenant_admin' && req.auth?.role !== 'admin') { res.status(403).json({ error: 'Only an admin can manage users' }); return null; }
     const mine = await resolveHelpdeskOrgId(req);
     if (!mine || String(u.organization_id) !== String(mine)) { res.status(403).json({ error: 'Forbidden' }); return null; }
     return u;
@@ -999,7 +1000,9 @@ router.delete('/tickets/:id', async (req, res) => {
   router.patch('/users/:id', async (req, res) => {
     try {
       if (!await assertUserScope(req, res, req.params.id)) return;
-      const { full_name, email, phone, role, is_active } = req.body;
+      const { full_name, email, phone, is_active } = req.body;
+      let role = req.body.role || null;
+      if (role && !['customer', 'agent', 'admin'].includes(role)) return res.status(400).json({ error: 'Role must be customer, agent or admin' });
       const act = is_active !== undefined && is_active !== null ? Boolean(is_active) : null;
       const rows = await sql`
         UPDATE user_profiles SET
