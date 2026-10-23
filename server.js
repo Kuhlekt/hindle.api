@@ -1835,16 +1835,30 @@ Always answer questions about AR, collections, dunning, credit management and re
 // GET  /api/tenant-config/:id
 // ─────────────────────────────────────────────
 
-app.post("/api/tenant-config", async (req, res) => {
+app.post("/api/tenant-config", requireAuth, async (req, res) => {
   const { tenantId, ...config } = req.body;
   if (!tenantId) return res.status(400).json({ error: "tenantId required" });
   try {
     // Look up org to get the canonical UUID
     const orgs = await sql`SELECT id FROM organisations WHERE tenant_id = ${tenantId} LIMIT 1`;
     const orgId = orgs.length ? orgs[0].id : tenantId;
+    // Only the tenant's own admins (or super admin) may write; never 'platform' unless super admin.
+    const isSuper = req.auth.role === "super_admin";
+    if (!isSuper) {
+      if (String(orgId) === "platform" || String(orgId) !== String(req.auth.org_id)) return res.status(403).json({ error: "Forbidden" });
+      if (req.auth.role === "agent" && Object.keys(config).some(k => k !== "quickReplies")) return res.status(403).json({ error: "Only an admin can change settings" });
+    }
+    // Never store passwords in plain text
+    delete config._adminPasswordHash;
+    if (typeof config.admin_password === "string" && config.admin_password) {
+      if (config.admin_password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+      config._adminPasswordHash = await bcrypt.hash(config.admin_password, 10);
+    }
+    delete config.admin_password;
     // Deep-merge with existing config
     const existing = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${orgId} LIMIT 1`;
     const merged = existing.length ? { ...existing[0].config, ...config } : config;
+    if (merged._adminPasswordHash) delete merged.admin_password;
     await sql`
       INSERT INTO tenant_configs (tenant_id, config)
       VALUES (${orgId}, ${JSON.stringify(merged)})
@@ -1862,7 +1876,11 @@ app.get("/api/tenant-config/:tenantId", async (req, res) => {
   try {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${tenantId} LIMIT 1`;
     if (!rows.length) return res.json({});
-    res.json(rows[0].config);
+    const cfg = rows[0].config || {};
+    const a = await optionalAuth(req);
+    const isOwner = a && (a.role === "super_admin" || (String(tenantId) !== "platform" && String(a.org_id) === String(tenantId)));
+    // The chat widget reads this anonymously: it only ever gets non-secret fields.
+    res.json(isOwner ? stripPasswords(cfg) : stripSecrets(stripPasswords(cfg)));
   } catch (err) {
     console.error("GET /api/tenant-config error:", err.message);
     res.status(500).json({ error: "Failed to load config" });
@@ -1880,6 +1898,13 @@ app.get("/api/admin-settings", async (req, res) => {
     const rows = await sql`SELECT config FROM tenant_configs WHERE tenant_id = 'platform' LIMIT 1`;
     if (!rows.length) return res.json({});
     const cfg = rows[0].config || {};
+    const a = await optionalAuth(req);
+    if (!a || a.role !== "super_admin") {
+      // Public: only what the landing/pricing page needs.
+      const sc = cfg._superConfig || {};
+      return res.json({ superConfig: { plans: sc.plans, annualDiscountPct: sc.annualDiscountPct, promoCodes: sc.promoCodes,
+        planFeatures: sc.planFeatures, planLimits: sc.planLimits } });
+    }
     res.json({
       profile:     cfg._adminProfile   || {},
       platform:    cfg._platformConfig || {},
@@ -1892,7 +1917,7 @@ app.get("/api/admin-settings", async (req, res) => {
   }
 });
 
-app.post("/api/admin-settings", async (req, res) => {
+app.post("/api/admin-settings", requireAuth, requireSuper, async (req, res) => {
   const { profile, platform, github, superConfig, adminPassword, adminAccounts, adminPasswordFor, testSMS, testEmail } = req.body;
 
   // ── Test SMS ──────────────────────────────────────────────────
@@ -2846,6 +2871,35 @@ async function requireAuth(req, res, next) {
   } catch (e) { res.status(500).json({ error: e.message }); }
 }
 
+// Reads the session if a valid Bearer token is present; never rejects.
+async function optionalAuth(req) {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!token || token.length < 20) return null;
+  try {
+    const rows = await sql`SELECT * FROM sessions WHERE token = ${token} AND expires_at > NOW() LIMIT 1`;
+    return rows[0] || null;
+  } catch (_) { return null; }
+}
+
+// Keys that must never leave the server to anyone but the owning admin.
+const SECRET_KEY_RE = /pass(word)?|hash|secret|api_?key|apikey|token|\bpat\b|private|credential|smtp|clicksend|stripe|webhook|github|_superConfig|_adminAccounts|_adminProfile|_platformConfig|_githubConfig/i;
+function stripSecrets(obj, depth = 0) {
+  if (Array.isArray(obj)) return depth > 6 ? [] : obj.map(v => stripSecrets(v, depth + 1));
+  if (!obj || typeof obj !== "object") return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (SECRET_KEY_RE.test(k)) continue;
+    out[k] = depth > 6 ? undefined : stripSecrets(v, depth + 1);
+  }
+  return out;
+}
+// Password material is never returned, even to owners.
+function stripPasswords(cfg) {
+  if (!cfg || typeof cfg !== "object") return cfg;
+  const { admin_password, _adminPasswordHash, adminPassword, ...rest } = cfg;
+  return rest;
+}
+
 function requireSuper(req, res, next) {
   if (req.auth?.role !== "super_admin") return res.status(403).json({ error: "Forbidden" });
   next();
@@ -2854,6 +2908,30 @@ function requireSuper(req, res, next) {
 function scopeOrg(req, orgId) {
   if (req.auth?.role === "super_admin") return orgId || null;
   return req.auth?.org_id || null;
+}
+
+// 3. Helpdesk portal staff (user_profiles) — one login for both apps.
+// Admins/agents of a helpdesk org sign in to the Helpdesk app as the linked
+// tenant. Customers are refused (they use the customer portal).
+async function portalStaffLogin(req, res, email, password) {
+  const rows = await sql`SELECT id, email, full_name, role, is_active, is_super_admin, organization_id, password_hash
+                         FROM user_profiles WHERE LOWER(email) = LOWER(${email}) LIMIT 1`.catch(() => []);
+  const u = rows[0];
+  if (!u) return res.status(401).json({ ok: false, error: "No account found for that email address." });
+  if (u.is_active === false) return res.status(403).json({ ok: false, error: "Account is disabled." });
+  if (!u.password_hash || !u.password_hash.startsWith("$2") || !(await bcrypt.compare(password, u.password_hash)))
+    return res.status(401).json({ ok: false, error: "Incorrect password." });
+  if (u.is_super_admin) {
+    const token = await createSession({ org_id: null, email: u.email, role: "super_admin" });
+    return res.json({ ok: true, token, id: null, org_id: null, role: "super_admin", email: u.email, name: u.full_name || u.email });
+  }
+  if (u.role !== "admin" && u.role !== "agent")
+    return res.status(403).json({ ok: false, error: "Customer accounts sign in on your organisation's support portal." });
+  const t = await sql`SELECT id, name, plan FROM organisations WHERE helpdesk_org_id = ${u.organization_id}::uuid LIMIT 1`.catch(() => []);
+  if (!t[0]) return res.status(403).json({ ok: false, error: "Your helpdesk isn't linked to a Helpdesk workspace yet. Contact support." });
+  const role = u.role === "admin" ? "tenant_admin" : "agent";
+  const token = await createSession({ org_id: t[0].id, email: u.email, role });
+  return res.json({ ok: true, token, id: null, org_id: t[0].id, role, email: u.email, name: u.full_name || u.email, plan: t[0].plan, via: "portal" });
 }
 
 app.post("/api/auth", async (req, res) => {
@@ -2879,6 +2957,16 @@ app.post("/api/auth", async (req, res) => {
       if (!storedPass) return res.status(401).json({ ok: false, error: "No password set. Use Forgot password to set one." });
       const passOk = isHashed ? await bcrypt.compare(password, storedPass) : (password === storedPass);
       if (!passOk) return res.status(401).json({ ok: false, error: "Incorrect password." });
+      if (!isHashed) {
+        // Legacy plain-text password: replace with a hash now that it's verified.
+        try {
+          const h = await bcrypt.hash(password, 10);
+          const cur = await sql`SELECT config FROM tenant_configs WHERE tenant_id = ${org.id} LIMIT 1`;
+          const next = { ...(cur[0]?.config || {}), _adminPasswordHash: h };
+          delete next.admin_password;
+          await sql`UPDATE tenant_configs SET config = ${JSON.stringify(next)} WHERE tenant_id = ${org.id}`;
+        } catch (e) { console.error("[auth] password upgrade failed:", e.message); }
+      }
       const token = await createSession({ org_id: org.id, email: org.email, role: "tenant_admin" });
       return res.json({ ok: true, token, org_id: org.id, role: "tenant_admin", email: org.email, name: org.name, plan: org.plan });    }
   } catch (e) {
@@ -2888,22 +2976,21 @@ app.post("/api/auth", async (req, res) => {
   // 2. Try agent (agents table)
   try {
     const rows = await sql`SELECT * FROM agents WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1`;
-    if (!rows.length) return res.status(401).json({ ok: false, error: "No account found for that email address." });
+    if (!rows.length) return await portalStaffLogin(req, res, email.trim(), password);
     const agent = rows[0];
     if (agent.active === false) return res.status(403).json({ ok: false, error: "Account is disabled." });
     if (!agent.password_hash) return res.status(401).json({ ok: false, error: "No password set. Contact your administrator." });
     // Support both plain-text (legacy) and bcrypt-hashed passwords
-    const agentPassOk = agent.password_hash.startsWith("$2") 
-      ? await bcrypt.compare(password, agent.password_hash)
-      : agent.password_hash === password;
+    const isBcrypt = agent.password_hash.startsWith("$2");
+    const agentPassOk = isBcrypt ? await bcrypt.compare(password, agent.password_hash) : agent.password_hash === password;
     if (!agentPassOk) return res.status(401).json({ ok: false, error: "Incorrect password." });
-    let orgId = agent.org_id || null;
-    if (!orgId && agent.role !== "super_admin") {
-        try {
-        const orgs = await sql`SELECT id FROM organisations LIMIT 1`;
-        if (orgs.length) { orgId = orgs[0].id; await sql`UPDATE agents SET org_id = ${orgId} WHERE id = ${agent.id}`; }
-      } catch (_) {}
+    if (!isBcrypt) {
+      // Legacy plain-text password: hash it now that it's verified.
+      await sql`UPDATE agents SET password_hash = ${await bcrypt.hash(password, 10)} WHERE id = ${agent.id}`.catch(() => {});
     }
+    const orgId = agent.org_id || null;
+    // Never attach an agent to an arbitrary tenant.
+    if (!orgId && agent.role !== "super_admin") return res.status(403).json({ ok: false, error: "This account isn't linked to an organisation. Ask your administrator." });
     const token = await createSession({ agent_id: agent.id, org_id: orgId, email: agent.email, role: agent.role || "agent" });
     return res.json({ ok: true, token, id: agent.id, org_id: orgId, role: agent.role || "agent", email: agent.email, name: agent.name, mustChangePassword: agent.must_change_password || false });
   } catch (e) {
@@ -3414,16 +3501,8 @@ app.post("/api/auth/magic-verify", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/auth/set-password", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "email and password required" });
-  try {
-    const hashedPw = await bcrypt.hash(password, 10);
-    const rows = await sql`UPDATE agents SET password_hash = ${hashedPw}, must_change_password = false WHERE LOWER(email) = LOWER(${email}) RETURNING id, name, email, role`;
-    if (!rows.length) return res.status(404).json({ error: "not found" });
-    res.json({ ok: true, ...rows[0] });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// (removed) /api/auth/set-password — set any agent password without auth
+
 
 // ─────────────────────────────────────────────
 // POST /api/sms-test  — test ClickSend credentials
