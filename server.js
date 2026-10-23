@@ -530,6 +530,19 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     console.error("[Stripe] Webhook signature error:", e.message);
     return res.status(400).json({ error: "Webhook signature error: " + e.message });
   }
+  // Without a signing secret the payload is untrusted: re-fetch the checkout
+  // session from Stripe and only act on what Stripe itself reports.
+  if (!webhookSecret) {
+    if (event?.type !== "checkout.session.completed" || !event?.data?.object?.id) return res.json({ received: true, ignored: true });
+    try {
+      const real = await stripe.checkout.sessions.retrieve(String(event.data.object.id));
+      if (!real || (real.payment_status !== "paid" && real.status !== "complete")) return res.json({ received: true, ignored: true });
+      event = { type: "checkout.session.completed", data: { object: real } };
+    } catch (e) {
+      console.error("[Stripe] Unsigned webhook rejected:", e.message);
+      return res.status(400).json({ error: "Unverified event" });
+    }
+  }
   
 
   if (event.type === "checkout.session.completed") {
