@@ -317,6 +317,63 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
+// ── API access guard ──────────────────────────────────────────────────────
+// Every /api route requires a signed-in session EXCEPT the explicit public
+// list below (chat widget, sign-in, Stripe, approval/screen-share links).
+// Public routes still see req.auth when a valid token is sent.
+const PUBLIC_API = [
+  ["*", /^\/api\/auth(\/|$)/],
+  ["GET", /^\/api\/health$/],
+  ["POST", /^\/api\/stripe\/webhook$/], ["POST", /^\/api\/stripe\/checkout$/], ["GET", /^\/api\/stripe\/status(\/|$)/],
+  ["GET", /^\/api\/handoff-token\//],
+  ["POST", /^\/api\/helpdesk\/webhook\//],
+  // chat widget (anonymous website visitors)
+  ["POST", /^\/api\/chat$/], ["POST", /^\/api\/handoff$/], ["POST", /^\/api\/offline-message$/],
+  ["POST", /^\/api\/typing$/], ["GET", /^\/api\/typing\//], ["POST", /^\/api\/widget-ping$/],
+  ["GET", /^\/api\/tenant-config\//], ["GET", /^\/api\/admin-settings$/],
+  ["POST", /^\/api\/conversations$/], ["GET", /^\/api\/conversations\/[^/]+$/], ["PATCH", /^\/api\/conversations\/[^/]+$/],
+  ["GET", /^\/api\/conversations\/[^/]+\/messages$/], ["POST", /^\/api\/conversations\/[^/]+\/messages$/],
+  ["POST", /^\/api\/conversations\/[^/]+\/csat$/],
+  // screen share viewer side (session id is the secret); creating needs sign-in
+  ["*", /^\/api\/screen-share\/(?!create$)/],
+  // access-approval links (the emailed token is the auth)
+  ["*", /^\/api\/access-requests\/approve\//],
+];
+const SUPER_ONLY_API = [/^\/api\/tenants(\/|$)/, /^\/api\/audit-log(\/|$)/, /^\/api\/diag\//];
+function isPublicApi(method, path) {
+  return PUBLIC_API.some(([m, re]) => (m === "*" || m === method) && re.test(path));
+}
+app.use(async (req, res, next) => {
+  const path = req.path;
+  if (!path.startsWith("/api/")) return next();
+  if (req.method === "OPTIONS") return next();
+  if (isPublicApi(req.method, path)) {
+    const a = await optionalAuth(req);
+    if (a) req.auth = a;
+    else {
+      // Anonymous visitors can only touch visitor fields / visitor messages.
+      if (req.method === "PATCH" && /^\/api\/conversations\/[^/]+$/.test(path)) req._visitorOnly = true;
+      if (req.method === "POST" && /^\/api\/conversations\/[^/]+\/messages$/.test(path)) req._visitorOnly = true;
+    }
+    return next();
+  }
+  if (path.startsWith("/api/helpdesk/")) return next(); // helpdeskGuard handles these
+  if (path === "/api/sso" || path.startsWith("/api/sso/")) return next(); // mounted with requireAuth
+  return requireAuth(req, res, () => {
+    if (SUPER_ONLY_API.some(re => re.test(path)) && req.auth.role !== "super_admin")
+      return res.status(403).json({ error: "Forbidden" });
+    // Tenant users act on their own tenant only: override any org selector.
+    if (req.auth.role !== "super_admin" && req.auth.org_id) {
+      const own = String(req.auth.org_id);
+      for (const k of ["org_id", "orgId", "tenant_id", "tenantId"]) {
+        if (req.query && req.query[k] !== undefined && req.query[k] !== "platform") req.query[k] = own;
+      }
+      req._ownOrg = own;
+    }
+    next();
+  });
+});
+
 // ── Bulk website scraper for KB ───────────────────────────────────────────────
 function extractTextFromHtml(html) {
   return html
@@ -542,6 +599,23 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 });
 
 app.use(express.json({ limit: "10mb" }));
+// After body parsing: enforce own-tenant ids in bodies and visitor-only writes.
+app.use((req, res, next) => {
+  if (req._ownOrg && req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
+    for (const k of ["org_id", "orgId", "tenant_id", "tenantId"]) {
+      if (req.body[k] !== undefined && req.body[k] !== null && req.body[k] !== "" && req.body[k] !== "platform") req.body[k] = req._ownOrg;
+    }
+  }
+  if (req._visitorOnly && req.body && typeof req.body === "object") {
+    if (req.method === "PATCH") {
+      for (const k of Object.keys(req.body)) if (!k.startsWith("visitor_")) delete req.body[k];
+      if (!Object.keys(req.body).length) return res.json({ ok: true });
+    } else if (!["visitor", "bot"].includes(req.body.type)) {
+      req.body.type = "visitor";
+    }
+  }
+  next();
+});
 const helpdeskProxy = require('./helpdesk-proxy-routes');
 // Helpdesk API: signed-in users only. The tenant (org) and role come from the
 // server-side session, never from client headers — except super admins, who
