@@ -941,6 +941,98 @@ router.delete('/tickets/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
   });
 
+  // ── Customer portal: branding + invite codes ──────────────────────────
+  const PORTAL_BASE = (process.env.PORTAL_PUBLIC_URL || HELPDESK_API_BASE).replace(/\/+$/, '');
+  const HEX = /^#[0-9a-fA-F]{6}$/;
+
+  router.get('/portal-branding', async (req, res) => {
+    const org = await resolveHelpdeskOrgId(req);
+    if (!org) return res.json({ success: true, data: null, enabled: false });
+    try {
+      const [o] = await sql`SELECT name, slug, logo_url, primary_color, accent_color FROM organizations WHERE id = ${org}::uuid LIMIT 1`;
+      if (!o) return res.status(404).json({ error: 'Helpdesk organisation not found' });
+      res.json({ success: true, data: { ...o, portal_url: o.slug ? `${PORTAL_BASE}/t/${o.slug}` : null, signup_url: `${PORTAL_BASE}/signup` } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  router.put('/portal-branding', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { logo_url, primary_color, accent_color } = req.body || {};
+    if (logo_url && !/^https:\/\/\S+$/i.test(logo_url)) return res.status(400).json({ error: 'Logo must be an https:// image address' });
+    for (const c of [primary_color, accent_color]) if (c && !HEX.test(c)) return res.status(400).json({ error: 'Colours must be hex, e.g. #2563EB' });
+    try {
+      const [o] = await sql`UPDATE organizations SET
+          logo_url = ${logo_url || null},
+          primary_color = COALESCE(${primary_color || null}, primary_color),
+          accent_color = COALESCE(${accent_color || null}, accent_color),
+          updated_at = NOW()
+        WHERE id = ${org}::uuid RETURNING name, slug, logo_url, primary_color, accent_color`;
+      res.json({ success: true, data: o });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  router.get('/invites', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    try {
+      const rows = await sql`
+        SELECT i.id, i.invite_code, i.invite_type, i.uses_remaining, i.expires_at, i.is_active, i.notes, i.created_at,
+               COUNT(u.id)::int AS times_used
+        FROM organization_invites i
+        LEFT JOIN organization_invite_uses u ON u.invite_id = i.id
+        WHERE i.organization_id = ${org}::uuid
+        GROUP BY i.id ORDER BY i.created_at DESC`;
+      res.json({ success: true, data: [...rows], signup_url: `${PORTAL_BASE}/signup` });
+    } catch (e) {
+      if (/does not exist/.test(e.message)) return res.json({ success: true, data: [], warning: 'Invite codes are not set up in the database yet.' });
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.post('/invites', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { invite_type, uses_remaining, expires_at, notes } = req.body || {};
+    const code = (req.body?.invite_code || '').toUpperCase().replace(/[^A-Z0-9-]/g, '') ||
+      require('crypto').randomBytes(4).toString('hex').toUpperCase();
+    try {
+      const [creator] = await sql`SELECT id FROM user_profiles WHERE organization_id = ${org}::uuid AND role = 'admin' ORDER BY created_at ASC LIMIT 1`;
+      const [r] = await sql`
+        INSERT INTO organization_invites (organization_id, invite_code, invite_type, uses_remaining, expires_at, created_by, notes, is_active)
+        VALUES (${org}::uuid, ${code}, ${invite_type || 'client'}, ${uses_remaining ? Number(uses_remaining) : null},
+                ${expires_at || null}, ${creator?.id || null}, ${notes || null}, true)
+        RETURNING *`;
+      res.json({ success: true, data: r });
+    } catch (e) {
+      if (/duplicate key/.test(e.message)) return res.status(409).json({ error: 'That code is already in use — pick another.' });
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.put('/invites/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { is_active, uses_remaining, expires_at, notes } = req.body || {};
+    try {
+      const [r] = await sql`UPDATE organization_invites SET
+          is_active = COALESCE(${typeof is_active === 'boolean' ? is_active : null}, is_active),
+          uses_remaining = COALESCE(${uses_remaining ?? null}, uses_remaining),
+          expires_at = COALESCE(${expires_at || null}, expires_at),
+          notes = COALESCE(${notes ?? null}, notes),
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING *`;
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true, data: r });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  router.delete('/invites/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    try {
+      await sql`DELETE FROM organization_invite_uses WHERE invite_id::text = ${req.params.id}`.catch(() => {});
+      const r = await sql`DELETE FROM organization_invites WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // ── Agents (for the assign-to dropdown) ──────────────────────────────
   // ── Agents (for the assign-to dropdown) ──────────────────────────────
   // NATIVE — Stage 2: queries user_profiles directly, filtered to this
