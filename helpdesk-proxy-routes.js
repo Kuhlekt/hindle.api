@@ -1174,11 +1174,66 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   // ── KPI / reporting snapshot ───────────────────────────────────────────
-  router.get('/reports/kpi', async (req, res) => {
-    const helpdeskOrgId = await resolveHelpdeskOrgId(req);
-    if (!helpdeskOrgId) return res.json({ success: true, data: null });
-    const { status, data } = await helpdeskFetch(helpdeskOrgId, `/api/admin/reports/kpi`);
-    res.status(status).json(data);
+  // ── Reports: native summary (replaces the old portal KPI passthrough) ──
+  router.get('/reports/kpi', (req, res, next) => { req.url = '/reports/summary'; next(); });
+  router.get('/reports/summary', async (req, res) => {
+    const org = await resolveHelpdeskOrgId(req);
+    if (!org) return res.json({ success: true, data: null, enabled: false });
+    const days = Math.min(365, Math.max(7, parseInt(req.query.days) || 30));
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+    try {
+      const [statusRows, prioRows, totals, firstResp, daily, agents, csat] = await Promise.all([
+        sql`SELECT status, COUNT(*)::int AS c FROM tickets WHERE organization_id = ${org}::uuid AND status <> 'merged' GROUP BY status`,
+        sql`SELECT priority, COUNT(*)::int AS c FROM tickets WHERE organization_id = ${org}::uuid AND status NOT IN ('merged','resolved','closed') GROUP BY priority`,
+        sql`SELECT
+              COUNT(*) FILTER (WHERE created_at >= ${since})::int AS created,
+              COUNT(*) FILTER (WHERE resolved_at >= ${since})::int AS resolved,
+              ROUND(AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 3600) FILTER (WHERE resolved_at >= ${since})::numeric, 1) AS avg_resolution_h,
+              COUNT(*) FILTER (WHERE status NOT IN ('resolved','closed','merged') AND assigned_to IS NULL)::int AS unassigned,
+              COUNT(*) FILTER (WHERE status NOT IN ('resolved','closed','merged') AND created_at < NOW() - INTERVAL '7 days')::int AS older_7d
+            FROM tickets WHERE organization_id = ${org}::uuid AND status <> 'merged'`,
+        sql`WITH fr AS (
+              SELECT t.id, t.created_at, MIN(m.created_at) AS first_at
+              FROM tickets t
+              JOIN ticket_messages m ON m.ticket_id = t.id AND COALESCE(m.is_internal, false) = false
+              JOIN user_profiles u ON u.id = m.user_id AND u.role IN ('agent','admin')
+              WHERE t.organization_id = ${org}::uuid AND t.created_at >= ${since}
+              GROUP BY t.id, t.created_at)
+            SELECT ROUND(AVG(EXTRACT(EPOCH FROM (first_at - created_at)) / 3600)::numeric, 1) AS avg_first_response_h, COUNT(*)::int AS n FROM fr`.catch(() => [{ avg_first_response_h: null, n: 0 }]),
+        sql`SELECT to_char(d::date, 'YYYY-MM-DD') AS day,
+              (SELECT COUNT(*)::int FROM tickets WHERE organization_id = ${org}::uuid AND status <> 'merged' AND created_at::date = d::date) AS created,
+              (SELECT COUNT(*)::int FROM tickets WHERE organization_id = ${org}::uuid AND resolved_at::date = d::date) AS resolved
+            FROM generate_series((NOW() - make_interval(days => ${days}::int))::date, NOW()::date, '1 day') d ORDER BY d`,
+        sql`SELECT u.id, COALESCE(u.full_name, u.email) AS name,
+              COUNT(t.id) FILTER (WHERE t.status NOT IN ('resolved','closed','merged'))::int AS open,
+              COUNT(t.id) FILTER (WHERE t.resolved_at >= ${since})::int AS resolved,
+              ROUND(AVG(EXTRACT(EPOCH FROM (t.resolved_at - t.created_at)) / 3600) FILTER (WHERE t.resolved_at >= ${since})::numeric, 1) AS avg_resolution_h
+            FROM user_profiles u
+            LEFT JOIN tickets t ON t.assigned_to = u.id AND t.organization_id = ${org}::uuid
+            WHERE u.organization_id = ${org}::uuid AND u.role IN ('agent','admin') AND COALESCE(u.is_active, true)
+            GROUP BY u.id, u.full_name, u.email
+            ORDER BY resolved DESC, open DESC`,
+        sql`SELECT ROUND(AVG(r.score)::numeric, 2) AS avg, COUNT(*)::int AS n
+            FROM csat_reviews r JOIN tickets t ON t.id = r.ticket_id
+            WHERE t.organization_id = ${org}::uuid AND r.created_at >= ${since}`.catch(() => [{ avg: null, n: 0 }]),
+      ]);
+      const byStatus = Object.fromEntries(statusRows.map(r => [r.status, r.c]));
+      const openPriority = Object.fromEntries(prioRows.map(r => [r.priority || 'medium', r.c]));
+      res.json({ success: true, data: {
+        days, by_status: byStatus, open_by_priority: openPriority,
+        open_total: ['open','in_progress','pending'].reduce((a, k) => a + (byStatus[k] || 0), 0),
+        created: totals[0]?.created || 0, resolved: totals[0]?.resolved || 0,
+        avg_resolution_h: totals[0]?.avg_resolution_h != null ? Number(totals[0].avg_resolution_h) : null,
+        avg_first_response_h: firstResp[0]?.avg_first_response_h != null ? Number(firstResp[0].avg_first_response_h) : null,
+        unassigned: totals[0]?.unassigned || 0, older_7d: totals[0]?.older_7d || 0,
+        csat_avg: csat[0]?.avg != null ? Number(csat[0].avg) : null, csat_n: csat[0]?.n || 0,
+        daily: daily.map(r => ({ day: r.day, created: r.created, resolved: r.resolved })),
+        agents: agents.map(a => ({ ...a, avg_resolution_h: a.avg_resolution_h != null ? Number(a.avg_resolution_h) : null })),
+      } });
+    } catch (e) {
+      console.error('[reports summary]', e.message);
+      res.status(500).json({ error: e.message });
+    }
   });
   // ── User management (helpdesk user_profiles) ─────────────────────────
   const USER_COLS = `id, email, full_name, phone, role, is_active, is_super_admin,
