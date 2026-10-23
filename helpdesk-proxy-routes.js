@@ -465,6 +465,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/categories', async (req, res) => {
+    // Agents may add these inline while working a ticket.
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const name = req.body?.name;
@@ -499,6 +500,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/resolution-types', async (req, res) => {
+    // Agents may add these inline while working a ticket.
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const name = req.body?.name;
@@ -534,6 +536,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/canned-responses', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { title, content, category, shortcut } = req.body || {};
@@ -551,6 +554,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.delete('/canned-responses/:id', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     try {
@@ -578,6 +582,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/csat-settings', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { enabled, delay_hours } = req.body || {};
@@ -614,6 +619,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/sla-policies', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { name, priority, first_response_hours, resolution_hours } = req.body || {};
@@ -631,6 +637,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.delete('/sla-policies/:id', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     try {
@@ -658,6 +665,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/departments', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { name, description } = req.body || {};
@@ -675,6 +683,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.delete('/departments/:id', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     try {
@@ -702,6 +711,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/tags', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { name, color } = req.body || {};
@@ -719,6 +729,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.delete('/tags/:id', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     try {
@@ -787,6 +798,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.post('/escalation-rules', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     const { condition, action, threshold } = req.body || {};
@@ -804,6 +816,7 @@ router.delete('/tickets/:id', async (req, res) => {
   });
 
   router.delete('/escalation-rules/:id', async (req, res) => {
+    if (!isAdminRole(req)) return res.status(403).json({ error: 'Only an admin can change helpdesk configuration' });
     const helpdeskOrgId = await resolveHelpdeskOrgId(req);
     if (!helpdeskOrgId) return res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' });
     try {
@@ -814,6 +827,118 @@ router.delete('/tickets/:id', async (req, res) => {
       console.error('[escalation-rules DELETE native]', e.message);
       res.status(500).json({ error: e.message || 'Failed' });
     }
+  });
+
+  // ── Configuration edits (Helpdesk → Configuration screen) ─────────────
+  // Admin-only. Every write is scoped to the tenant's helpdesk org.
+  function isAdminRole(req) {
+    const r = req.auth?.role;
+    return r === 'super_admin' || r === 'tenant_admin' || r === 'admin';
+  }
+  async function adminOrg(req, res) {
+    if (!isAdminRole(req)) { res.status(403).json({ error: 'Only an admin can change helpdesk configuration' }); return null; }
+    const org = await resolveHelpdeskOrgId(req);
+    if (!org) { res.status(400).json({ error: 'Helpdesk is not enabled for this tenant.' }); return null; }
+    return org;
+  }
+
+  router.put('/categories/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { name, description } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+    try {
+      const r = await sql`UPDATE categories SET name = ${name.trim()}, description = ${description || null}
+                          WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING *`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true, data: r[0] });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
+  });
+  router.delete('/categories/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    try {
+      const used = await sql`SELECT COUNT(*)::int AS c FROM tickets WHERE category_id::text = ${req.params.id} AND organization_id = ${org}::uuid`.catch(() => [{ c: 0 }]);
+      if (used[0]?.c > 0 && !req.query.force) return res.status(409).json({ error: `Used by ${used[0].c} ticket(s). Delete anyway?`, tickets: used[0].c });
+      if (used[0]?.c > 0) await sql`UPDATE tickets SET category_id = NULL WHERE category_id::text = ${req.params.id} AND organization_id = ${org}::uuid`.catch(() => {});
+      const r = await sql`DELETE FROM categories WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
+  });
+
+  router.put('/resolution-types/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const name = req.body?.name;
+    if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+    try {
+      const r = await sql`UPDATE resolution_types SET name = ${name.trim()} WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING id, name, sort_order`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true, data: r[0] });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
+  });
+  router.delete('/resolution-types/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    try {
+      const r = await sql`DELETE FROM resolution_types WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING id`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
+  });
+
+  router.put('/canned-responses/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { title, content, category, shortcut } = req.body || {};
+    if (!title?.trim() || !content?.trim()) return res.status(400).json({ error: 'Title and content required' });
+    try {
+      const r = await sql`UPDATE canned_responses SET title = ${title.trim()}, content = ${content.trim()}, category = ${category || 'General'},
+                            shortcut = ${shortcut || ''}, updated_at = now()
+                          WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING *`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true, data: r[0] });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
+  });
+
+  router.put('/sla-policies/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { name, priority, first_response_hours, resolution_hours, is_active } = req.body || {};
+    try {
+      const r = await sql`UPDATE sla_policies SET
+                            name = COALESCE(${name?.trim() || null}, name),
+                            priority = COALESCE(${priority || null}, priority),
+                            first_response_hours = COALESCE(${first_response_hours ?? null}, first_response_hours),
+                            resolution_hours = COALESCE(${resolution_hours ?? null}, resolution_hours),
+                            is_active = COALESCE(${typeof is_active === 'boolean' ? is_active : null}, is_active),
+                            updated_at = now()
+                          WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING *`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true, data: r[0] });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
+  });
+
+  router.put('/escalation-rules/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { condition, action, threshold, is_active } = req.body || {};
+    try {
+      const r = await sql`UPDATE escalation_rules SET
+                            condition = COALESCE(${condition?.trim() || null}, condition),
+                            action = COALESCE(${action?.trim() || null}, action),
+                            threshold = COALESCE(${threshold ?? null}, threshold),
+                            is_active = COALESCE(${typeof is_active === 'boolean' ? is_active : null}, is_active),
+                            updated_at = NOW()
+                          WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING *`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true, data: r[0] });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
+  });
+
+  router.put('/tags/:id', async (req, res) => {
+    const org = await adminOrg(req, res); if (!org) return;
+    const { name, color } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+    try {
+      const r = await sql`UPDATE tags SET name = ${name.trim()}, color = ${color || '#2563eb'} WHERE id::text = ${req.params.id} AND organization_id = ${org}::uuid RETURNING *`;
+      if (!r.length) return res.status(404).json({ error: 'Not found' });
+      res.json({ success: true, data: r[0] });
+    } catch (e) { res.status(500).json({ error: e.message || 'Failed' }); }
   });
 
   // ── Agents (for the assign-to dropdown) ──────────────────────────────
