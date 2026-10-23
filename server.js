@@ -237,6 +237,35 @@ const { neon } = require("@neondatabase/serverless");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 
+// Retry Neon HTTP requests that fail before reaching the database (dropped
+// sockets after idle, DNS blips, compute waking from suspend). Only network-
+// level failures and gateway errors are retried, so a query that reached the
+// DB is never sent twice.
+try {
+  const { neonConfig } = require("@neondatabase/serverless");
+  const _baseFetch = globalThis.fetch;
+  const RETRY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE",
+    "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "UND_ERR_CLOSED"]);
+  neonConfig.fetchFunction = async (url, opts) => {
+    let lastErr;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const r = await _baseFetch(url, opts);
+        if ((r.status === 502 || r.status === 503 || r.status === 504) && attempt < 3) {
+          lastErr = new Error(`Neon gateway ${r.status}`);
+        } else return r;
+      } catch (e) {
+        const code = e?.cause?.code || e?.code;
+        if (!(RETRY_CODES.has(code) || /fetch failed|socket hang up|network/i.test(String(e?.message)))) throw e;
+        lastErr = e;
+      }
+      await new Promise((res) => setTimeout(res, 300 * Math.pow(2, attempt)));
+    }
+    console.error("[db] giving up after retries:", lastErr?.message);
+    throw lastErr;
+  };
+} catch (e) { console.error("[db] retry wrapper not installed:", e.message); }
+
 const sql = neon(process.env.DATABASE_URL);
 
 
@@ -2789,6 +2818,11 @@ async function requireAuth(req, res, next) {
     const rows = await sql`SELECT * FROM sessions WHERE token = ${token} AND expires_at > NOW() LIMIT 1`;
     if (!rows.length) return res.status(401).json({ error: "Session expired" });
     req.auth = rows[0];
+    // Sliding expiry: active sessions stay signed in (7 days from last use).
+    // Extend at most ~hourly to avoid a write on every request.
+    if (new Date(rows[0].expires_at).getTime() - Date.now() < 7 * 24 * 3600 * 1000 - 3600 * 1000) {
+      sql`UPDATE sessions SET expires_at = NOW() + INTERVAL '7 days' WHERE token = ${token}`.catch(() => {});
+    }
     next();
   } catch (e) { res.status(500).json({ error: e.message }); }
 }
